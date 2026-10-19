@@ -1,0 +1,51 @@
+target	class	entry_to_declare	instr_before_entry	gapfill_segment	segment_start_fate	missing_split
+822844D0	LEAF_TAILCALL	822844D0	b->82276440 (unknown before GapFill)	822844C0-822844E0	GapFill-registered, SEALED	entry not split: preceded by b to unknown
+823A4748	THUNK	823A4748	b->823B0B90 (unknown before GapFill)	823A4740-823A4768	existed before GapFill (Discover)	entry not split: preceded by b to unknown
+823A4750	THUNK	823A4750	b->823B4400 (unknown before GapFill)	823A4740-823A4768	existed before GapFill (Discover)	entry not split: preceded by b to unknown
+823A4758	THUNK	823A4758	b->823AEAD0 (unknown before GapFill)	823A4740-823A4768	existed before GapFill (Discover)	entry not split: preceded by b to unknown
+823A4760	THUNK	823A4760	b->823AD038 (unknown before GapFill)	823A4740-823A4768	existed before GapFill (Discover)	entry not split: preceded by b to unknown
+823A4790	THUNK	823A4790	b->823B4408 (unknown before GapFill)	823A4788-823A47B0	GapFill-registered, SEALED	entry not split: preceded by b to unknown
+823A4798	THUNK	823A4798	b->823AEB08 (unknown before GapFill)	823A4788-823A47B0	GapFill-registered, SEALED	entry not split: preceded by b to unknown
+823A47A0	THUNK	823A47A0	b->823B0BD0 (unknown before GapFill)	823A4788-823A47B0	GapFill-registered, SEALED	entry not split: preceded by b to unknown
+823A47A8	THUNK	823A47A8	b->823AEB30 (unknown before GapFill)	823A4788-823A47B0	GapFill-registered, SEALED	entry not split: preceded by b to unknown
+823A4850	THUNK	823A4850	b->823AD310 (unknown before GapFill)	823A4848-823A4918	GapFill-registered, SEALED	entry not split: preceded by b to unknown
+823A4BB8	THUNK	823A4BB8	b->823B2B18 (unknown before GapFill)	823A4BB0-823A4BE8	GapFill-registered, SEALED	entry not split: preceded by b to unknown
+823A4BC0	THUNK	823A4BC0	b->823AEC40 (unknown before GapFill)	823A4BB0-823A4BE8	GapFill-registered, SEALED	entry not split: preceded by b to unknown
+823A4BC8	THUNK	823A4BC8	b->823B2B60 (unknown before GapFill)	823A4BB0-823A4BE8	GapFill-registered, SEALED	entry not split: preceded by b to unknown
+823A4BD0	THUNK	823A4BD0	b->823AEC80 (unknown before GapFill)	823A4BB0-823A4BE8	GapFill-registered, SEALED	entry not split: preceded by b to unknown
+823A4BD8	THUNK	823A4BD8	b->823B2BA0 (unknown before GapFill)	823A4BB0-823A4BE8	GapFill-registered, SEALED	entry not split: preceded by b to unknown
+823A4BE0	THUNK	823A4BE0	b->823AECB8 (unknown before GapFill)	823A4BB0-823A4BE8	GapFill-registered, SEALED	entry not split: preceded by b to unknown
+823A4BF0	THUNK	823A4BF0	b->823AED18 (unknown before GapFill)	823A4BE8-823A4C00	GapFill-registered, SEALED	entry not split: preceded by b to unknown
+823A4D38	THUNK	823A4D38	b->823AF328 (unknown before GapFill)	823A4D30-823A4D40	existed before GapFill (Discover)	entry not split: preceded by b to unknown
+823A4D90	THUNK	823A4D90	b->823B6D98 (unknown before GapFill)	823A4D88-823A4D98	GapFill-registered, SEALED	entry not split: preceded by b to unknown
+823A9978	THUNK	823A9978	b->823A4840 (unknown before GapFill)	823A9960-823A9980	existed before GapFill (Discover)	entry not split: preceded by b to unknown
+823DEDD8	THUNK	823DEDD8	b->823E0100 (unknown before GapFill)	823DEDD0-823DEDE8	existed before GapFill (Discover)	entry not split: preceded by b to unknown
+823DEDE0	THUNK	823DEDE0	b->823E0120 (unknown before GapFill)	823DEDD0-823DEDE8	existed before GapFill (Discover)	entry not split: preceded by b to unknown
+82406940	THUNK	82406940	b->82403518 (unknown before GapFill)	82406938-82406948	existed before GapFill (Discover)	entry not split: preceded by b to unknown
+824813E0	LEAF_TAILCALL	824813E0	bctr (never a split point)	824813CC-824813F4	not registered (other)	entry not split: preceded by bctr
+82481408	LEAF_TAILCALL	82481408	bctr (never a split point)	824813F4-82481430	GapFill-registered, SEALED	entry not split: preceded by bctr
+8256A7D0	THUNK	8256A7D0	b->8259F4D0 (unknown before GapFill)	8256A7C8-8256A7E8	GapFill-registered, SEALED	entry not split: preceded by b to unknown
+82646FF0	JOIN_POINT	82646FB0	b->82646F5C (unknown before GapFill)	82646FA4-82647070	GapFill-registered, later removed (no SEALED)	entry not split: preceded by b to unknown
+826473A0	JOIN_POINT	82647360	b->8264730C (unknown before GapFill)	82647354-82647420	GapFill-registered, later removed (no SEALED)	entry not split: preceded by b to unknown
+82647758	JOIN_POINT	82647718	b->826476C4 (unknown before GapFill)	8264770C-826477D8	GapFill-registered, later removed (no SEALED)	entry not split: preceded by b to unknown
+82647E60	JOIN_POINT	82647E20	b->82647DCC (unknown before GapFill)	82647E14-82647EE0	GapFill-registered, later removed (no SEALED)	entry not split: preceded by b to unknown
+82648240	JOIN_POINT	82648200	b->826481AC (unknown before GapFill)	826481F4-826482C0	GapFill-registered, later removed (no SEALED)	entry not split: preceded by b to unknown
+826EBEE8	LEAF_TAILCALL	826EBEE8	b->82717050 (unknown before GapFill)	826EBEE0-826EBF10	GapFill-registered, later removed (no SEALED)	entry not split: preceded by b to unknown
+826EBF18	THUNK	826EBF18	b->82717060 (unknown before GapFill)	826EBF10-826EBF20	GapFill-registered, SEALED	entry not split: preceded by b to unknown
+826EBF60	LEAF_TAILCALL	826EBF60	bctr (never a split point)	826EBF4C-826EBF68	GapFill-registered, later removed (no SEALED)	entry not split: preceded by bctr
+826EC020	LEAF_TAILCALL	826EC020	b->82717490 (unknown before GapFill)	826EC008-826EC038	GapFill-registered, SEALED	entry not split: preceded by b to unknown
+82717150	THUNK	82717150	b->82738EB8 (unknown before GapFill)	82717148-82717158	GapFill-registered, SEALED	entry not split: preceded by b to unknown
+8284B85C	JOIN_POINT	8284B7E8	b->8284B7D4 (unknown before GapFill)	8284B7B4-8284B864	not registered: start inside PDATA fn	entry not split: preceded by b to unknown
+828C7B10	LEAF_TAILCALL	828C7B10	bctr (never a split point)	828C7B00-828C7B78	GapFill-registered, SEALED	entry not split: preceded by bctr
+828C7B88	LEAF_TAILCALL	828C7B88	bctr (never a split point)	828C7B78-828C7C24	GapFill-registered, SEALED	entry not split: preceded by bctr
+828C7C38	LEAF_TAILCALL	828C7C38	bctr (never a split point)	828C7C28-828C7D04	GapFill-registered, SEALED	entry not split: preceded by bctr
+828C7C48	LEAF_TAILCALL	828C7C48	bctr (never a split point)	828C7C28-828C7D04	GapFill-registered, SEALED	entry not split: preceded by bctr
+828C7C58	LEAF_TAILCALL	828C7C58	bctr (never a split point)	828C7C28-828C7D04	GapFill-registered, SEALED	entry not split: preceded by bctr
+828C7C68	LEAF_TAILCALL	828C7C68	bctr (never a split point)	828C7C28-828C7D04	GapFill-registered, SEALED	entry not split: preceded by bctr
+828D3080	LEAF_TAILCALL	828D3080	b->828D305C (unknown before GapFill)	828D3064-828D3090	not registered: start inside PDATA fn	entry not split: preceded by b to unknown
+828D88F4	JOIN_POINT	828D8888	b->828D8874 (unknown before GapFill)	828D8854-828D88FC	not registered: start inside PDATA fn	entry not split: preceded by b to unknown
+828D8A0C	JOIN_POINT	828D89A0	b->828D898C (unknown before GapFill)	828D896C-828D8A14	not registered: start inside PDATA fn	entry not split: preceded by b to unknown
+82CFF064	JOIN_POINT_UNREFERENCED	82CFF028	b->82CFEFF0 (unknown before GapFill)	82CFF020-82CFF090	GapFill-registered, later removed (no SEALED)	entry not split: preceded by b to unknown
+82F66FF0	LEAF_TAILCALL	82F66FF0	b->82EEF6A0 (unknown before GapFill)	82F66FD0-82F67008	existed before GapFill (Discover)	entry not split: preceded by b to unknown
+82FBBA00	LEAF_TAILCALL	82FBBA00	bctr (never a split point)	82FBB9E8-82FBBA60	existed before GapFill (Discover)	entry not split: preceded by bctr
+8332E2C8	LEAF_TAILCALL	8332E2C8	b->8332E298 (unknown before GapFill)	8332E2A0-8332E2D0	not registered: start inside PDATA fn	entry not split: preceded by b to unknown
