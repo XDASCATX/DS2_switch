@@ -8,6 +8,12 @@
 #     -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20 \
 #     -DCMAKE_C_FLAGS=-march=x86-64-v3 -DCMAKE_CXX_FLAGS=-march=x86-64-v3
 #   cmake --build out/app-host --target ds2 -j2
+#
+# Nintendo Switch (devkitA64 + libnx + the Mesa NVK SDK, see docs/handoff/10-switch-build.md):
+#   cmake -S app -B out/app-switch -G Ninja -DCMAKE_BUILD_TYPE=Release \
+#     -DCMAKE_TOOLCHAIN_FILE=tools/switch/cmake/switch-devkitA64.cmake \
+#     -DREXGLUE_SWITCH_NVK_SDK=<mesa-sdk>/opt/devkitpro/portlibs/switch
+#   cmake --build out/app-switch --target ds2 -j2        -> out/app-switch/ds2.nro
 
 cmake_minimum_required(VERSION 3.25)
 project(ds2 LANGUAGES C CXX)
@@ -43,7 +49,16 @@ set(DS2_SOURCES
 add_executable(ds2 ${DS2_SOURCES})
 target_include_directories(ds2 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${DS2_GENERATED_DIR}")
 target_link_libraries(ds2 PRIVATE ds2_recomp rex::runtime)
-rexglue_configure_target(ds2)
+if(REXGLUE_PLATFORM_SWITCH)
+    # One static executable: the GPU plugin is linked in instead of loaded from a shared library.
+    rexglue_configure_target(ds2 GPU_PLUGINS xenos)
+    rexglue_switch_add_nro(ds2
+        NAME "Dark Souls II SotFS (recomp)"
+        AUTHOR "DS2 Switch port"
+        VERSION "0.1.0")
+else()
+    rexglue_configure_target(ds2)
+endif()
 
 # rex_app.cpp includes imgui.h, but rexruntime links imgui privately, so the include path does not reach the
 # executable when the SDK is a subdirectory (same fix as nfsmw-nx app/CMakeLists.txt; on Switch
@@ -53,4 +68,6 @@ if(NOT REXGLUE_PLATFORM_SWITCH AND TARGET imgui)
 endif()
 
 # Put ds2 next to librexruntime.so (sdk/out/<platform>/) so the $ORIGIN rpath set by rexglue_configure_target finds it.
-set_target_properties(ds2 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:rex::runtime>")
+if(NOT REXGLUE_PLATFORM_SWITCH)
+    set_target_properties(ds2 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:rex::runtime>")
+endif()
