@@ -202,6 +202,9 @@ constexpr Mode kModes[] = {
     {8, "sin cargas de texturas"},
     {16, "sin efecto de presentacion"},
     {32, "sin despacho por baldosas"},
+    {64, "sin bits de stencil en transferencias"},
+    {128, "sin transferencias de profundidad"},
+    {256, "sin transferencias de color"},
     {63, "sin nada"},
 };
 constexpr size_t kModeCount = sizeof(kModes) / sizeof(kModes[0]);

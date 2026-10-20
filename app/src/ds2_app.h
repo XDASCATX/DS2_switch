@@ -46,6 +46,11 @@ class Ds2App : public rex::ReXApp {
   // unless the command line or ds2.toml chose otherwise.
   void OnPostInitLogging() override {
     SetIfDefault("gpu_plugin", "xenos");
+#if defined(__SWITCH__)
+    // Switch defaults proven on the console (docs/handoff/11-switch-level-load-diag.md, tests 20-21):
+    // 16 MB host stacks for ~44 guest threads exhausted the heap (PC measurement: <= 3.6 MB used).
+    SetIfDefault("host_thread_stack_mb", "6");
+#endif
     ds2::watchdog::ApplyPlatformSwitches();
   }
 

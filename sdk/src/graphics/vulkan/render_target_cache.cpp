@@ -5308,7 +5308,11 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             RexSwitchPerfCount(13);
 #endif
 #if REX_PLATFORM_SWITCH
-            if (!RexSwitchPerfSkip(2))
+            // DS2 port: finer A/B lap modes (switch_perf.cpp) - 64 stencil-bit passes (8 per depth transfer
+            // without VK_EXT_shader_stencil_export, which NVK lacks), 128 depth/stencil transfers, 256 color.
+            if (!RexSwitchPerfSkip(2) && !(transfer_is_stencil_bit && RexSwitchPerfSkip(64)) &&
+                !(dest_rt_key.is_depth && RexSwitchPerfSkip(128)) &&
+                !(!dest_rt_key.is_depth && RexSwitchPerfSkip(256)))
 #endif
             command_buffer.CmdVkDraw(transfer_vertex_count, 1, 0, 0);
           }
