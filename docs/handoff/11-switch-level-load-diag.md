@@ -382,3 +382,8 @@ diag12 = diag11 + это; тесты 19 (свой hbloader) и 20 (станда�
 собственный рендерер (`nfsmw-nx/docs/native-renderer.md`).
 Тест 24 (только `ds2.toml`): `render_target_path_vulkan = "fsi"` — EDRAM в буфере через interlock, без переносов
 владения и transfer-draw (NVK на GM20B объявляет `fragmentShaderPixelInterlock`).
+
+## Тест 24 (FSI): зависание на экране загрузки
+
+С `render_target_path_vulkan = "fsi"` игра остановилась на заставке загрузки (логи не сняты). Путь отложен; рабочая
+конфигурация — `11-ds2.toml.test23` (или test21).
