@@ -7,6 +7,7 @@
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/logging.h>
+#include <rex/filesystem.h>
 #include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xfile.h>
@@ -14,7 +15,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <ctime>
+#include <deque>
+#include <filesystem>
+#include <unistd.h>
 #include <map>
 #include <set>
 #include <string>
@@ -70,6 +76,34 @@ std::thread g_thread;
 std::atomic<bool> g_run{false};
 rex::Runtime* g_runtime = nullptr;
 
+// The main log can lose its last seconds when the console is switched off by holding POWER (data handed to the
+// file system but not committed). logs/ds2_wd_last.txt is rewritten and fsync'ed on every heartbeat, so after a
+// forced power-off it still says when the process was last alive and what it was doing.
+std::deque<std::string> g_events;  // recent file events, watchdog thread only
+
+void Note(std::string line) {
+  g_events.push_back(std::move(line));
+  while (g_events.size() > 24) g_events.pop_front();
+}
+
+void WriteDurable(const std::string& heartbeat) {
+  static const std::filesystem::path path = [] {
+    const auto dir = rex::filesystem::GetExecutableFolder();
+    if (dir.empty()) return std::filesystem::path();
+    std::error_code ec;
+    std::filesystem::create_directories(dir / "logs", ec);
+    return dir / "logs" / "ds2_wd_last.txt";
+  }();
+  if (path.empty()) return;
+  FILE* f = std::fopen(path.string().c_str(), "w");
+  if (!f) return;
+  std::fprintf(f, "%s\nrecent file events:\n", heartbeat.c_str());
+  for (const auto& e : g_events) std::fprintf(f, "  %s\n", e.c_str());
+  std::fflush(f);
+  fsync(fileno(f));
+  std::fclose(f);
+}
+
 // One line: is the process alive (this line keeps coming), does the guest see vblanks, and is the GPU command
 // processor still moving (the shaders it binds change while it executes the game's draws).
 void LogHeartbeat(int seconds, size_t threads, size_t files) {
@@ -87,8 +121,14 @@ void LogHeartbeat(int seconds, size_t threads, size_t files) {
   }
   uint64_t used = 0, total = 0;
   ds2::platform::HostMemory(&used, &total);
-  REXLOG_INFO("[ds2 wd] t={}s hb vblank={} cp_vs={:016X} cp_ps={:016X}{} threads={} files={} host_mb={}", seconds,
-              vblank, vs, ps, paused ? " cp_paused" : "", threads, files, used >> 20);
+  const std::string line =
+      fmt::format("[ds2 wd] t={}s hb vblank={} cp_vs={:016X} cp_ps={:016X}{} threads={} files={} host_mb={}", seconds,
+                  vblank, vs, ps, paused ? " cp_paused" : "", threads, files, used >> 20);
+  REXLOG_INFO("{}", line);
+  const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+  char stamp[32] = {};
+  std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+  WriteDurable(std::string(stamp) + " " + line);
 }
 
 constexpr int kStallSeconds = 5;
@@ -154,9 +194,15 @@ void Main() {
     for (auto& f : files) files_now.insert(f->path());
     if (files_now != files_before) {
       for (const auto& p : files_now)
-        if (files_before.count(p) < files_now.count(p)) REXLOG_INFO("[ds2 wd] t={}s file + {}", seconds, p);
+        if (files_before.count(p) < files_now.count(p)) {
+          REXLOG_INFO("[ds2 wd] t={}s file + {}", seconds, p);
+          Note(fmt::format("t={}s + {}", seconds, p));
+        }
       for (const auto& p : files_before)
-        if (files_now.count(p) < files_before.count(p)) REXLOG_INFO("[ds2 wd] t={}s file - {}", seconds, p);
+        if (files_now.count(p) < files_before.count(p)) {
+          REXLOG_INFO("[ds2 wd] t={}s file - {}", seconds, p);
+          Note(fmt::format("t={}s - {}", seconds, p));
+        }
       wrote = true;
     }
 
