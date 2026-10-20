@@ -1,6 +1,7 @@
 // ds2 - small Switch-only queries kept out of the files that include rex headers (switch.h typedefs clash).
 #pragma once
 #include <cstdint>
+#include <string>
 
 namespace ds2::platform {
 // Process memory as Horizon counts it (svcGetInfo UsedMemorySize / TotalMemorySize). false off the Switch.
@@ -19,6 +20,9 @@ struct KernelStats {
   bool valid = false;
 };
 KernelStats QueryKernelStats();
+// The same walk, as text: blocks grouped by (inside/outside the guest window, memory type, permission, attribute),
+// largest groups first. For the 10 s snapshots, to see which kind of mapping multiplies.
+std::string KernelBlockHistogram(size_t max_groups);
 
 // SDK bridge that publishes FPS to SaltyNX overlays (sdk/src/ui/switch_saltynx.cpp). No-op off the Switch.
 void SetSaltyNxBridge(bool enabled);

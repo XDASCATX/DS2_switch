@@ -8,7 +8,14 @@ size_t RexGmCommittedBytes(void);
 size_t RexGmMappedBytes(void);
 void RexSwitchSaltyNxHabilitar(int habilitado);
 uint32_t RexGmLastResult(void);
+uint8_t* RexGmBase(void);
+size_t RexGmSize(void);
 }
+#include <algorithm>
+#include <cstdio>
+#include <map>
+#include <tuple>
+#include <vector>
 #endif
 
 namespace ds2::platform {
@@ -66,6 +73,41 @@ KernelStats QueryKernelStats() {
   k.valid = true;
 #endif
   return k;
+}
+
+std::string KernelBlockHistogram(size_t max_groups) {
+#if defined(__SWITCH__)
+  const u64 gb = reinterpret_cast<u64>(RexGmBase()), ge = gb + RexGmSize();
+  std::map<std::tuple<int, u32, u32, u32>, std::pair<u64, u64>> groups;  // -> (blocks, bytes)
+  u64 addr = 0;
+  for (int guard = 0; guard < 1000000; ++guard) {
+    MemoryInfo mi{};
+    u32 pi = 0;
+    if (R_FAILED(svcQueryMemory(&mi, &pi, addr))) break;
+    const int in_window = (gb && mi.addr >= gb && mi.addr < ge) ? 1 : 0;
+    auto& g = groups[{in_window, mi.type & 0xFF, mi.perm, mi.attr}];
+    g.first += 1;
+    g.second += mi.size;
+    const u64 next = mi.addr + mi.size;
+    if (next <= addr || next == 0) break;
+    addr = next;
+  }
+  std::vector<std::pair<std::tuple<int, u32, u32, u32>, std::pair<u64, u64>>> v(groups.begin(), groups.end());
+  std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+  std::string out;
+  char buf[160];
+  for (size_t i = 0; i < v.size() && i < max_groups; ++i) {
+    const auto& [key, val] = v[i];
+    std::snprintf(buf, sizeof(buf), "%s%s type=0x%02X perm=%u attr=0x%X: %llu blocks %llu MB", i ? "; " : "",
+                  std::get<0>(key) ? "window" : "other", std::get<1>(key), std::get<2>(key), std::get<3>(key),
+                  (unsigned long long)val.first, (unsigned long long)(val.second >> 20));
+    out += buf;
+  }
+  return out;
+#else
+  (void)max_groups;
+  return {};
+#endif
 }
 
 void SetSaltyNxBridge(bool enabled) {

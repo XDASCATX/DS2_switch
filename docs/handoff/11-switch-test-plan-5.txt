@@ -1,0 +1,14 @@
+DS2 Switch - diag6, test 10
+===========================
+Tests 8 and 9 measured it: during the level load the number of memory blocks of the game's process jumps from
+~4,400 to ~10,600 in 4 seconds (heap use grows by only 17 MB in that time), and the 2001-0103 errors start at about
+10,000 blocks, in both tests. After that even other programs fail (log writes, the system monitor overlay you
+opened in test 9, HOME): the kernel objects that describe memory mappings are shared with the system and they ran out.
+
+diag6 adds which KIND of blocks multiply (where they are, type, permissions), logged every time the count changes
+by 500 and saved in ds2_wd_last.txt. That tells which part of the port creates them.
+
+Setup: copy diag6/ds2.nro as sdmc:/switch/ds2/ds2.nro, ds2.toml.test10 as ds2.toml, rename the old logs folder.
+Do NOT open the system monitor/overlay this time (in test 9 that is what froze everything).
+Same steps: Continue -> intro -> loading; when the black screen with water appears, wait 2-3 minutes, then exit
+(HOME -> Close if it works, otherwise power). Send the whole logs folder.

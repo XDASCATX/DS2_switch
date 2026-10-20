@@ -81,6 +81,8 @@ rex::Runtime* g_runtime = nullptr;
 // file system but not committed). logs/ds2_wd_last.txt is rewritten and fsync'ed on every heartbeat, so after a
 // forced power-off it still says when the process was last alive and what it was doing.
 std::deque<std::string> g_events;  // recent file events, watchdog thread only
+std::string g_histogram;           // last kernel block histogram, watchdog thread only
+uint64_t g_histogram_blocks = 0;
 
 void Note(std::string line) {
   g_events.push_back(std::move(line));
@@ -98,7 +100,8 @@ void WriteDurable(const std::string& heartbeat) {
   if (path.empty()) return;
   FILE* f = std::fopen(path.string().c_str(), "w");
   if (!f) return;
-  std::fprintf(f, "%s\nrecent file events:\n", heartbeat.c_str());
+  std::fprintf(f, "%s\nkernel blocks by kind (at %llu blocks): %s\nrecent file events:\n", heartbeat.c_str(),
+               (unsigned long long)g_histogram_blocks, g_histogram.c_str());
   for (const auto& e : g_events) std::fprintf(f, "  %s\n", e.c_str());
   std::fflush(f);
   fsync(fileno(f));
@@ -128,6 +131,12 @@ void LogHeartbeat(int seconds, size_t threads, size_t files) {
       seconds, vblank, vs, ps, paused ? " cp_paused" : "", threads, files, size_t(mi.uordblks) >> 20, k.blocks,
       k.sysres_used >> 10, k.sysres_total >> 10);
   REXLOG_INFO("{}", line);
+  // A fast rise in memory blocks is what preceded every 2001-0103 so far: record what kind of blocks they are.
+  if (k.valid && (g_histogram.empty() || k.blocks > g_histogram_blocks + 500 || k.blocks + 500 < g_histogram_blocks)) {
+    g_histogram = ds2::platform::KernelBlockHistogram(8);
+    g_histogram_blocks = k.blocks;
+    REXLOG_INFO("[ds2 wd] t={}s kernel blocks by kind ({}): {}", seconds, k.blocks, g_histogram);
+  }
   const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
   char stamp[32] = {};
   std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
@@ -244,6 +253,8 @@ void Main() {
       REXLOG_INFO("[ds2 wd] t={}s snapshot: {} guest threads, {} open files", seconds, threads.size(),
                   files_now.size());
       LogMemory("snapshot");
+      if (const std::string h = ds2::platform::KernelBlockHistogram(8); !h.empty())
+        REXLOG_INFO("[ds2 wd] t={}s kernel blocks by kind: {}", seconds, h);
       LogThreads(threads, false);
       wrote = true;
     }
@@ -265,6 +276,8 @@ void Main() {
         REXLOG_ERROR("[ds2 wd] t={}s STALL: {} s without any change in {} guest threads and {} open files",
                      seconds, still, threads.size(), files_now.size());
         LogMemory("stall");
+        if (const std::string h = ds2::platform::KernelBlockHistogram(8); !h.empty())
+          REXLOG_ERROR("[ds2 wd] t={}s kernel blocks by kind: {}", seconds, h);
         LogThreads(threads, true);
         wrote = true;
       }
