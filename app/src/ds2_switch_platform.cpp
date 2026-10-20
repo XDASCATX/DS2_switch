@@ -11,6 +11,7 @@ uint32_t RexGmLastResult(void);
 uint8_t* RexGmBase(void);
 size_t RexGmCoalescedRuns(void);
 size_t RexGmCoalesceFailures(void);
+extern u32 __nx_nv_transfermem_size;
 size_t RexGmSize(void);
 }
 #include <algorithm>
@@ -111,6 +112,48 @@ std::string KernelBlockHistogram(size_t max_groups) {
 #else
   (void)max_groups;
   return {};
+#endif
+}
+
+std::string ResourceLimits() {
+#if defined(__SWITCH__)
+  u64 v = 0;
+  if (R_FAILED(svcGetInfo(&v, InfoType_ResourceLimit, INVALID_HANDLE, 0)) || !v) return {};
+  const Handle h = static_cast<Handle>(v);
+  static const struct {
+    LimitableResource r;
+    const char* name;
+    int shift;
+  } kRes[] = {{LimitableResource_Memory, "memory_mb", 20},
+              {LimitableResource_Threads, "threads", 0},
+              {LimitableResource_Events, "events", 0},
+              {LimitableResource_TransferMemories, "transfer_mems", 0},
+              {LimitableResource_Sessions, "sessions", 0}};
+  std::string out;
+  char buf[64];
+  for (const auto& r : kRes) {
+    s64 cur = 0, max = 0;
+    if (R_SUCCEEDED(svcGetResourceLimitCurrentValue(&cur, h, r.r)) &&
+        R_SUCCEEDED(svcGetResourceLimitLimitValue(&max, h, r.r))) {
+      std::snprintf(buf, sizeof(buf), "%s%s %lld/%lld", out.empty() ? "" : ", ", r.name,
+                    (long long)(cur >> r.shift), (long long)(max >> r.shift));
+      out += buf;
+    }
+  }
+  svcCloseHandle(h);
+  return out;
+#else
+  return {};
+#endif
+}
+
+uint32_t SetNvTransferMemMb(int mb) {
+#if defined(__SWITCH__)
+  if (mb > 0) __nx_nv_transfermem_size = static_cast<u32>(mb) << 20;
+  return __nx_nv_transfermem_size >> 20;
+#else
+  (void)mb;
+  return 0;
 #endif
 }
 

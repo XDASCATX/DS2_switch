@@ -41,6 +41,11 @@ REXCVAR_DEFINE_INT32(ds2_watchdog_heartbeat_s, 2, "DS2",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 // Environment for Mesa/NVK, applied before Vulkan is created (as nfsmw_mesa_entorno in nfsmw-nx), e.g.
 // "NVK_SWITCH_NO_UBO_CBUF=1;MESA_SHADER_CACHE_DISABLE=true".
+REXCVAR_DEFINE_INT32(ds2_switch_nvmap_mb, 0, "DS2",
+                     "Switch: MB of the transfer memory libnx gives nvservices for GPU memory bookkeeping (libnx: 8). "
+                     "0 = leave libnx's value")
+    .range(0, 256)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(ds2_mesa_env, "", "DS2", "Mesa/NVK environment variables, 'NAME=value;NAME=value'")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
@@ -56,6 +61,7 @@ namespace ds2::watchdog {
 void ApplyPlatformSwitches() {
   ds2::platform::SetSaltyNxBridge(REXCVAR_GET(ds2_switch_saltynx));
   REXLOG_INFO("[ds2] SaltyNX overlay bridge: {}", REXCVAR_GET(ds2_switch_saltynx) ? "on" : "off");
+  REXLOG_INFO("[ds2] nvservices transfer memory: {} MB", ds2::platform::SetNvTransferMemMb(REXCVAR_GET(ds2_switch_nvmap_mb)));
   const std::string env = REXCVAR_GET(ds2_mesa_env);
   size_t start = 0;
   while (start < env.size()) {
@@ -253,6 +259,8 @@ void Main() {
       REXLOG_INFO("[ds2 wd] t={}s snapshot: {} guest threads, {} open files", seconds, threads.size(),
                   files_now.size());
       LogMemory("snapshot");
+      if (const std::string r = ds2::platform::ResourceLimits(); !r.empty())
+        REXLOG_INFO("[ds2 wd] t={}s resource limits: {}", seconds, r);
       if (const std::string h = ds2::platform::KernelBlockHistogram(8); !h.empty())
         REXLOG_INFO("[ds2 wd] t={}s kernel blocks by kind: {}", seconds, h);
       LogThreads(threads, false);

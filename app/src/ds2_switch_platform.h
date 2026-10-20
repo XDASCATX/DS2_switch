@@ -25,6 +25,12 @@ KernelStats QueryKernelStats();
 // largest groups first. For the 10 s snapshots, to see which kind of mapping multiplies.
 std::string KernelBlockHistogram(size_t max_groups);
 
+// Process resource limits as "name cur/max" pairs (memory in MB), or "" if unavailable.
+std::string ResourceLimits();
+// libnx's transfer memory for nvservices (__nx_nv_transfermem_size): the area where nvdrv keeps the bookkeeping of
+// every GPU memory object. mb <= 0 leaves libnx's default (8 MB). Must run before Vulkan is created. Returns MB now.
+uint32_t SetNvTransferMemMb(int mb);
+
 // SDK bridge that publishes FPS to SaltyNX overlays (sdk/src/ui/switch_saltynx.cpp). No-op off the Switch.
 void SetSaltyNxBridge(bool enabled);
 }  // namespace ds2::platform
