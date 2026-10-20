@@ -10,6 +10,7 @@
 #include "ds2_capture.h"
 #include "ds2_dlc.h"
 #include "ds2_input_script.h"
+#include "ds2_watchdog.h"
 
 #include <filesystem>
 #include <string>
@@ -43,7 +44,10 @@ class Ds2App : public rex::ReXApp {
 
   // Without a GPU plugin the runtime drops the game's graphics ("no GPU emulation loaded"); default to xenos
   // unless the command line or ds2.toml chose otherwise.
-  void OnPostInitLogging() override { SetIfDefault("gpu_plugin", "xenos"); }
+  void OnPostInitLogging() override {
+    SetIfDefault("gpu_plugin", "xenos");
+    ds2::watchdog::ApplyPlatformSwitches();
+  }
 
   static void SetIfDefault(const char* name, const char* value) {
     if (rex::cvar::GetFlagInfo(name) == nullptr || rex::cvar::HasNonDefaultValue(name)) return;
@@ -65,6 +69,10 @@ class Ds2App : public rex::ReXApp {
   void OnPostLaunchModule(rex::system::XThread* thread) override {
     (void)thread;
     ds2::capture::Start(runtime());
+    ds2::watchdog::Start(runtime());
   }
-  void OnShutdown() override { ds2::capture::Stop(); }
+  void OnShutdown() override {
+    ds2::watchdog::Stop();
+    ds2::capture::Stop();
+  }
 };

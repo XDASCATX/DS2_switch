@@ -10,6 +10,7 @@
 #include <rex/system/xam/content_manager.h>
 #include <rex/system/xcontent.h>
 
+#include <chrono>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -35,6 +36,8 @@ void InstallConfigured(rex::Runtime* runtime) {
     std::error_code ec;
     for (const auto& e : std::filesystem::directory_iterator(exe_dir / "dlc", ec)) {
       if (ec) break;
+      // Skip hidden files: macOS leaves "._<name>" AppleDouble copies next to every file it writes to a FAT card.
+      if (e.path().filename().string().rfind('.', 0) == 0) continue;
       if (e.is_regular_file(ec)) list += (list.empty() ? "" : ";") + rex::path_to_utf8(e.path());
     }
   }
@@ -65,8 +68,13 @@ void InstallConfigured(rex::Runtime* runtime) {
       REXLOG_INFO("[ds2 dlc] {} already installed", name);
       continue;
     }
+    REXLOG_INFO("[ds2 dlc] installing {} (first boot only: the package is unpacked onto the SD card, which takes "
+                "minutes on the console)", rex::path_to_utf8(path));
+    rex::FlushLogging();
+    const auto t0 = std::chrono::steady_clock::now();
     const auto result = content->InstallContent(path);
-    REXLOG_INFO("[ds2 dlc] install {} -> {:08X}", item, uint32_t(result));
+    REXLOG_INFO("[ds2 dlc] install {} -> {:08X} in {:.1f} s", rex::path_to_utf8(path), uint32_t(result),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
   }
 }
 

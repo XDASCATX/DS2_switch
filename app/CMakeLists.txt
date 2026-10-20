@@ -45,6 +45,8 @@ set(DS2_SOURCES
     src/ds2_capture.cpp
     src/ds2_input_script.cpp
     src/ds2_dlc.cpp
+    src/ds2_watchdog.cpp
+    src/ds2_switch_platform.cpp
 )
 add_executable(ds2 ${DS2_SOURCES})
 target_include_directories(ds2 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${DS2_GENERATED_DIR}")

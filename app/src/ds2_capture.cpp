@@ -3,6 +3,7 @@
 #include "ds2_capture.h"
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/runtime.h>
 #include <rex/system/interfaces/graphics.h>
@@ -19,6 +20,8 @@ REXCVAR_DEFINE_STRING(ds2_capture_dir, "", "DS2",
                       "Diagnostic: folder where guest output frames are saved as PPM (empty = off)");
 REXCVAR_DEFINE_INT32(ds2_capture_every_ms, 2000, "DS2", "Diagnostic: interval between captured frames, ms");
 REXCVAR_DEFINE_INT32(ds2_capture_max, 60, "DS2", "Diagnostic: maximum number of captured frames");
+REXCVAR_DEFINE_BOOL(ds2_capture_save, true, "DS2",
+                    "Diagnostic: write the PPM files (false = only log size and non-black share of each capture)");
 
 namespace ds2::capture {
 namespace {
@@ -85,6 +88,12 @@ void Loop(rex::Runtime* runtime, std::filesystem::path dir) {
     }
     char name[64];
     std::snprintf(name, sizeof(name), "frame_%04d.ppm", saved);
+    if (!REXCVAR_GET(ds2_capture_save)) {
+      REXLOG_INFO("[ds2 capture] attempt {}: {}x{} non-black {:.1f}% (not saved)", attempt, img.width, img.height,
+                  100.0 * NonBlackRatio(img));
+      ++saved;
+      continue;
+    }
     const bool ok = WritePpm(dir / name, img);
     REXLOG_INFO("[ds2 capture] attempt {}: {} {}x{} non-black {:.1f}% -> {}", attempt, ok ? "saved" : "FAILED",
                 img.width, img.height, 100.0 * NonBlackRatio(img), (dir / name).string());
@@ -100,7 +109,13 @@ void Start(rex::Runtime* runtime) {
     return;
   }
   g_stop = false;
-  g_thread = std::thread(Loop, runtime, std::filesystem::path(dir));
+  std::filesystem::path path(dir);
+  // Relative to the executable folder, so ds2.toml on the SD card can say "frames" (sdmc:/switch/ds2/frames).
+  if (path.is_relative()) {
+    const auto exe_dir = rex::filesystem::GetExecutableFolder();
+    if (!exe_dir.empty()) path = exe_dir / path;
+  }
+  g_thread = std::thread(Loop, runtime, path);
 }
 
 void Stop() {
