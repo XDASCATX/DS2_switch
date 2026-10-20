@@ -104,14 +104,20 @@ void WriteDurable(const std::string& heartbeat) {
     return dir / "logs" / "ds2_wd_last.txt";
   }();
   if (path.empty()) return;
-  FILE* f = std::fopen(path.string().c_str(), "w");
+  // Written to a temporary file and renamed, so a failing write (the kernel ran out of resources) leaves the
+  // previous version instead of an empty file.
+  const std::string tmp = path.string() + ".tmp";
+  FILE* f = std::fopen(tmp.c_str(), "w");
   if (!f) return;
   std::fprintf(f, "%s\nkernel blocks by kind (at %llu blocks): %s\nrecent file events:\n", heartbeat.c_str(),
                (unsigned long long)g_histogram_blocks, g_histogram.c_str());
   for (const auto& e : g_events) std::fprintf(f, "  %s\n", e.c_str());
-  std::fflush(f);
-  fsync(fileno(f));
+  const bool ok = std::fflush(f) == 0 && fsync(fileno(f)) == 0 && !std::ferror(f);
   std::fclose(f);
+  if (ok) {
+    std::remove(path.string().c_str());
+    std::rename(tmp.c_str(), path.string().c_str());
+  }
 }
 
 // One line: is the process alive (this line keeps coming), does the guest see vblanks, and is the GPU command

@@ -36,6 +36,13 @@
 REXCVAR_DEFINE_BOOL(protect_zero, true, "Memory", "Protect the zero page from reads and writes")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// DS2 Switch port, DIAGNOSTIC ONLY: no page protection for GPU write watches (textures, vertex/index buffers).
+// The GPU then never hears that the game rewrote those pages: stale textures are expected. Used to tell whether
+// the watch traffic is what exhausts the console kernel during the first level load.
+REXCVAR_DEFINE_BOOL(diag_disable_gpu_write_watch, false, "Memory",
+                    "DIAGNOSTIC: do not protect pages for GPU write watches (stale textures expected)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_BOOL(protect_on_release, false, "Memory",
                     "Protect released memory to prevent accesses");
 
@@ -706,6 +713,9 @@ void Memory::UnregisterPhysicalMemoryInvalidationCallback(void* callback_handle)
 void Memory::EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint32_t length,
                                                  bool enable_invalidation_notifications,
                                                  bool enable_data_providers) {
+  if (REXCVAR_GET(diag_disable_gpu_write_watch)) {
+    return;
+  }
   heaps_.vA0000000.EnableAccessCallbacks(physical_address, length,
                                          enable_invalidation_notifications, enable_data_providers);
   heaps_.vC0000000.EnableAccessCallbacks(physical_address, length,

@@ -707,8 +707,67 @@ bool RexGmProtect(uint8_t* address, size_t length, RexGmAccess access, RexGmAcce
     }
 
     std::vector<size_t> remapped; /* pages mapped back in this call, see CoalesceViewRun */
+
+    /*
+     * DS2 port: consecutive pages that need the same kernel operation (all mapped back, or all unmapped) and
+     * whose sources are consecutive in the same chunk's shadow go in ONE svcMapProcessMemory /
+     * svcUnmapProcessMemory call instead of one per 4 KB page. A lifted write watch can cover up to 4 MB, which
+     * used to be 1,024 calls (and 1,024 separate kernel mappings) at once. If the batched call fails, the run is
+     * retried page by page as before, and on a page failure the logical protection of the pages not done is
+     * put back, so the table never says "mapped" for a page that is not.
+     */
+    struct Pending {
+        bool active = false;
+        bool map = false;      /* true: map back (estaba == false); false: unmap */
+        size_t win = 0;        /* window offset of the first page */
+        u64 src = 0;           /* shadow address of the first page */
+        size_t len = 0;
+        std::vector<std::pair<size_t, RexGmAccess>> old;  /* page -> access before this call */
+    } run;
+    auto restore_from = [&](size_t idx) {
+        for (size_t k = idx; k < run.old.size(); ++k) {
+            const auto& [pg, acc] = run.old[k];
+            if (acc == REX_GM_WRITE) s.protection.erase(pg);
+            else s.protection[pg] = acc;
+        }
+    };
+    auto flush = [&]() -> bool {
+        if (!run.active) return true;
+        run.active = false;
+        const Result rc = run.map ? svcMapProcessMemory(s.base + run.win, Proc(), run.src, run.len)
+                                  : svcUnmapProcessMemory(s.base + run.win, Proc(), run.src, run.len);
+        if (R_SUCCEEDED(rc)) {
+            if (run.map) {
+                s.mapped += run.len;
+                remapped.push_back(run.win);
+            } else {
+                s.mapped -= run.len;
+            }
+            return true;
+        }
+        for (size_t k = 0; k < run.len / kPageSize; ++k) {
+            const size_t pg = run.win + k * kPageSize;
+            const u64 sp = run.src + k * kPageSize;
+            const Result r1 = run.map ? svcMapProcessMemory(s.base + pg, Proc(), sp, kPageSize)
+                                      : svcUnmapProcessMemory(s.base + pg, Proc(), sp, kPageSize);
+            if (R_FAILED(r1)) {
+                s.last_result = r1;
+                restore_from(k);
+                return false;
+            }
+            if (run.map) {
+                s.mapped += kPageSize;
+                remapped.push_back(pg);
+            } else {
+                s.mapped -= kPageSize;
+            }
+        }
+        return true;
+    };
+
     for (size_t p = begin; p < end; p += kPageSize) {
-        const bool estaba = (AccessOf(s, p) == REX_GM_WRITE);
+        const RexGmAccess antes = AccessOf(s, p);
+        const bool estaba = (antes == REX_GM_WRITE);
 
         if (estaba != debe_estar) {
             /*
@@ -736,18 +795,20 @@ bool RexGmProtect(uint8_t* address, size_t length, RexGmAccess access, RexGmAcce
                      * remembers whether it works.
                      */
                     if (!ProtegerConPermisos(s.base + p, estaba)) {
-                        const Result rc =
-                            estaba ? svcUnmapProcessMemory(s.base + p, Proc(), src, kPageSize)
-                                   : svcMapProcessMemory(s.base + p, Proc(), src, kPageSize);
-                        if (R_FAILED(rc)) {
-                            s.last_result = rc;
-                            return false;
+                        const bool map = !estaba;
+                        const bool extends = run.active && run.map == map && run.win + run.len == p &&
+                                             run.src + run.len == src;
+                        if (!extends) {
+                            if (!flush()) return false;
+                            run.active = true;
+                            run.map = map;
+                            run.win = p;
+                            run.src = src;
+                            run.len = 0;
+                            run.old.clear();
                         }
-                        if (estaba) s.mapped -= kPageSize;
-                        else {
-                            s.mapped += kPageSize;
-                            remapped.push_back(p);
-                        }
+                        run.len += kPageSize;
+                        run.old.emplace_back(p, antes);
                     }
                 }
                 /*
@@ -760,6 +821,7 @@ bool RexGmProtect(uint8_t* address, size_t length, RexGmAccess access, RexGmAcce
         if (debe_estar) s.protection.erase(p);
         else s.protection[p] = access;
     }
+    if (!flush()) return false;
     /* Pages of the same run would repeat the work: once per run is enough (CoalesceViewRun skips runs that
      * are already one block). */
     for (size_t p : remapped) CoalesceViewRun(s, p);
