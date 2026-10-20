@@ -1,0 +1,14 @@
+DS2 Switch - diag10, test 17
+============================
+Test 16 (write watching OFF) failed exactly like test 15: 2001-0103 about 0.2 s after the level's sound bank
+opens. So the watch storm is NOT the cause either. Ruled out so far: the old driver, the shader cache, the uniform
+buffer path, memory volume (texture cache), nvservices transfer memory, the block count of our process, and the
+write-watch traffic.
+
+diag10 measures the kernel directly: every 2 s it tries up to 512 tiny mapping changes on a private scratch buffer
+and undoes them at once, and writes how many succeeded ("headroom>=512" = plenty; a smaller number = the kernel
+resource is running out). With that we see whether the resource drains slowly during the whole session or
+disappears in one go at the level load, and how fast.
+
+Setup: copy diag10/ds2.nro as sdmc:/switch/ds2/ds2.nro, ds2.toml.test17 as ds2.toml, rename the old logs folder.
+Same steps as always. Send the whole logs folder.

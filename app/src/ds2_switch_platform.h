@@ -25,6 +25,13 @@ KernelStats QueryKernelStats();
 // largest groups first. For the 10 s snapshots, to see which kind of mapping multiplies.
 std::string KernelBlockHistogram(size_t max_groups);
 
+// How many more kernel memory blocks this process can still create right now: changes the cache attribute of
+// every other 4 KB page of a private 8 MB scratch buffer, one call each, until a call fails or max_pages is
+// reached, then restores the whole buffer with one call. Each changed page costs the kernel what any small
+// mapping change costs (memory blocks, and a page table for the region). Returns the pages that succeeded;
+// *fail_rc gets the first failure (0 if none). Switch only; 0 elsewhere.
+uint32_t ProbeKernelHeadroom(uint32_t max_pages, uint32_t* fail_rc);
+
 // Process resource limits as "name cur/max" pairs (memory in MB), or "" if unavailable.
 std::string ResourceLimits();
 // libnx's transfer memory for nvservices (__nx_nv_transfermem_size): the area where nvdrv keeps the bookkeeping of

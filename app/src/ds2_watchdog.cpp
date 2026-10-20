@@ -41,6 +41,11 @@ REXCVAR_DEFINE_INT32(ds2_watchdog_heartbeat_s, 2, "DS2",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 // Environment for Mesa/NVK, applied before Vulkan is created (as nfsmw_mesa_entorno in nfsmw-nx), e.g.
 // "NVK_SWITCH_NO_UBO_CBUF=1;MESA_SHADER_CACHE_DISABLE=true".
+REXCVAR_DEFINE_INT32(ds2_watchdog_probe_pages, 0, "DS2",
+                     "Switch DIAGNOSTIC: every heartbeat, test how many more small kernel mapping changes still "
+                     "succeed, up to this many (0 = off). Shows the kernel resource running out")
+    .range(0, 1024)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(ds2_switch_nvmap_mb, 0, "DS2",
                      "Switch: MB of the transfer memory libnx gives nvservices for GPU memory bookkeeping (libnx: 8). "
                      "0 = leave libnx's value")
@@ -137,11 +142,17 @@ void LogHeartbeat(int seconds, size_t threads, size_t files) {
   }
   const struct mallinfo mi = mallinfo();
   const auto k = ds2::platform::QueryKernelStats();
+  std::string probe;
+  if (const int pp = REXCVAR_GET(ds2_watchdog_probe_pages); pp > 0) {
+    uint32_t rc = 0;
+    const uint32_t left = ds2::platform::ProbeKernelHeadroom(uint32_t(pp), &rc);
+    probe = rc ? fmt::format(" headroom={} (0x{:X})", left, rc) : fmt::format(" headroom>={}", left);
+  }
   const std::string line = fmt::format(
       "[ds2 wd] t={}s hb vblank={} cp_vs={:016X} cp_ps={:016X}{} threads={} files={} malloc_mb={} blocks={} "
       "sysres_kb={}/{} merged_runs={} merge_fail={}",
       seconds, vblank, vs, ps, paused ? " cp_paused" : "", threads, files, size_t(mi.uordblks) >> 20, k.blocks,
-      k.sysres_used >> 10, k.sysres_total >> 10, k.coalesced, k.coalesce_failures);
+      k.sysres_used >> 10, k.sysres_total >> 10, k.coalesced, k.coalesce_failures) + probe;
   REXLOG_INFO("{}", line);
   // A fast rise in memory blocks is what preceded every 2001-0103 so far: record what kind of blocks they are.
   if (k.valid && (g_histogram.empty() || k.blocks > g_histogram_blocks + 500 || k.blocks + 500 < g_histogram_blocks)) {

@@ -2,6 +2,7 @@
 
 #if defined(__SWITCH__)
 #include <cstddef>
+#include <malloc.h>
 #include <switch.h>
 extern "C" {
 size_t RexGmCommittedBytes(void);
@@ -112,6 +113,32 @@ std::string KernelBlockHistogram(size_t max_groups) {
 #else
   (void)max_groups;
   return {};
+#endif
+}
+
+uint32_t ProbeKernelHeadroom(uint32_t max_pages, uint32_t* fail_rc) {
+  if (fail_rc) *fail_rc = 0;
+#if defined(__SWITCH__)
+  constexpr size_t kScratch = 8u << 20;
+  static uint8_t* scratch = static_cast<uint8_t*>(memalign(2u << 20, kScratch));
+  if (!scratch) return 0;
+  const uint32_t pages = std::min<uint32_t>(max_pages, kScratch / 0x2000);
+  uint32_t ok = 0;
+  armDCacheFlush(scratch, kScratch);
+  for (uint32_t i = 0; i < pages; ++i) {
+    const Result rc = svcSetMemoryAttribute(scratch + size_t(i) * 0x2000, 0x1000, 8, 8);
+    if (R_FAILED(rc)) {
+      if (fail_rc) *fail_rc = rc;
+      break;
+    }
+    ++ok;
+  }
+  // Back to normal in one call: the blocks merge again.
+  svcSetMemoryAttribute(scratch, kScratch, 8, 0);
+  return ok;
+#else
+  (void)max_pages;
+  return 0;
 #endif
 }
 
