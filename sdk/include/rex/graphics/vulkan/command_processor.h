@@ -204,6 +204,18 @@ class VulkanCommandProcessor : public CommandProcessor {
   // scope. Submission must be open.
   void EndRenderPass();
 
+  // DS2 port, Switch diagnostics (cvar gpu_zone_timing): GPU time of kinds of work, measured with
+  // timestamp queries around them and summed per submission into the profiler (switch_perf.cpp).
+  enum GpuZone : uint8_t {
+    kGpuZoneTransfers = 0,  // render target ownership transfers and resolve clears
+    kGpuZoneResolve = 1,    // resolves (EDRAM -> guest memory copies, dumps)
+    kGpuZoneTextureLoad = 2,
+    kGpuZoneSwap = 3,       // output gamma / FXAA
+    kGpuZoneCount = 4,
+  };
+  void GpuZoneBegin(GpuZone zone) { GpuZoneWrite(uint8_t(zone)); }
+  void GpuZoneEnd(GpuZone zone) { GpuZoneWrite(uint8_t(zone) | 0x80); }
+
   VkDescriptorSetLayout GetSingleTransientDescriptorLayout(
       SingleTransientDescriptorLayout transient_descriptor_layout) const {
     return descriptor_set_layouts_single_transient_[size_t(transient_descriptor_layout)];
@@ -726,6 +738,25 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkAccessFlags scratch_buffer_last_access_mask_ = 0;
   uint64_t scratch_buffer_last_usage_submission_ = 0;
   bool scratch_buffer_used_ = false;
+
+  // GPU zone timing (see GpuZoneBegin). Tags per query: zone id (begin), id | 0x80 (end), 0xFE submission
+  // start, 0xFF submission end.
+  static constexpr uint32_t kGpuZoneSlots = 8;
+  static constexpr uint32_t kGpuZoneQueriesPerSlot = 1024;
+  struct GpuZoneSlot {
+    uint64_t submission = 0;
+    uint32_t count = 0;
+    bool pending = false;  // recorded, results not read yet
+    uint8_t tags[kGpuZoneQueriesPerSlot];
+  };
+  void GpuZoneWrite(uint8_t tag);
+  void GpuZonesBeginSubmission();
+  void GpuZonesCollect();
+  VkQueryPool gpu_zone_pool_ = VK_NULL_HANDLE;
+  bool gpu_zone_pool_failed_ = false;
+  GpuZoneSlot gpu_zone_slots_[kGpuZoneSlots];
+  GpuZoneSlot* gpu_zone_current_ = nullptr;
+  uint32_t gpu_zone_current_base_ = 0;
 
   static constexpr uint32_t kMaxOcclusionQueries = 8192;
   VkQueryPool occlusion_query_pool_ = VK_NULL_HANDLE;

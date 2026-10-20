@@ -59,6 +59,11 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(gpu_zone_timing, false, "GPU/Vulkan",
+                    "Switch DIAGNOSTIC: measure GPU time of transfers, resolves, texture loads and output with "
+                    "timestamp queries; reported per frame in rex_perfil.log. Adds a little GPU work")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -2709,10 +2714,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           BindExternalComputePipeline(swap_apply_gamma_compute_pipeline);
           uint32_t group_count_x = (guest_output_width + 15) / 16;
           uint32_t group_count_y = (guest_output_height + 7) / 8;
+GpuZoneBegin(kGpuZoneSwap);
 #if REX_PLATFORM_SWITCH
           if (!RexSwitchPerfSkip(16))
 #endif
           deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+GpuZoneEnd(kGpuZoneSwap);
 
           if (use_fxaa) {
             // Make the FXAA source image readable and bind a separate
@@ -2783,10 +2790,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             BindExternalComputePipeline(swap_post_effect == SwapPostEffect::kFxaaExtreme
                                             ? swap_fxaa_extreme_pipeline_
                                             : swap_fxaa_pipeline_);
+GpuZoneBegin(kGpuZoneSwap);
 #if REX_PLATFORM_SWITCH
             if (!RexSwitchPerfSkip(16))
 #endif
             deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+GpuZoneEnd(kGpuZoneSwap);
           }
 
           // Insert the release barrier.
@@ -2941,10 +2950,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
               VK_PIPELINE_BIND_POINT_GRAPHICS, swap_apply_gamma_pipeline_layout_, 0,
               uint32_t(swap_descriptor_sets.size()), swap_descriptor_sets.data(), 0, nullptr);
 
+GpuZoneBegin(kGpuZoneSwap);
 #if REX_PLATFORM_SWITCH
           if (!RexSwitchPerfSkip(16))
 #endif
           deferred_command_buffer_.CmdVkDraw(3, 1, 0, 0);
+GpuZoneEnd(kGpuZoneSwap);
           deferred_command_buffer_.CmdVkEndRenderPass();
 
           // Insert the release barrier.
@@ -3101,6 +3112,9 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
     return false;
   }
   EndRenderPass();
+#if REX_PLATFORM_SWITCH
+  RexSwitchPerfAdd(53, pending_barriers_.size());  // pipeline barriers recorded
+#endif
   for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend(); ++it) {
     auto it_next = std::next(it);
     bool is_last = it_next == pending_barriers_.cend();
@@ -3298,6 +3312,9 @@ void VulkanCommandProcessor::EndRenderPass() {
   if (!in_render_pass_) {
     return;
   }
+#if REX_PLATFORM_SWITCH
+  RexSwitchPerfCount(52);  // render pass instances (counted when they end)
+#endif
   if (current_render_pass_ == VK_NULL_HANDLE) {
     deferred_command_buffer_.CmdVkEndRendering();
   } else {
@@ -5019,6 +5036,113 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
   sample_counts->StencilFail_B = 0;
 }
 
+void VulkanCommandProcessor::GpuZonesBeginSubmission() {
+  gpu_zone_current_ = nullptr;
+#if REX_PLATFORM_SWITCH
+  if (!REXCVAR_GET(gpu_zone_timing) || gpu_zone_pool_failed_) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  if (gpu_zone_pool_ == VK_NULL_HANDLE) {
+    VkQueryPoolCreateInfo pool_info = {};
+    pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    pool_info.queryCount = kGpuZoneSlots * kGpuZoneQueriesPerSlot;
+    if (dfn.vkCreateQueryPool(vulkan_device->device(), &pool_info, nullptr, &gpu_zone_pool_) != VK_SUCCESS) {
+      gpu_zone_pool_failed_ = true;
+      gpu_zone_pool_ = VK_NULL_HANDLE;
+      REXGPU_ERROR("gpu_zone_timing: failed to create the timestamp query pool");
+      return;
+    }
+    REXGPU_INFO("gpu_zone_timing: on ({} slots x {} timestamps)", kGpuZoneSlots, kGpuZoneQueriesPerSlot);
+  }
+  const uint64_t submission = GetCurrentSubmission();
+  const uint32_t slot_index = uint32_t(submission % kGpuZoneSlots);
+  GpuZoneSlot& slot = gpu_zone_slots_[slot_index];
+  if (slot.pending) {
+    // Still in flight or not read yet: this submission goes unmeasured rather than waiting.
+    return;
+  }
+  slot.submission = submission;
+  slot.count = 0;
+  gpu_zone_current_ = &slot;
+  gpu_zone_current_base_ = slot_index * kGpuZoneQueriesPerSlot;
+  deferred_command_buffer_.CmdVkResetQueryPool(gpu_zone_pool_, gpu_zone_current_base_, kGpuZoneQueriesPerSlot);
+  GpuZoneWrite(0xFE);
+#endif
+}
+
+void VulkanCommandProcessor::GpuZoneWrite(uint8_t tag) {
+  GpuZoneSlot* slot = gpu_zone_current_;
+  if (!slot || slot->count >= kGpuZoneQueriesPerSlot - 1 || (tag != 0xFF && slot->count >= kGpuZoneQueriesPerSlot - 2)) {
+    return;  // keep the last query for the submission end
+  }
+  // Bottom of pipe: the time when all earlier work has finished, so the difference of two is the GPU time of
+  // the work between them (the GPU runs one submission's work in order on this driver).
+  deferred_command_buffer_.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_zone_pool_,
+                                               gpu_zone_current_base_ + slot->count);
+  slot->tags[slot->count++] = tag;
+}
+
+void VulkanCommandProcessor::GpuZonesCollect() {
+#if REX_PLATFORM_SWITCH
+  if (gpu_zone_pool_ == VK_NULL_HANDLE) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  // NVK on Horizon reports 1 ns per tick but the counter advances once per 1.627 ns (nfsmw-nx measuring.md).
+  constexpr double kNsPerTick = 1.627;
+  uint64_t values[kGpuZoneQueriesPerSlot];
+  for (uint32_t i = 0; i < kGpuZoneSlots; ++i) {
+    GpuZoneSlot& slot = gpu_zone_slots_[i];
+    if (!slot.pending || slot.submission > submission_completed_) {
+      continue;
+    }
+    slot.pending = false;
+    if (slot.count < 2) {
+      continue;
+    }
+    if (dfn.vkGetQueryPoolResults(vulkan_device->device(), gpu_zone_pool_, i * kGpuZoneQueriesPerSlot,
+                                  slot.count, sizeof(values), values, sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+      continue;
+    }
+    uint64_t zone_ticks[kGpuZoneCount] = {};
+    uint64_t zone_open[kGpuZoneCount] = {};
+    bool zone_is_open[kGpuZoneCount] = {};
+    uint64_t start = 0, end = 0;
+    for (uint32_t q = 0; q < slot.count; ++q) {
+      const uint8_t tag = slot.tags[q];
+      if (tag == 0xFE) {
+        start = values[q];
+      } else if (tag == 0xFF) {
+        end = values[q];
+      } else {
+        const uint8_t zone = tag & 0x7F;
+        if (zone >= kGpuZoneCount) continue;
+        if (!(tag & 0x80)) {
+          zone_open[zone] = values[q];
+          zone_is_open[zone] = true;
+        } else if (zone_is_open[zone]) {
+          if (values[q] >= zone_open[zone]) zone_ticks[zone] += values[q] - zone_open[zone];
+          zone_is_open[zone] = false;
+        }
+      }
+    }
+    if (!start || end < start) {
+      continue;
+    }
+    RexSwitchPerfAdd(42, uint64_t(double(end - start) * kNsPerTick));
+    for (uint32_t z = 0; z < kGpuZoneCount; ++z) {
+      RexSwitchPerfAdd(43 + z, uint64_t(double(zone_ticks[z]) * kNsPerTick));
+    }
+    RexSwitchPerfCount(47);
+  }
+#endif
+}
+
 void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission) {
   // Only report once, no need to retry a wait that won't succeed anyway.
   if (device_lost_) {
@@ -5091,6 +5215,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   submissions_in_flight_fences_.erase(submissions_in_flight_fences_.cbegin(),
                                       submissions_in_flight_fences_awaited_end);
   submission_completed_ += fences_awaited;
+  GpuZonesCollect();
 
   // Reclaim semaphores.
   while (!submissions_in_flight_semaphores_.empty()) {
@@ -5212,6 +5337,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // the end of the submission (when async pipeline object creation requests
     // are fulfilled).
     deferred_command_buffer_.Reset();
+    GpuZonesBeginSubmission();
 
     // Reset cached state of the command buffer.
     dynamic_viewport_update_needed_ = true;
@@ -5385,6 +5511,11 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     }
 
     EndRenderPass();
+    GpuZoneWrite(0xFF);
+    if (gpu_zone_current_) {
+      gpu_zone_current_->pending = true;
+      gpu_zone_current_ = nullptr;
+    }
 
     pipeline_cache_->EndSubmission();
 

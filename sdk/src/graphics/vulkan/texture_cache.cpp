@@ -1626,10 +1626,12 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                           &load_constants.host_offset);
       }
       command_processor_.SubmitBarriers(true);
+      command_processor_.GpuZoneBegin(VulkanCommandProcessor::kGpuZoneTextureLoad);
 #if REX_PLATFORM_SWITCH
       if (!RexSwitchPerfSkip(8))
 #endif
       command_buffer.CmdVkDispatch(group_count_x, group_count_y, load_constants.size_blocks[2]);
+      command_processor_.GpuZoneEnd(VulkanCommandProcessor::kGpuZoneTextureLoad);
       load_constants.guest_offset += level_array_slice_stride_bytes_scaled;
       load_constants.host_offset += uint32_t(level_host_layout.slice_size_bytes);
     }
@@ -1729,11 +1731,13 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                             &load_constants_float_convert.host_offset);
         }
         command_processor_.SubmitBarriers(true);
+        command_processor_.GpuZoneBegin(VulkanCommandProcessor::kGpuZoneTextureLoad);
 #if REX_PLATFORM_SWITCH
         if (!RexSwitchPerfSkip(8))
 #endif
         command_buffer.CmdVkDispatch(group_count_x, group_count_y,
                                      load_constants_float_convert.size_blocks[2]);
+        command_processor_.GpuZoneEnd(VulkanCommandProcessor::kGpuZoneTextureLoad);
         load_constants_float_convert.guest_offset += level_array_slice_stride_bytes;
         load_constants_float_convert.host_offset += level_array_slice_stride_bytes;
       }

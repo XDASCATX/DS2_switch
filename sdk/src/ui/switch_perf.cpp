@@ -103,7 +103,7 @@ constexpr u64 kReportSeconds = 10;
 constexpr u64 kStartDelayNs = 8000000000ULL;
 constexpr size_t kMaxSamples = 1 << 15;
 constexpr size_t kFrames = 10;
-constexpr unsigned kCounterCount = 33;
+constexpr unsigned kCounterCount = 56;
 // In <NRO folder>/logs/rex/ (switch_crash_hooks.c computes it at startup).
 std::string ReportPath() {
   return std::string(RexSwitchLogDir()) + "rex_perfil.log";
@@ -585,6 +585,32 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
                  delta(9) / frames, delta(10) / frames / 921600.0, delta(11) / frames,
                  delta(12) / frames, delta(13) / frames, delta(14) / frames,
                  delta(15) / frames / 1048576.0, delta(16));
+    // DS2 port: render target transfers in detail (render_target_cache.cpp, counters 33-41).
+    std::fprintf(f,
+                 "     transferencias detalle: RT destino profundidad %.1f, color %.1f (MSAA %.1f) | "
+                 "dibujados profundidad %.1f + bits de stencil %.1f, color %.1f, omitidos %.1f | "
+                 "pixeles x pasadas: profundidad %.2f pantallas, color %.2f pantallas\n",
+                 delta(39) / frames, delta(40) / frames, delta(41) / frames, delta(35) / frames,
+                 delta(36) / frames, delta(37) / frames, delta(38) / frames,
+                 delta(33) / frames / 921600.0, delta(34) / frames / 921600.0);
+    // DS2 port: render passes (52), pipeline barriers (53), per-sample transfer pipelines (49), host depth
+    // store dispatches (50) and their pixels (51).
+    std::fprintf(f,
+                 "     pasadas de render %.1f | barreras %.1f | transferencias por muestra (MSAA) %.1f | "
+                 "depth store: %.1f despachos, %.2f pantallas\n",
+                 delta(52) / frames, delta(53) / frames, delta(49) / frames, delta(50) / frames,
+                 delta(51) / frames / 921600.0);
+    // GPU time measured with timestamps (gpu_zone_timing): 42 whole submissions, 43-46 zones, 47 submissions
+    // measured. Zones can nest (resolve clears inside a resolve), so they may add up to more than the total.
+    if (delta(47) > 0) {
+      const double per = 1.0 / delta(47) / 1e6;  // ms per measured submission
+      std::fprintf(f,
+                   "     GPU ms por envio medido (%.0f envios, %.2f por fotograma): total %.1f | transferencias %.1f | "
+                   "resolves %.1f | carga de texturas %.1f | salida %.1f | resto (dibujados y demas) %.1f\n",
+                   delta(47), delta(47) / frames, delta(42) * per, delta(43) * per, delta(44) * per,
+                   delta(45) * per, delta(46) * per,
+                   (delta(42) - delta(43) - delta(44) - delta(45) - delta(46)) * per);
+    }
     std::fprintf(f,
                  "     dibujados por ancho de superficie: 1600+ %.0f | 1280-1599 %.0f | "
                  "640-1279 %.0f | 256-639 %.0f | menos de 256 %.0f\n",

@@ -1139,10 +1139,23 @@ void VulkanRenderTargetCache::EndSubmission() {
   }
 }
 
+namespace {
+// DS2 port: GPU zone timing (VulkanCommandProcessor::GpuZoneBegin, cvar gpu_zone_timing).
+struct GpuZoneScope {
+  VulkanCommandProcessor& cp;
+  VulkanCommandProcessor::GpuZone zone;
+  GpuZoneScope(VulkanCommandProcessor& c, VulkanCommandProcessor::GpuZone z) : cp(c), zone(z) {
+    cp.GpuZoneBegin(zone);
+  }
+  ~GpuZoneScope() { cp.GpuZoneEnd(zone); }
+};
+}  // namespace
+
 bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                       VulkanSharedMemory& shared_memory,
                                       VulkanTextureCache& texture_cache,
                                       uint32_t& written_address_out, uint32_t& written_length_out) {
+  GpuZoneScope gpu_zone(command_processor_, VulkanCommandProcessor::kGpuZoneResolve);
   written_address_out = 0;
   written_length_out = 0;
 
@@ -4581,6 +4594,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     const uint64_t* render_target_resolve_clear_values,
     const Transfer::Rectangle* resolve_clear_rectangle) {
   assert_true(GetPath() == Path::kHostRenderTargets);
+  GpuZoneScope gpu_zone(command_processor_, VulkanCommandProcessor::kGpuZoneTransfers);
 #if REX_PLATFORM_SWITCH
   RexSwitchPerfCount(11);
   if (render_target_transfers) {
@@ -4692,6 +4706,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         if (!RexSwitchPerfSkip(2))
 #endif
         command_buffer.CmdVkDispatch(group_count_x, group_count_y, 1);
+#if REX_PLATFORM_SWITCH
+        RexSwitchPerfCount(50);  // host depth store dispatches (depth kept in the EDRAM buffer)
+        RexSwitchPerfAdd(51, uint64_t(transfer_rectangles[j].width_pixels) * transfer_rectangles[j].height_pixels);
+#endif
         MarkEdramBufferModified();
       }
     }
@@ -4879,6 +4897,11 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                                                           : dest_vulkan_rt.view_color_transfer();
 
     if (!current_transfers.empty()) {
+#if REX_PLATFORM_SWITCH
+      // 39 depth / 40 colour render targets receiving transfers, 41 of them multisampled.
+      RexSwitchPerfCount(dest_rt_key.is_depth ? 39 : 40);
+      if (dest_rt_key.msaa_samples != xenos::MsaaSamples::k1X) RexSwitchPerfCount(41);
+#endif
       uint32_t dest_pitch_tiles = dest_rt_key.GetPitchTiles();
       bool dest_is_64bpp = dest_rt_key.Is64bpp();
 
@@ -5122,6 +5145,22 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           assert_not_zero(transfer_invocation_rectangle_count);
           for (uint32_t j = 0; j < transfer_invocation_rectangle_count; ++j) {
             const Transfer::Rectangle& transfer_rectangle = transfer_invocation_rectangles[j];
+#if REX_PLATFORM_SWITCH
+            // DS2 port: transferred pixels, depth (33) / colour (34), times the passes drawn over them.
+            {
+              // Passes actually drawn: render_target_transfer_skip leaves some out.
+              const uint32_t skip = uint32_t(REXCVAR_GET(render_target_transfer_skip));
+              const bool drawn = !(transfer_is_stencil_bit && (skip & 1)) && !(dest_rt_key.is_depth && (skip & 2)) &&
+                                 !(!dest_rt_key.is_depth && (skip & 4));
+              RexSwitchPerfAdd(dest_rt_key.is_depth ? 33 : 34,
+                               drawn ? uint64_t(transfer_rectangle.width_pixels) * transfer_rectangle.height_pixels *
+                                           transfer_sample_pipeline_count * (transfer_is_stencil_bit ? 8u : 1u)
+                                     : 0);
+              if (drawn && transfer_sample_pipeline_count > 1) {
+                RexSwitchPerfAdd(49, transfer_sample_pipeline_count);  // per-sample pipelines drawn
+              }
+            }
+#endif
             float transfer_rectangle_x0 = -1.0f + transfer_rectangle.x_pixels * pixels_to_ndc_x;
             float transfer_rectangle_y0 = -1.0f + transfer_rectangle.y_pixels * pixels_to_ndc_y;
             float transfer_rectangle_x1 =
@@ -5328,6 +5367,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                             !(transfer_is_stencil_bit && RexSwitchPerfSkip(64)) &&
                             !(dest_rt_key.is_depth && RexSwitchPerfSkip(128)) &&
                             !(!dest_rt_key.is_depth && RexSwitchPerfSkip(256));
+#endif
+#if REX_PLATFORM_SWITCH
+            // 35 depth transfer draws, 36 of them stencil-bit passes, 37 colour transfer draws, 38 skipped.
+            RexSwitchPerfCount(!transfer_draw ? 38 : !dest_rt_key.is_depth ? 37 : transfer_is_stencil_bit ? 36 : 35);
 #endif
             if (transfer_draw)
             command_buffer.CmdVkDraw(transfer_vertex_count, 1, 0, 0);
