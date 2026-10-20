@@ -5,7 +5,7 @@
 ~1 кадр в секунду, красноватый оттенок 3D (как на ПК).
 
 ## Сборка
-- Ветка `diag/switch-level-load`, тег `switch-ingame-1`; NRO = `releases/diag12` (sha256 `39a08daa…906b`, в GitHub
+- Ветка `diag/switch-level-load`, ветка-снимок `switch/ingame-1` (тег `switch-ingame-1` только локально: прокси не пропускает теги); NRO = `releases/diag12` (sha256 `39a08daa…906b`, в GitHub
   не публикуется: производное от игры).
 - Тулчейн и Mesa — `docs/handoff/10-switch-build.md`.
 - Настройки — `docs/handoff/11-ds2.toml.test21` (обязательно `host_thread_stack_mb = 6`).
