@@ -52,6 +52,11 @@ REXCVAR_DEFINE_INT32(ds2_watchdog_probe_tables, 32, "DS2",
                      "them with the whole system (pt_left in the heartbeat)")
     .range(0, 128)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(ds2_switch_commit_granule_kb, 2048, "DS2",
+                     "Switch: guest memory is committed in aligned pieces of this size (KB, power of two). 2048 lets "
+                     "the kernel map each piece without page tables; 4 = the SDK's original exact commits")
+    .range(4, 65536)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(ds2_switch_nvmap_mb, 0, "DS2",
                      "Switch: MB of the transfer memory libnx gives nvservices for GPU memory bookkeeping (libnx: 8). "
                      "0 = leave libnx's value")
@@ -72,6 +77,12 @@ namespace ds2::watchdog {
 void ApplyPlatformSwitches() {
   ds2::platform::SetSaltyNxBridge(REXCVAR_GET(ds2_switch_saltynx));
   REXLOG_INFO("[ds2] SaltyNX overlay bridge: {}", REXCVAR_GET(ds2_switch_saltynx) ? "on" : "off");
+  {
+    const size_t g = ds2::platform::SetCommitGranule(size_t(REXCVAR_GET(ds2_switch_commit_granule_kb)) << 10);
+    const auto k = ds2::platform::QueryKernelStats();
+    REXLOG_INFO("[ds2] guest commit granule: {} KB; own system resource: {} KB{}", g >> 10, k.sysres_total >> 10,
+                k.sysres_total ? "" : " (none: page tables come from the kernel heap shared with the system)");
+  }
   REXLOG_INFO("[ds2] nvservices transfer memory: {} MB", ds2::platform::SetNvTransferMemMb(REXCVAR_GET(ds2_switch_nvmap_mb)));
   const std::string env = REXCVAR_GET(ds2_mesa_env);
   size_t start = 0;
@@ -159,7 +170,7 @@ void LogHeartbeat(int seconds, size_t threads, size_t files) {
     const uint32_t left = ds2::platform::ProbePageTableHeadroom(uint32_t(pt), &rc);
     probe += rc ? fmt::format(" pt_left={} (0x{:X})", left, rc) : fmt::format(" pt_left>={}", left);
   }
-  if (k.valid) probe += fmt::format(" pt_win={}/{}", k.pt_windows_split, k.pt_windows_mapped);
+  if (k.valid) probe += fmt::format(" pt_win={}/{} chunks={}", k.pt_windows_split, k.pt_windows_mapped, k.chunks);
   const std::string line = fmt::format(
       "[ds2 wd] t={}s hb vblank={} cp_vs={:016X} cp_ps={:016X}{} threads={} files={} malloc_mb={} blocks={} "
       "sysres_kb={}/{} merged_runs={} merge_fail={}",

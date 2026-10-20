@@ -21,6 +21,7 @@ struct KernelStats {
   // 2 MB windows of the address space that hold any mapping (upper bound of level-3 page tables) and windows cut by
   // a block edge (they need a page table whatever the physical layout: lower bound).
   uint64_t pt_windows_mapped = 0, pt_windows_split = 0;
+  uint64_t chunks = 0;  // committed guest-memory chunks (each: heap backing + code alias + lazy view mappings)
   bool valid = false;
 };
 KernelStats QueryKernelStats();
@@ -43,6 +44,9 @@ uint32_t ProbePageTableHeadroom(uint32_t max_tables, uint32_t* fail_rc);
 
 // Process resource limits as "name cur/max" pairs (memory in MB), or "" if unavailable.
 std::string ResourceLimits();
+// Guest memory commit granule (RexGmSetCommitGranule). Must run before the guest memory is created. Returns the
+// granule in effect (0 off the Switch).
+size_t SetCommitGranule(size_t bytes);
 // libnx's transfer memory for nvservices (__nx_nv_transfermem_size): the area where nvdrv keeps the bookkeeping of
 // every GPU memory object. mb <= 0 leaves libnx's default (8 MB). Must run before Vulkan is created. Returns MB now.
 uint32_t SetNvTransferMemMb(int mb);

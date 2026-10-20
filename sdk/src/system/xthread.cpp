@@ -43,6 +43,10 @@
 #include "../core/threading_switch.h"
 #endif
 
+REXCVAR_DEFINE_INT32(host_thread_stack_mb, 16, "Kernel",
+                     "Host stack of each guest thread, MB. Measured on PC (DS2): at most ~3.6 MB used. On Switch each "
+                     "stack is a separate mapping that needs ~1 page table per 2 MB")
+    .range(1, 64);
 REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
                     "Ignores game-specified thread priorities");
 
@@ -464,7 +468,7 @@ X_STATUS XThread::Create() {
   RetainHandle();
 
   rex::thread::Thread::CreationParameters params;
-  params.stack_size = 16_MiB;  // Allocate a big host stack.
+  params.stack_size = size_t(REXCVAR_GET(host_thread_stack_mb)) << 20;  // big host stack
   params.create_suspended = true;
   thread_ = rex::thread::Thread::Create(params, [this]() {
     rex::initialize_seh_thread();
@@ -1438,7 +1442,7 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
 
     rex::thread::Thread::CreationParameters params;
     params.create_suspended = true;  // Not done restoring yet.
-    params.stack_size = 16_MiB;
+    params.stack_size = size_t(REXCVAR_GET(host_thread_stack_mb)) << 20;
     thread->thread_ = rex::thread::Thread::Create(params, [thread, state]() {
       // Set thread ID override. This is used by logging.
       rex::thread::set_current_thread_id(thread->handle());

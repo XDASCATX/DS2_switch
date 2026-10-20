@@ -13,6 +13,7 @@
 #include <atomic>
 #include <mutex>
 #include <vector>
+#include <algorithm>
 #include <iterator>
 
 namespace {
@@ -23,6 +24,15 @@ constexpr size_t kPageSize  = 0x1000;
  * page table.
  */
 constexpr size_t kBlockSize = 0x200000;
+
+/*
+ * Commit granule (DS2 port). Committing exactly the requested range left hundreds of small chunks at
+ * arbitrary 4 KB offsets; each one needs level-3 page tables in the heap (its backing), in the code alias
+ * and in every view, and under hbloader those tables come from a kernel heap shared with the whole system
+ * (2001-0103 for everybody once it is dry). With a 2 MB granule every chunk is one 2 MB-aligned 2 MB piece,
+ * which the kernel can map with a single block descriptor and no page table. 0x1000 = the old behaviour.
+ */
+size_t g_commit_granule = 0x200000;
 
 constexpr size_t AlignDown(size_t v, size_t a) { return v & ~(a - 1); }
 constexpr size_t AlignUp(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
@@ -416,8 +426,14 @@ uint8_t* RexGmInit(size_t size) {
     std::lock_guard<std::mutex> lock(s.mutex);
     if (s.base) return s.base;
 
+    /*
+     * virtmemFind*'s second argument is a guard size, not an alignment: libnx returns any 4 KB-aligned
+     * address. A window at a random 4 KB offset can never be mapped with 2 MB block descriptors, so every
+     * view mapping took level-3 page tables (DS2 port). Ask for 2 MB more and align inside it.
+     */
     virtmemLock();
-    s.base = static_cast<uint8_t*>(virtmemFindAslr(size, kBlockSize));
+    void* found = virtmemFindAslr(size + kBlockSize, 0);
+    s.base = found ? reinterpret_cast<uint8_t*>(AlignUp(reinterpret_cast<size_t>(found), kBlockSize)) : nullptr;
     if (s.base) s.reservation = virtmemAddReservation(s.base, size);
     virtmemUnlock();
 
@@ -499,6 +515,19 @@ int RexGmModoProteccion(void) {
 }
 
 size_t RexGmCoalescedRuns(void) { return g_coalesce_runs; }
+
+void RexGmSetCommitGranule(size_t granule) {
+    if (granule < kPageSize || (granule & (granule - 1)) != 0) granule = kPageSize;
+    g_commit_granule = granule;
+}
+
+size_t RexGmCommitGranule(void) { return g_commit_granule; }
+
+size_t RexGmChunkCount(void) {
+    State& s = S();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    return s.chunks.size();
+}
 size_t RexGmCoalesceFailures(void) { return g_coalesce_failures; }
 
 uint32_t RexGmLastResult(void) {
@@ -542,8 +571,9 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
     std::lock_guard<std::mutex> lock(s.mutex);
     if (!s.base) return false;
 
-    const size_t begin = AlignDown(offset, kPageSize);
-    const size_t end   = AlignUp(offset + length, kPageSize);
+    const size_t gran  = g_commit_granule > kPageSize ? g_commit_granule : kPageSize;
+    const size_t begin = AlignDown(offset, gran);
+    const size_t end   = std::min(AlignUp(offset + length, gran), s.size);
 
     size_t cur = begin;
     while (cur < end) {
@@ -558,7 +588,10 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
         if (sig != s.chunks.end() && sig->second.offset < hueco_fin)
             hueco_fin = sig->second.offset;
 
-        const size_t tam = hueco_fin - cur;
+        /* Granule mode: one chunk per granule, so views still map lazily, 2 MB at a time. */
+        const size_t tam = gran > kPageSize ? std::min(hueco_fin - cur, gran - (cur & (gran - 1)))
+                                            : hueco_fin - cur;
+        hueco_fin = cur + tam;
         const size_t align = (tam >= kBlockSize && (cur & (kBlockSize - 1)) == 0)
                                  ? kBlockSize : kPageSize;
 
@@ -570,7 +603,10 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
         memset(backing, 0, tam);
 
         virtmemLock();
-        void* shadow = virtmemFindCodeMemory(tam, align);
+        /* As for the window: the second argument of virtmemFind* is a guard, so align by hand. */
+        void* shadow = virtmemFindCodeMemory(tam + (align > kPageSize ? align : 0), 0);
+        if (shadow && align > kPageSize)
+            shadow = reinterpret_cast<void*>(AlignUp(reinterpret_cast<size_t>(shadow), align));
         Result rc = shadow ? svcMapProcessCodeMemory(Proc(), reinterpret_cast<u64>(shadow),
                                                      reinterpret_cast<u64>(backing), tam)
                            : 0;

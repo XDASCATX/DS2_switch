@@ -14,6 +14,9 @@ size_t RexGmCoalescedRuns(void);
 size_t RexGmCoalesceFailures(void);
 extern u32 __nx_nv_transfermem_size;
 size_t RexGmSize(void);
+void RexGmSetCommitGranule(size_t granule);
+size_t RexGmCommitGranule(void);
+size_t RexGmChunkCount(void);
 }
 #include <algorithm>
 #include <cstdio>
@@ -93,6 +96,7 @@ KernelStats QueryKernelStats() {
   }
   k.last_gm = RexGmLastResult();
   k.coalesced = RexGmCoalescedRuns();
+  k.chunks = RexGmChunkCount();
   k.coalesce_failures = RexGmCoalesceFailures();
   k.valid = true;
 #endif
@@ -233,6 +237,16 @@ std::string ResourceLimits() {
   return out;
 #else
   return {};
+#endif
+}
+
+size_t SetCommitGranule(size_t bytes) {
+#if defined(__SWITCH__)
+  RexGmSetCommitGranule(bytes);
+  return RexGmCommitGranule();
+#else
+  (void)bytes;
+  return 0;
 #endif
 }
 

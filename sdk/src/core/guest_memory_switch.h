@@ -172,6 +172,15 @@ size_t RexGmCoalescedRuns(void);
 size_t RexGmCoalesceFailures(void);
 
 /*
+ * Commit granule (DS2 port): commits are widened to multiples of it, aligned to it, one chunk per granule.
+ * Power of two >= 4 KB; 4 KB = commit exactly what is asked (the original behaviour). Default 2 MB. Set it
+ * before the first commit.
+ */
+void RexGmSetCommitGranule(size_t granule);
+size_t RexGmCommitGranule(void);
+size_t RexGmChunkCount(void);
+
+/*
  * Tells whether watched pages are protected with permissions (readable) or by
  * unmapping (not readable). It is printed in the profile header to show which
  * of the two paths Horizon took. 0 = not tried yet, 1 = permissions,
