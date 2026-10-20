@@ -3115,6 +3115,7 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
 #if REX_PLATFORM_SWITCH
   RexSwitchPerfAdd(53, pending_barriers_.size());  // pipeline barriers recorded
 #endif
+  GpuZoneBegin(kGpuZoneBarrier);
   for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend(); ++it) {
     auto it_next = std::next(it);
     bool is_last = it_next == pending_barriers_.cend();
@@ -3134,6 +3135,7 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
                  it->image_memory_barriers_offset),
         pending_barriers_image_memory_barriers_.data() + it->image_memory_barriers_offset);
   }
+  GpuZoneEnd(kGpuZoneBarrier);
   pending_barriers_.clear();
   pending_barriers_buffer_memory_barriers_.clear();
   pending_barriers_image_memory_barriers_.clear();
@@ -4196,9 +4198,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
 #if REX_PLATFORM_SWITCH
+    if (regs.Get<reg::RB_SURFACE_INFO>().msaa_samples != xenos::MsaaSamples::k1X) RexSwitchPerfCount(54);
+    GpuZoneBegin(kGpuZoneGuestDraw);
     if (!RexSwitchPerfSkip(1))
 #endif
     deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
+    GpuZoneEnd(kGpuZoneGuestDraw);
   } else {
     std::pair<VkBuffer, VkDeviceSize> index_buffer;
     switch (primitive_processing_result.index_buffer_type) {
@@ -4230,10 +4235,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
             ? VK_INDEX_TYPE_UINT16
             : VK_INDEX_TYPE_UINT32);
 #if REX_PLATFORM_SWITCH
+    if (regs.Get<reg::RB_SURFACE_INFO>().msaa_samples != xenos::MsaaSamples::k1X) RexSwitchPerfCount(54);
+    GpuZoneBegin(kGpuZoneGuestDraw);
     if (!RexSwitchPerfSkip(1))
 #endif
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
+    GpuZoneEnd(kGpuZoneGuestDraw);
   }
 
   // Invalidate textures in memexported memory and watch for changes.
@@ -5110,6 +5118,7 @@ void VulkanCommandProcessor::GpuZonesCollect() {
       continue;
     }
     uint64_t zone_ticks[kGpuZoneCount] = {};
+    uint64_t zone_instances[kGpuZoneCount] = {};
     uint64_t zone_open[kGpuZoneCount] = {};
     bool zone_is_open[kGpuZoneCount] = {};
     uint64_t start = 0, end = 0;
@@ -5127,6 +5136,7 @@ void VulkanCommandProcessor::GpuZonesCollect() {
           zone_is_open[zone] = true;
         } else if (zone_is_open[zone]) {
           if (values[q] >= zone_open[zone]) zone_ticks[zone] += values[q] - zone_open[zone];
+          ++zone_instances[zone];
           zone_is_open[zone] = false;
         }
       }
@@ -5136,7 +5146,8 @@ void VulkanCommandProcessor::GpuZonesCollect() {
     }
     RexSwitchPerfAdd(42, uint64_t(double(end - start) * kNsPerTick));
     for (uint32_t z = 0; z < kGpuZoneCount; ++z) {
-      RexSwitchPerfAdd(43 + z, uint64_t(double(zone_ticks[z]) * kNsPerTick));
+      RexSwitchPerfAdd(56 + z, uint64_t(double(zone_ticks[z]) * kNsPerTick));
+      RexSwitchPerfAdd(66 + z, zone_instances[z]);
     }
     RexSwitchPerfCount(47);
   }

@@ -211,7 +211,11 @@ class VulkanCommandProcessor : public CommandProcessor {
     kGpuZoneResolve = 1,    // resolves (EDRAM -> guest memory copies, dumps)
     kGpuZoneTextureLoad = 2,
     kGpuZoneSwap = 3,       // output gamma / FXAA
-    kGpuZoneCount = 4,
+    kGpuZoneTransferDepthDraw = 4,  // the transfer draws themselves, into depth render targets
+    kGpuZoneTransferColorDraw = 5,  // ... into colour render targets
+    kGpuZoneBarrier = 6,    // recorded pipeline barriers (the GPU drain they cause)
+    kGpuZoneGuestDraw = 7,  // the game's own draws (vkCmdDraw/DrawIndexed)
+    kGpuZoneCount = 8,
   };
   void GpuZoneBegin(GpuZone zone) { GpuZoneWrite(uint8_t(zone)); }
   void GpuZoneEnd(GpuZone zone) { GpuZoneWrite(uint8_t(zone) | 0x80); }
@@ -742,7 +746,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // GPU zone timing (see GpuZoneBegin). Tags per query: zone id (begin), id | 0x80 (end), 0xFE submission
   // start, 0xFF submission end.
   static constexpr uint32_t kGpuZoneSlots = 8;
-  static constexpr uint32_t kGpuZoneQueriesPerSlot = 1024;
+  static constexpr uint32_t kGpuZoneQueriesPerSlot = 4096;
   struct GpuZoneSlot {
     uint64_t submission = 0;
     uint32_t count = 0;

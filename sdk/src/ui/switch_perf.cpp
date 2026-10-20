@@ -103,7 +103,7 @@ constexpr u64 kReportSeconds = 10;
 constexpr u64 kStartDelayNs = 8000000000ULL;
 constexpr size_t kMaxSamples = 1 << 15;
 constexpr size_t kFrames = 10;
-constexpr unsigned kCounterCount = 56;
+constexpr unsigned kCounterCount = 76;
 // In <NRO folder>/logs/rex/ (switch_crash_hooks.c computes it at startup).
 std::string ReportPath() {
   return std::string(RexSwitchLogDir()) + "rex_perfil.log";
@@ -600,16 +600,23 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
                  "depth store: %.1f despachos, %.2f pantallas\n",
                  delta(52) / frames, delta(53) / frames, delta(49) / frames, delta(50) / frames,
                  delta(51) / frames / 921600.0);
-    // GPU time measured with timestamps (gpu_zone_timing): 42 whole submissions, 43-46 zones, 47 submissions
-    // measured. Zones can nest (resolve clears inside a resolve), so they may add up to more than the total.
+    // GPU time measured with timestamps (gpu_zone_timing): 42 whole submissions (ns), 47 submissions measured,
+    // 56+z zone ns, 66+z zone instances (command_processor.h GpuZone). Zones nest (transfer draws and barriers
+    // inside transfers, resolve clears inside resolves), so they do not add up to the total.
     if (delta(47) > 0) {
       const double per = 1.0 / delta(47) / 1e6;  // ms per measured submission
-      std::fprintf(f,
-                   "     GPU ms por envio medido (%.0f envios, %.2f por fotograma): total %.1f | transferencias %.1f | "
-                   "resolves %.1f | carga de texturas %.1f | salida %.1f | resto (dibujados y demas) %.1f\n",
-                   delta(47), delta(47) / frames, delta(42) * per, delta(43) * per, delta(44) * per,
-                   delta(45) * per, delta(46) * per,
-                   (delta(42) - delta(43) - delta(44) - delta(45) - delta(46)) * per);
+      static const char* const kZoneNames[8] = {"transferencias (todo)", "resolves", "carga de texturas",
+                                                "salida", "dibujados de transferencia a profundidad",
+                                                "dibujados de transferencia a color", "barreras",
+                                                "dibujados del juego"};
+      std::fprintf(f, "     GPU ms por envio medido (%.0f envios, %.2f por fotograma): total %.1f |", delta(47),
+                   delta(47) / frames, delta(42) * per);
+      for (unsigned z = 0; z < 8; ++z) {
+        const double n = delta(66 + z) / delta(47);
+        std::fprintf(f, " %s %.1f (%.0f x %.0f us)%s", kZoneNames[z], delta(56 + z) * per, n,
+                     n > 0 ? delta(56 + z) * per * 1000.0 / n : 0.0, z < 7 ? " |" : "\n");
+      }
+      std::fprintf(f, "     dibujados del juego en RT con MSAA: %.1f por fotograma\n", delta(54) / frames);
     }
     std::fprintf(f,
                  "     dibujados por ancho de superficie: 1600+ %.0f | 1280-1599 %.0f | "

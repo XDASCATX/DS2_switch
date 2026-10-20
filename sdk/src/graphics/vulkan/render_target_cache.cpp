@@ -5372,8 +5372,13 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             // 35 depth transfer draws, 36 of them stencil-bit passes, 37 colour transfer draws, 38 skipped.
             RexSwitchPerfCount(!transfer_draw ? 38 : !dest_rt_key.is_depth ? 37 : transfer_is_stencil_bit ? 36 : 35);
 #endif
-            if (transfer_draw)
-            command_buffer.CmdVkDraw(transfer_vertex_count, 1, 0, 0);
+            if (transfer_draw) {
+              const auto transfer_zone = dest_rt_key.is_depth ? VulkanCommandProcessor::kGpuZoneTransferDepthDraw
+                                                              : VulkanCommandProcessor::kGpuZoneTransferColorDraw;
+              command_processor_.GpuZoneBegin(transfer_zone);
+              command_buffer.CmdVkDraw(transfer_vertex_count, 1, 0, 0);
+              command_processor_.GpuZoneEnd(transfer_zone);
+            }
           }
         }
       }
