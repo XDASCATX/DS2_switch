@@ -371,3 +371,14 @@ diag12 = diag11 + это; тесты 19 (свой hbloader) и 20 (станда�
   IPC + простой GPU.
 - Тест 23 (только `ds2.toml`): `occlusion_query_enable = false` (подставляется 1000 — «всё видно»). Если подтвердится —
   сделать асинхронную выдачу результатов (без ожидания GPU).
+
+## Тест 23 (occlusion queries выключены): почти без изменений — узкое место GPU
+
+1,3–2,0 кадр/с (было 1,3–1,9). Ожидания fence те же (198/с, 984 мс/с), `kickoff` 4/с, 830 предупреждений
+`native submission pressure (0xd5c)`: в полёте 2 отправки по ~1000 записей GPFIFO (1997 записей, ~220 КБ команд),
+`nvGpuChannelKickoff` ждёт по 180–330 мс, пока GPU освободит канал. То есть GPU не успевает: на кадр ~43 resolve
+(15,4 экрана), ~94 переноса владения render target, ~350 «transfer»-draw, 659 draw с суммарной площадью scissor
+374 экрана. nfsmw-nx на том же пути эмуляции Xenos получил 2 кадр/с в гонке (resolve 3–4 мс GPU каждый) и перешёл на
+собственный рендерер (`nfsmw-nx/docs/native-renderer.md`).
+Тест 24 (только `ds2.toml`): `render_target_path_vulkan = "fsi"` — EDRAM в буфере через interlock, без переносов
+владения и transfer-draw (NVK на GM20B объявляет `fragmentShaderPixelInterlock`).

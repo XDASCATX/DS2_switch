@@ -1,0 +1,18 @@
+# Test 24 - diag12 NRO. Test 23 plus the fragment-shader-interlock render target path (EDRAM emulated in a
+# buffer inside the pixel shaders). Test 23: GPU-bound, ~1.4-2 FPS, the GPU channel full (kickoff timeouts), per
+# frame ~45 resolves (15 screens), ~95 render-target ownership transfers and ~350 transfer draws - all of which
+# exist only on the host render target path. NVK exposes fragmentShaderPixelInterlock on this GPU.
+log_level = "info"
+ds2_watchdog = true
+ds2_switch_saltynx = false
+ds2_mesa_env = "MESA_SHADER_CACHE_DIR=sdmc:/switch/ds2/mesa_cache_head;NOUVEAU_HORIZON_BO_CACHE_MB=16;NVK_SWITCH_PERF_LOG=1"
+nfsmw_io_rangos_mb = 0
+ds2_switch_nvmap_mb = 64
+texture_cache_memory_limit_soft = 128
+texture_cache_memory_limit_hard = 256
+texture_cache_memory_limit_soft_lifetime = 5
+ds2_watchdog_probe_tables = 0
+ds2_switch_commit_granule_kb = 2048
+host_thread_stack_mb = 6
+occlusion_query_enable = false
+render_target_path_vulkan = "fsi"
