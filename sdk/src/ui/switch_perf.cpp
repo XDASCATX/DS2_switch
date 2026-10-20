@@ -226,13 +226,57 @@ constexpr size_t kModeCount = sizeof(kModes) / sizeof(kModes[0]);
  */
 std::atomic<bool> g_ab_activas{false};
 std::atomic<u32> g_skip_mask{0};
+/*
+ * DS2 port: the mode in effect is a stable number, the index in kModes (0 = normal). It can be fixed for the
+ * whole session from ds2.toml (edram_diagnostic_mode, RexSwitchPerfSetFixedMode); the L+R+ZL lap goes through
+ * every mode and then returns to the fixed one. The current number and the FPS of the last second are exposed
+ * for the on-screen label (app/src/ds2_mode_overlay.cpp).
+ */
+std::atomic<int> g_mode_index{0};
+std::atomic<int> g_fixed_mode{0};
+std::atomic<u64> g_mode_changes{0};
+std::atomic<double> g_last_fps{0.0};
+
+void ApplyMode(int index) {
+  g_mode_index.store(index, std::memory_order_relaxed);
+  g_skip_mask.store(kModes[index].mask, std::memory_order_relaxed);
+  g_mode_changes.fetch_add(1, std::memory_order_relaxed);
+}
 
 extern "C" void RexSwitchPerfToggleAb(void) {
   const bool nuevo = !g_ab_activas.load(std::memory_order_relaxed);
   g_ab_activas.store(nuevo, std::memory_order_relaxed);
   if (!nuevo) {
-    g_skip_mask.store(0, std::memory_order_relaxed);
+    ApplyMode(g_fixed_mode.load(std::memory_order_relaxed));
+  } else {
+    ApplyMode(0);  // the lap always starts from normal rendering
   }
+}
+
+extern "C" int RexSwitchPerfModeCount(void) { return int(kModeCount); }
+extern "C" const char* RexSwitchPerfModeName(int index) {
+  return index >= 0 && size_t(index) < kModeCount ? kModes[index].name : "?";
+}
+extern "C" unsigned RexSwitchPerfModeMask(int index) {
+  return index >= 0 && size_t(index) < kModeCount ? kModes[index].mask : 0u;
+}
+extern "C" int RexSwitchPerfCurrentMode(void) { return g_mode_index.load(std::memory_order_relaxed); }
+extern "C" int RexSwitchPerfFixedMode(void) { return g_fixed_mode.load(std::memory_order_relaxed); }
+extern "C" bool RexSwitchPerfLapActive(void) { return g_ab_activas.load(std::memory_order_relaxed); }
+extern "C" unsigned long long RexSwitchPerfModeChanges(void) {
+  return g_mode_changes.load(std::memory_order_relaxed);
+}
+extern "C" double RexSwitchPerfFps(void) { return g_last_fps.load(std::memory_order_relaxed); }
+// Returns false (and changes nothing) for a number that is not a mode.
+extern "C" bool RexSwitchPerfSetFixedMode(int index) {
+  if (index < 0 || size_t(index) >= kModeCount) {
+    return false;
+  }
+  g_fixed_mode.store(index, std::memory_order_relaxed);
+  if (!g_ab_activas.load(std::memory_order_relaxed)) {
+    ApplyMode(index);
+  }
+  return true;
 }
 
 /*
@@ -751,6 +795,7 @@ struct TicOverlay {
     const double segundos = double(ahora - tic) / double(freq);
     const u64 ahora_presentados = g_counters[0].load(std::memory_order_relaxed);
     const double fps = segundos > 0.0 ? double(ahora_presentados - presentados) / segundos : 0.0;
+    g_last_fps.store(fps, std::memory_order_relaxed);
     media[pos] = fps;
     pos = (pos + 1) % 10;
     double suma = 0.0;
@@ -832,7 +877,6 @@ void ProfilerMain(void*) {
   report_start = armGetSystemTick();
 
   size_t rr = 0;
-  size_t mode_index = 0;
   while (true) {
     __real_svcSleepThread(sample_stacks ? kSampleIntervalNs : kPassiveIntervalNs);
 
@@ -881,13 +925,20 @@ void ProfilerMain(void*) {
     // Once per second, FPS and resolution for the overlay (the profile report runs every 10 s).
     overlay.Paso(now, tick_freq, true);
     if (now - report_start >= kReportSeconds * tick_freq) {
-      Report(now - report_start, tick_freq, counters_last, kModes[mode_index].name);
+      {
+        const int m = g_mode_index.load(std::memory_order_relaxed);
+        char mode_label[96];
+        std::snprintf(mode_label, sizeof(mode_label), "%d %s%s", m, kModes[m].name,
+                      g_ab_activas.load(std::memory_order_relaxed) ? " (vuelta A/B)" : "");
+        Report(now - report_start, tick_freq, counters_last, mode_label);
+      }
       if (g_ab_activas.load(std::memory_order_relaxed)) {
-        mode_index = (mode_index + 1) % kModeCount;
-        g_skip_mask.store(kModes[mode_index].mask, std::memory_order_relaxed);
+        const size_t mode_index = size_t(g_mode_index.load(std::memory_order_relaxed) + 1) % kModeCount;
+        ApplyMode(int(mode_index));
         if (mode_index == 0) {
-          // Full cycle: it turns itself off and the game looks right again.
+          // Full cycle: it turns itself off and returns to the fixed mode (edram_diagnostic_mode, 0 by default).
           g_ab_activas.store(false, std::memory_order_relaxed);
+          ApplyMode(g_fixed_mode.load(std::memory_order_relaxed));
         }
       }
       report_start = armGetSystemTick();

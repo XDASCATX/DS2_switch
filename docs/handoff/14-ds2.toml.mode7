@@ -1,0 +1,14 @@
+# diag14: test 23 settings + edram_diagnostic_mode = 7 (see 13-switch-diag-modes.md).
+log_level = "info"
+ds2_watchdog = true
+ds2_switch_saltynx = false
+ds2_mesa_env = "MESA_SHADER_CACHE_DIR=sdmc:/switch/ds2/mesa_cache_head;NOUVEAU_HORIZON_BO_CACHE_MB=16;NVK_SWITCH_PERF_LOG=1"
+nfsmw_io_rangos_mb = 0
+ds2_switch_nvmap_mb = 64
+texture_cache_memory_limit_soft = 128
+texture_cache_memory_limit_hard = 256
+texture_cache_memory_limit_soft_lifetime = 5
+ds2_watchdog_probe_tables = 0
+ds2_switch_commit_granule_kb = 2048
+occlusion_query_enable = false
+edram_diagnostic_mode = 7

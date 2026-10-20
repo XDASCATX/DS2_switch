@@ -37,6 +37,13 @@
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
 
+REXCVAR_DEFINE_INT32(render_target_transfer_skip, 0, "GPU/Vulkan",
+                     "Leave out render target ownership transfer draws (bitmask): 1 = stencil-bit passes, "
+                     "2 = depth/stencil transfers, 4 = color transfers. Faster on GPUs without stencil export; "
+                     "correct only if the game overwrites or clears the reused EDRAM range")
+    .range(0, 7)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                       "Vulkan render target implementation path")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -5307,13 +5314,22 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
 #if REX_PLATFORM_SWITCH
             RexSwitchPerfCount(13);
 #endif
+            // DS2 port: render_target_transfer_skip (1 stencil-bit passes, 2 depth/stencil transfers, 4 color
+            // transfers). The ownership bookkeeping is unchanged; only the copy of the old EDRAM contents into the
+            // new host render target is left out.
+            const uint32_t transfer_skip = uint32_t(REXCVAR_GET(render_target_transfer_skip));
+            bool transfer_draw = !(transfer_is_stencil_bit && (transfer_skip & 1)) &&
+                                 !(dest_rt_key.is_depth && (transfer_skip & 2)) &&
+                                 !(!dest_rt_key.is_depth && (transfer_skip & 4));
 #if REX_PLATFORM_SWITCH
-            // DS2 port: finer A/B lap modes (switch_perf.cpp) - 64 stencil-bit passes (8 per depth transfer
-            // without VK_EXT_shader_stencil_export, which NVK lacks), 128 depth/stencil transfers, 256 color.
-            if (!RexSwitchPerfSkip(2) && !(transfer_is_stencil_bit && RexSwitchPerfSkip(64)) &&
-                !(dest_rt_key.is_depth && RexSwitchPerfSkip(128)) &&
-                !(!dest_rt_key.is_depth && RexSwitchPerfSkip(256)))
+            // Finer A/B lap modes (switch_perf.cpp): 64 stencil-bit passes (8 per depth transfer without
+            // VK_EXT_shader_stencil_export, which NVK lacks), 128 depth/stencil transfers, 256 color.
+            transfer_draw = transfer_draw && !RexSwitchPerfSkip(2) &&
+                            !(transfer_is_stencil_bit && RexSwitchPerfSkip(64)) &&
+                            !(dest_rt_key.is_depth && RexSwitchPerfSkip(128)) &&
+                            !(!dest_rt_key.is_depth && RexSwitchPerfSkip(256));
 #endif
+            if (transfer_draw)
             command_buffer.CmdVkDraw(transfer_vertex_count, 1, 0, 0);
           }
         }

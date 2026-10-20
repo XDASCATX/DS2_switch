@@ -10,6 +10,7 @@
 #include "ds2_capture.h"
 #include "ds2_dlc.h"
 #include "ds2_input_script.h"
+#include "ds2_mode_overlay.h"
 #include "ds2_watchdog.h"
 
 #include <filesystem>
@@ -52,6 +53,7 @@ class Ds2App : public rex::ReXApp {
     SetIfDefault("host_thread_stack_mb", "6");
 #endif
     ds2::watchdog::ApplyPlatformSwitches();
+    ds2::mode_overlay::ApplyConfig();
   }
 
   static void SetIfDefault(const char* name, const char* value) {
@@ -75,8 +77,12 @@ class Ds2App : public rex::ReXApp {
     (void)thread;
     ds2::capture::Start(runtime());
     ds2::watchdog::Start(runtime());
+    ds2::mode_overlay::Start(imgui_drawer(), [this](std::function<void()> f) {
+      app_context().CallInUIThreadDeferred(std::move(f));
+    });
   }
   void OnShutdown() override {
+    ds2::mode_overlay::Stop();
     ds2::watchdog::Stop();
     ds2::capture::Stop();
   }
