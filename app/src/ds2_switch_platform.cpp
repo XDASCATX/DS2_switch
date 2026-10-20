@@ -63,12 +63,30 @@ KernelStats QueryKernelStats() {
   if (R_SUCCEEDED(svcGetInfo(&v, InfoType_SystemResourceSizeUsed, CUR_PROCESS_HANDLE, 0))) k.sysres_used = v;
   if (R_SUCCEEDED(svcGetInfo(&v, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0))) k.sysres_total = v;
   u64 addr = 0;
+  u64 last_mapped_w = ~0ull, last_split_w = ~0ull;
   for (int guard = 0; guard < 1000000; ++guard) {
     MemoryInfo mi{};
     u32 pi = 0;
     if (R_FAILED(svcQueryMemory(&mi, &pi, addr))) break;
     ++k.blocks;
     if (mi.type != MemType_Unmapped && (mi.perm & Perm_Rw) == 0) ++k.blocks_inaccessible;
+    if (mi.type != MemType_Unmapped && mi.size) {
+      // 2 MB windows (one level-3 page table each when not mapped as a 2 MB block).
+      const u64 a = mi.addr, e = mi.addr + mi.size;
+      u64 w0 = a >> 21;
+      const u64 w1 = (e - 1) >> 21;
+      if (last_mapped_w != ~0ull && w0 <= last_mapped_w) w0 = last_mapped_w + 1;
+      if (w0 <= w1) k.pt_windows_mapped += w1 - w0 + 1;
+      if (w1 > last_mapped_w || last_mapped_w == ~0ull) last_mapped_w = w1;
+      auto split = [&](u64 w) {
+        if (last_split_w == ~0ull || w > last_split_w) {
+          ++k.pt_windows_split;
+          last_split_w = w;
+        }
+      };
+      if (a & 0x1FFFFF) split(a >> 21);
+      if (e & 0x1FFFFF) split((e - 1) >> 21);
+    }
     const u64 next = mi.addr + mi.size;
     if (next <= addr || next == 0) break;
     addr = next;
@@ -138,6 +156,50 @@ uint32_t ProbeKernelHeadroom(uint32_t max_pages, uint32_t* fail_rc) {
   return ok;
 #else
   (void)max_pages;
+  return 0;
+#endif
+}
+
+uint32_t ProbePageTableHeadroom(uint32_t max_tables, uint32_t* fail_rc) {
+  if (fail_rc) *fail_rc = 0;
+#if defined(__SWITCH__)
+  // Each probe maps one 4 KB heap page into its own empty 2 MB window of the stack region with svcMapMemory: the
+  // kernel must take a fresh level-3 page table for every window. A process without its own system resource takes
+  // page tables from the kernel's page-table heap that it shares with every system process, so this measures how
+  // much of that shared heap is left. Everything is unmapped again right away.
+  constexpr uint32_t kMax = 128;
+  static uint8_t* src = static_cast<uint8_t*>(memalign(0x1000, kMax * 0x1000));
+  static uint8_t* dst = nullptr;
+  static bool tried = false;
+  if (!tried) {
+    tried = true;
+    const size_t span = size_t(kMax) << 21;
+    virtmemLock();
+    void* p = virtmemFindStack(span + (2u << 20), 0);
+    if (p) {
+      uint8_t* aligned = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(p) + 0x1FFFFF) & ~uintptr_t(0x1FFFFF));
+      if (virtmemAddReservation(p, span + (2u << 20))) dst = aligned;
+    }
+    virtmemUnlock();
+  }
+  if (!src || !dst) {
+    if (fail_rc) *fail_rc = 0xFFFFFFFF;
+    return 0;
+  }
+  const uint32_t n = std::min<uint32_t>(max_tables, kMax);
+  uint32_t ok = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    const Result rc = svcMapMemory(dst + (size_t(i) << 21), src + size_t(i) * 0x1000, 0x1000);
+    if (R_FAILED(rc)) {
+      if (fail_rc) *fail_rc = rc;
+      break;
+    }
+    ++ok;
+  }
+  for (uint32_t i = 0; i < ok; ++i) svcUnmapMemory(dst + (size_t(i) << 21), src + size_t(i) * 0x1000, 0x1000);
+  return ok;
+#else
+  (void)max_tables;
   return 0;
 #endif
 }

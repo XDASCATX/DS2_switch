@@ -46,6 +46,12 @@ REXCVAR_DEFINE_INT32(ds2_watchdog_probe_pages, 0, "DS2",
                      "succeed, up to this many (0 = off). Shows the kernel resource running out")
     .range(0, 1024)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(ds2_watchdog_probe_tables, 32, "DS2",
+                     "Switch DIAGNOSTIC: every heartbeat, test how many more kernel page tables can still be taken, "
+                     "up to this many (max 128, 0 = off). Without a system resource of its own the process shares "
+                     "them with the whole system (pt_left in the heartbeat)")
+    .range(0, 128)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(ds2_switch_nvmap_mb, 0, "DS2",
                      "Switch: MB of the transfer memory libnx gives nvservices for GPU memory bookkeeping (libnx: 8). "
                      "0 = leave libnx's value")
@@ -148,6 +154,12 @@ void LogHeartbeat(int seconds, size_t threads, size_t files) {
     const uint32_t left = ds2::platform::ProbeKernelHeadroom(uint32_t(pp), &rc);
     probe = rc ? fmt::format(" headroom={} (0x{:X})", left, rc) : fmt::format(" headroom>={}", left);
   }
+  if (const int pt = REXCVAR_GET(ds2_watchdog_probe_tables); pt > 0) {
+    uint32_t rc = 0;
+    const uint32_t left = ds2::platform::ProbePageTableHeadroom(uint32_t(pt), &rc);
+    probe += rc ? fmt::format(" pt_left={} (0x{:X})", left, rc) : fmt::format(" pt_left>={}", left);
+  }
+  if (k.valid) probe += fmt::format(" pt_win={}/{}", k.pt_windows_split, k.pt_windows_mapped);
   const std::string line = fmt::format(
       "[ds2 wd] t={}s hb vblank={} cp_vs={:016X} cp_ps={:016X}{} threads={} files={} malloc_mb={} blocks={} "
       "sysres_kb={}/{} merged_runs={} merge_fail={}",

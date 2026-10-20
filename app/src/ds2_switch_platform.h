@@ -18,6 +18,9 @@ struct KernelStats {
   uint64_t blocks = 0, blocks_inaccessible = 0, sysres_used = 0, sysres_total = 0;
   uint32_t last_gm = 0;
   uint64_t coalesced = 0, coalesce_failures = 0;  // SDK view-run merges (guest_memory_switch.cpp)
+  // 2 MB windows of the address space that hold any mapping (upper bound of level-3 page tables) and windows cut by
+  // a block edge (they need a page table whatever the physical layout: lower bound).
+  uint64_t pt_windows_mapped = 0, pt_windows_split = 0;
   bool valid = false;
 };
 KernelStats QueryKernelStats();
@@ -31,6 +34,12 @@ std::string KernelBlockHistogram(size_t max_groups);
 // mapping change costs (memory blocks, and a page table for the region). Returns the pages that succeeded;
 // *fail_rc gets the first failure (0 if none). Switch only; 0 elsewhere.
 uint32_t ProbeKernelHeadroom(uint32_t max_pages, uint32_t* fail_rc);
+
+// How many more page tables the kernel can still hand to this process right now (up to max_tables, at most 128):
+// maps single pages into separate empty 2 MB windows, then unmaps them. Without a system resource of its own
+// (sysres 0/0, the case under hbloader) the process shares that page-table heap with all system processes, and
+// running it dry fails every mapping system-wide with 2001-0103. *fail_rc: first failure, 0 if none.
+uint32_t ProbePageTableHeadroom(uint32_t max_tables, uint32_t* fail_rc);
 
 // Process resource limits as "name cur/max" pairs (memory in MB), or "" if unavailable.
 std::string ResourceLimits();
