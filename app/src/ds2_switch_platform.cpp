@@ -9,6 +9,8 @@ size_t RexGmMappedBytes(void);
 void RexSwitchSaltyNxHabilitar(int habilitado);
 uint32_t RexGmLastResult(void);
 uint8_t* RexGmBase(void);
+size_t RexGmCoalescedRuns(void);
+size_t RexGmCoalesceFailures(void);
 size_t RexGmSize(void);
 }
 #include <algorithm>
@@ -70,6 +72,8 @@ KernelStats QueryKernelStats() {
     addr = next;
   }
   k.last_gm = RexGmLastResult();
+  k.coalesced = RexGmCoalescedRuns();
+  k.coalesce_failures = RexGmCoalesceFailures();
   k.valid = true;
 #endif
   return k;

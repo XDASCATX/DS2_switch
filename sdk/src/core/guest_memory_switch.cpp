@@ -13,6 +13,7 @@
 #include <atomic>
 #include <mutex>
 #include <vector>
+#include <iterator>
 
 namespace {
 
@@ -346,6 +347,66 @@ void ReleaseChunk(const Chunk& c) {
     free(c.backing);
 }
 
+/*
+ * DS2 (2026-10-20): every page a write watch unmaps and later maps back stays a separate 4 KB kernel memory
+ * block in the view, because each svcMapProcessMemory call makes its own block. On the console the views of
+ * DS2 reached 7,214 such blocks (979 MB) and the process ~10,000 blocks in total, and from there every
+ * kernel mapping failed with 2001-0103 (resource exhausted) - GPU buffers, file writes, other processes.
+ *
+ * After a page is mapped back, the run of unprotected pages around it (inside the same chunk and view) is
+ * unmapped and mapped again with one call, so it is one block again. Skipped when the run is already a
+ * single block. On failure the run is mapped back piece by piece as before.
+ */
+size_t g_coalesce_runs = 0;
+size_t g_coalesce_failures = 0;
+
+void CoalesceViewRun(State& s, size_t page_off) {
+    const uint64_t wbase = reinterpret_cast<uint64_t>(s.base);
+    const View* v = ViewFor(s, wbase + page_off);
+    if (!v) return;
+    const size_t view_lo = static_cast<size_t>(v->base - s.base);
+    const size_t off_mapeo = v->offset + (page_off - view_lo);
+    Chunk* c = ChunkAt(s, off_mapeo);
+    if (!c) return;
+    size_t vi = 0;
+    if (!ViewIndexFor(s, wbase + page_off, &vi) || s.view_mapped.count({vi, c->offset}) == 0) return;
+    /* Window range of chunk ∩ view. */
+    size_t lo, hi;
+    if (!Intersect(c->offset, c->length, v->offset, v->length, &lo, &hi)) return;
+    size_t run_lo = view_lo + (lo - v->offset);
+    size_t run_hi = view_lo + (hi - v->offset);
+    /* Clip at the nearest protected pages on each side. */
+    auto it = s.protection.lower_bound(page_off);
+    if (it != s.protection.end() && it->first < run_hi) run_hi = it->first;
+    if (it != s.protection.begin()) {
+        auto prev = std::prev(it);
+        if (prev->first >= run_lo) run_lo = prev->first + kPageSize;
+    }
+    if (run_hi <= run_lo + kPageSize) return;
+    MemoryInfo mi;
+    u32 pi = 0;
+    if (R_FAILED(svcQueryMemory(&mi, &pi, wbase + run_lo))) return;
+    if (mi.addr <= wbase + run_lo && mi.addr + mi.size >= wbase + run_hi) return; /* already one block */
+    const size_t len = run_hi - run_lo;
+    uint8_t* src = static_cast<uint8_t*>(c->shadow) + (v->offset + (run_lo - view_lo) - c->offset);
+    if (R_FAILED(svcUnmapProcessMemory(s.base + run_lo, Proc(), reinterpret_cast<u64>(src), len))) {
+        ++g_coalesce_failures;
+        return; /* nothing changed */
+    }
+    const Result rc = svcMapProcessMemory(s.base + run_lo, Proc(), reinterpret_cast<u64>(src), len);
+    if (R_SUCCEEDED(rc)) {
+        ++g_coalesce_runs;
+        return;
+    }
+    ++g_coalesce_failures;
+    s.last_result = rc;
+    s.mapped -= len;
+    /* Same result as before the attempt: the run mapped again, in pieces if need be. */
+    if (MapWindowRange(s, run_lo, src, len)) return;
+    /* Could not map it back: forget the chunk in this view so the next access faults it in again. */
+    s.view_mapped.erase({vi, c->offset});
+}
+
 }  // namespace
 
 extern "C" {
@@ -436,6 +497,9 @@ int RexGmModoProteccion(void) {
         default: return 0;
     }
 }
+
+size_t RexGmCoalescedRuns(void) { return g_coalesce_runs; }
+size_t RexGmCoalesceFailures(void) { return g_coalesce_failures; }
 
 uint32_t RexGmLastResult(void) {
     State& s = S();
@@ -570,9 +634,23 @@ bool RexGmFaultIn(uint64_t window_address) {
                                            reinterpret_cast<uint64_t>(s.views[vi].base));
     Chunk* c = ChunkAt(s, off);
     if (!c) return false;                                       /* sin confirmar */
-    if (s.view_mapped.count({vi, c->offset}) != 0) return false; /* ya estaba */
+    if (s.view_mapped.count({vi, c->offset}) != 0) {
+        /*
+         * Already mapped in this view. Since CoalesceViewRun (RexGmProtect) briefly unmaps and remaps a
+         * run of pages, a thread can fault inside that gap and get here once the lock is free: if the page
+         * is mapped and writable now, retrying the instruction is correct. Checked with the kernel so a
+         * real hole can never turn into an endless retry.
+         */
+        MemoryInfo mi;
+        u32 pi = 0;
+        const u64 page = AlignDown(window_address, kPageSize);
+        return R_SUCCEEDED(svcQueryMemory(&mi, &pi, page)) && mi.type != MemType_Unmapped &&
+               (mi.perm & Perm_Rw) == Perm_Rw;
+    }
     return MapChunkIntoView(s, vi, *c);
 }
+
+
 
 bool RexGmDecommit(size_t offset, size_t length) {
     State& s = S();
@@ -628,6 +706,7 @@ bool RexGmProtect(uint8_t* address, size_t length, RexGmAccess access, RexGmAcce
         if (it == s.protection.end() || it->first >= end) return true;
     }
 
+    std::vector<size_t> remapped; /* pages mapped back in this call, see CoalesceViewRun */
     for (size_t p = begin; p < end; p += kPageSize) {
         const bool estaba = (AccessOf(s, p) == REX_GM_WRITE);
 
@@ -665,7 +744,10 @@ bool RexGmProtect(uint8_t* address, size_t length, RexGmAccess access, RexGmAcce
                             return false;
                         }
                         if (estaba) s.mapped -= kPageSize;
-                        else s.mapped += kPageSize;
+                        else {
+                            s.mapped += kPageSize;
+                            remapped.push_back(p);
+                        }
                     }
                 }
                 /*
@@ -678,6 +760,9 @@ bool RexGmProtect(uint8_t* address, size_t length, RexGmAccess access, RexGmAcce
         if (debe_estar) s.protection.erase(p);
         else s.protection[p] = access;
     }
+    /* Pages of the same run would repeat the work: once per run is enough (CoalesceViewRun skips runs that
+     * are already one block). */
+    for (size_t p : remapped) CoalesceViewRun(s, p);
     return true;
 }
 

@@ -167,6 +167,10 @@ size_t RexGmCommittedBytes(void);
  */
 size_t RexGmMappedBytes(void);
 
+/* Runs of view pages merged back into one kernel block after a write watch was lifted (DS2 port). */
+size_t RexGmCoalescedRuns(void);
+size_t RexGmCoalesceFailures(void);
+
 /*
  * Tells whether watched pages are protected with permissions (readable) or by
  * unmapping (not readable). It is printed in the profile header to show which

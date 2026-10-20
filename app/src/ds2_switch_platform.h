@@ -17,6 +17,7 @@ uint64_t GuestMapped();
 struct KernelStats {
   uint64_t blocks = 0, blocks_inaccessible = 0, sysres_used = 0, sysres_total = 0;
   uint32_t last_gm = 0;
+  uint64_t coalesced = 0, coalesce_failures = 0;  // SDK view-run merges (guest_memory_switch.cpp)
   bool valid = false;
 };
 KernelStats QueryKernelStats();
