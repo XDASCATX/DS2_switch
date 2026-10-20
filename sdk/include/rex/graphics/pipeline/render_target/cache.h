@@ -548,6 +548,9 @@ class RenderTargetCache {
   // EDRAM memory are committed with a memory barrier.
   void PixelShaderInterlockFullEdramBarrierPlaced();
 
+  // DS2 port: for the Vulkan transfer elision (VulkanRenderTargetCache::Update).
+  DrawExtentEstimator& draw_extent_estimator() { return draw_extent_estimator_; }
+
  private:
   const RegisterFile& register_file_;
   uint32_t draw_resolution_scale_x_;

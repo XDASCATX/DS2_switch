@@ -597,9 +597,10 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
     // store dispatches (50) and their pixels (51).
     std::fprintf(f,
                  "     pasadas de render %.1f | barreras %.1f | transferencias por muestra (MSAA) %.1f | "
-                 "depth store: %.1f despachos, %.2f pantallas\n",
+                 "depth store: %.1f despachos, %.2f pantallas | transferencias evitadas (borradas por el "
+                 "dibujado) %.1f, %.2f pantallas\n",
                  delta(52) / frames, delta(53) / frames, delta(49) / frames, delta(50) / frames,
-                 delta(51) / frames / 921600.0);
+                 delta(51) / frames / 921600.0, delta(64) / frames, delta(65) / frames / 921600.0);
     // GPU time measured with timestamps (gpu_zone_timing): 42 whole submissions (ns), 47 submissions measured,
     // 56+z zone ns, 66+z zone instances (command_processor.h GpuZone). Zones nest (transfer draws and barriers
     // inside transfers, resolve clears inside resolves), so they do not add up to the total.

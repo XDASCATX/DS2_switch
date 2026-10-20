@@ -35,6 +35,10 @@
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <map>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DEFINE_INT32(render_target_transfer_skip, 0, "GPU/Vulkan",
@@ -42,6 +46,22 @@ REXCVAR_DEFINE_INT32(render_target_transfer_skip, 0, "GPU/Vulkan",
                      "2 = depth/stencil transfers, 4 = color transfers. Faster on GPUs without stencil export; "
                      "correct only if the game overwrites or clears the reused EDRAM range")
     .range(0, 7)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(render_target_transfer_elide_overwritten, false, "GPU/Vulkan",
+                    "Skip render target ownership transfers into areas that the draw binding the render targets "
+                    "provably overwrites completely (an opaque, full-coverage screen rectangle such as a clear). "
+                    "Same image, less GPU work")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(rt_transfer_stats, 0, "GPU/Vulkan",
+                     "DEVELOPMENT: log a histogram of render target ownership transfers (destination <- source "
+                     "key) every N render targets receiving transfers (0 = off)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(rt_transfer_trace, 0, "GPU/Vulkan",
+                     "DEVELOPMENT (with rt_transfer_stats): log every transfer of 200 destination updates starting "
+                     "at this update number (0 = off)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
@@ -1419,6 +1439,81 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   return copied && cleared;
 }
 
+VulkanRenderTargetCache::DrawOverwrite VulkanRenderTargetCache::ComputeDrawOverwrite(
+    bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+    const Shader& vertex_shader) {
+  DrawOverwrite ow;
+  if (!REXCVAR_GET(render_target_transfer_elide_overwritten) || !is_rasterization_done ||
+      draw_resolution_scale_x() != 1 || draw_resolution_scale_y() != 1) {
+    return ow;
+  }
+  const RegisterFile& regs = register_file();
+  if (regs.Get<reg::RB_MODECONTROL>().edram_mode != xenos::EdramMode::kColorDepth) {
+    return ow;
+  }
+  // Anything that can leave covered pixels or samples unwritten.
+  const Shader* ps = draw_pixel_shader_;
+  if (ps && ps->kills_pixels()) {
+    return ow;
+  }
+  const auto colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+  if ((colorcontrol.alpha_test_enable && colorcontrol.alpha_func != xenos::CompareFunction::kAlways) ||
+      colorcontrol.alpha_to_mask_enable) {
+    return ow;
+  }
+  // Primitives must not be clipped by the clipper (guard band, near/far, user planes): only the scissor and the
+  // bounding rectangle limit what is drawn. The game's clears run with clipping disabled.
+  const auto clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
+  if (!clip_cntl.clip_disable || clip_cntl.ucp_ena) {
+    return ow;
+  }
+  // Every covered sample must pass the depth and stencil tests, or neither depth nor colour is written there.
+  const bool depth_passes =
+      !normalized_depth_control.z_enable || normalized_depth_control.zfunc == xenos::CompareFunction::kAlways;
+  bool stencil_passes = true;
+  bool stencil_replaced = false;
+  if (normalized_depth_control.stencil_enable) {
+    const auto refmask = regs.Get<reg::RB_STENCILREFMASK>();
+    stencil_passes = normalized_depth_control.stencilfunc == xenos::CompareFunction::kAlways;
+    stencil_replaced = normalized_depth_control.stencilzpass == xenos::StencilOp::kReplace &&
+                       refmask.stencilwritemask == 0xFF;
+    if (normalized_depth_control.backface_enable) {
+      const auto refmask_bf = regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF);
+      stencil_passes = stencil_passes &&
+                       normalized_depth_control.stencilfunc_bf == xenos::CompareFunction::kAlways;
+      stencil_replaced = stencil_replaced &&
+                         normalized_depth_control.stencilzpass_bf == xenos::StencilOp::kReplace &&
+                         refmask_bf.stencilwritemask == 0xFF;
+    }
+  }
+  if (!depth_passes || !stencil_passes) {
+    return ow;
+  }
+  // Depth: written everywhere it is covered.
+  ow.depth = normalized_depth_control.z_enable && normalized_depth_control.z_write_enable;
+  ow.stencil = normalized_depth_control.stencil_enable && stencil_replaced;
+  // Colour: every component written, no blending.
+  for (uint32_t k = 0; k < xenos::kMaxColorRenderTargets; ++k) {
+    if (((normalized_color_mask >> (4 * k)) & 0xF) != 0xF) {
+      continue;
+    }
+    const auto blend = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[k]);
+    if (blend.color_srcblend == xenos::BlendFactor::kOne && blend.color_destblend == xenos::BlendFactor::kZero &&
+        blend.color_comb_fcn == xenos::BlendOp::kAdd && blend.alpha_srcblend == xenos::BlendFactor::kOne &&
+        blend.alpha_destblend == xenos::BlendFactor::kZero && blend.alpha_comb_fcn == xenos::BlendOp::kAdd) {
+      ow.color_rts |= uint32_t(1) << k;
+    }
+  }
+  if (!ow.depth && !ow.color_rts) {
+    return ow;
+  }
+  if (!draw_extent_estimator().EstimateFullyCoveredRectangle(vertex_shader, ow.x0, ow.y0, ow.x1, ow.y1)) {
+    return DrawOverwrite();
+  }
+  ow.valid = true;
+  return ow;
+}
+
 bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
                                      reg::RB_DEPTHCONTROL normalized_depth_control,
                                      uint32_t normalized_color_mask, const Shader& vertex_shader) {
@@ -1439,8 +1534,11 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
       RenderTarget* const* depth_and_color_render_targets =
           last_update_accumulated_render_targets();
 
+      draw_overwrite_ = ComputeDrawOverwrite(is_rasterization_done, normalized_depth_control,
+                                             normalized_color_mask, vertex_shader);
       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
                                        depth_and_color_render_targets, last_update_transfers());
+      draw_overwrite_.valid = false;
 
       if (depth_and_color_render_targets[0]) {
         render_pass_key.depth_and_color_used |= 1 << 0;
@@ -4295,6 +4393,15 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
   std::vector<unsigned int> shader_code;
   builder.dump(shader_code);
 
+  // DS2 port, development: REX_DUMP_TRANSFER_SHADERS=<dir> writes each transfer shader as SPIR-V.
+  if (const char* dump_dir = std::getenv("REX_DUMP_TRANSFER_SHADERS")) {
+    const std::string path = fmt::format("{}/transfer_{:08X}.spv", dump_dir, key.key);
+    if (FILE* dump = std::fopen(path.c_str(), "wb")) {
+      std::fwrite(shader_code.data(), sizeof(uint32_t), shader_code.size(), dump);
+      std::fclose(dump);
+    }
+  }
+
   // Create the shader module, and store the handle even if creation fails not
   // to try to create it again later.
   VkShaderModule shader_module = ui::vulkan::util::CreateShaderModule(
@@ -4595,6 +4702,56 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     const Transfer::Rectangle* resolve_clear_rectangle) {
   assert_true(GetPath() == Path::kHostRenderTargets);
   GpuZoneScope gpu_zone(command_processor_, VulkanCommandProcessor::kGpuZoneTransfers);
+
+  // DS2 port: leave out the transfers into areas this draw overwrites anyway (see DrawOverwrite).
+  if (render_target_transfers && draw_overwrite_.valid) {
+    const DrawOverwrite& ow = draw_overwrite_;
+    const uint32_t transfer_skip = uint32_t(REXCVAR_GET(render_target_transfer_skip));
+    bool any_elided = false;
+    for (uint32_t i = 0; i < render_target_count && i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      std::vector<Transfer>& filtered = elision_filtered_transfers_[i];
+      filtered.clear();
+      const std::vector<Transfer>& in = render_target_transfers[i];
+      if (in.empty() || !render_targets[i]) {
+        filtered = in;
+        continue;
+      }
+      // Depth: the depth pass is overwritten; the stencil passes too, or they are not drawn at all.
+      const bool overwritten = i == 0 ? (ow.depth && (ow.stencil || (transfer_skip & 1)))
+                                      : ((ow.color_rts >> (i - 1)) & 1) != 0;
+      const RenderTargetKey dest_key = render_targets[i]->key();
+      for (const Transfer& transfer : in) {
+        bool inside = overwritten;
+        uint64_t pixels = 0;
+        if (inside) {
+          Transfer::Rectangle rects[Transfer::kMaxRectanglesWithCutout];
+          const uint32_t n = transfer.GetRectangles(dest_key.base_tiles, dest_key.GetPitchTiles(),
+                                                    dest_key.msaa_samples, dest_key.Is64bpp(), rects,
+                                                    resolve_clear_rectangle);
+          for (uint32_t r = 0; r < n && inside; ++r) {
+            inside = int32_t(rects[r].x_pixels) >= ow.x0 && int32_t(rects[r].y_pixels) >= ow.y0 &&
+                     int32_t(rects[r].x_pixels + rects[r].width_pixels) <= ow.x1 &&
+                     int32_t(rects[r].y_pixels + rects[r].height_pixels) <= ow.y1;
+            pixels += uint64_t(rects[r].width_pixels) * rects[r].height_pixels;
+          }
+        }
+        if (inside) {
+          any_elided = true;
+          elided_transfers_total_ += 1;
+          elided_pixels_total_ += pixels;
+#if REX_PLATFORM_SWITCH
+          RexSwitchPerfCount(64);
+          RexSwitchPerfAdd(65, pixels);
+#endif
+          continue;
+        }
+        filtered.push_back(transfer);
+      }
+    }
+    if (any_elided) {
+      render_target_transfers = elision_filtered_transfers_;
+    }
+  }
 #if REX_PLATFORM_SWITCH
   RexSwitchPerfCount(11);
   if (render_target_transfers) {
@@ -4904,6 +5061,73 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
 #endif
       uint32_t dest_pitch_tiles = dest_rt_key.GetPitchTiles();
       bool dest_is_64bpp = dest_rt_key.Is64bpp();
+
+      if (const int stats_every = REXCVAR_GET(rt_transfer_stats); stats_every > 0) {
+        // DS2 port, development: which kinds of transfers the game causes (same on PC and console).
+        static std::map<std::string, std::pair<uint64_t, uint64_t>> stats;  // -> (transfers, tiles)
+        static int dest_updates = 0;  // counted below
+        auto describe = [](const RenderTargetKey& k) {
+          return fmt::format("{}{}x{} p{} b{}", k.is_depth ? "D" : "C", uint32_t(k.resource_format),
+                             1u << uint32_t(k.msaa_samples), k.pitch_tiles_at_32bpp, k.base_tiles);
+        };
+        for (const Transfer& transfer : current_transfers) {
+          const RenderTargetKey sk = transfer.source->key();
+          const bool same_layout = sk.pitch_tiles_at_32bpp == dest_rt_key.pitch_tiles_at_32bpp &&
+                                   sk.msaa_samples == dest_rt_key.msaa_samples &&
+                                   sk.Is64bpp() == dest_rt_key.Is64bpp();
+          std::string key = fmt::format(
+              "{} <- {}{}{}{}", describe(dest_rt_key), describe(sk),
+              same_layout ? " same-layout" : "", sk.resource_format == dest_rt_key.resource_format &&
+                                                         sk.is_depth == dest_rt_key.is_depth
+                                                     ? " same-format"
+                                                     : "",
+              transfer.host_depth_source ? (transfer.host_depth_source == &dest_vulkan_rt ? " hostdepth=self"
+                                                                                           : " hostdepth")
+                                         : "");
+          auto& e = stats[key];
+          e.first += 1;
+          e.second += transfer.end_tiles - transfer.start_tiles;
+        }
+        ++dest_updates;
+        if (const int trace_from = REXCVAR_GET(rt_transfer_trace); trace_from > 0 && dest_updates >= trace_from &&
+            (dest_updates - trace_from) % 1500 < 150) {
+          for (const Transfer& transfer : current_transfers) {
+            Transfer::Rectangle rects[Transfer::kMaxRectanglesWithCutout];
+            const uint32_t n = transfer.GetRectangles(dest_rt_key.base_tiles, dest_pitch_tiles,
+                                                      dest_rt_key.msaa_samples, dest_is_64bpp, rects,
+                                                      resolve_clear_rectangle);
+            uint64_t px = 0;
+            for (uint32_t r = 0; r < n; ++r) px += uint64_t(rects[r].width_pixels) * rects[r].height_pixels;
+            // The draw that caused this update: is it a full-screen clear that overwrites what is transferred?
+            const RegisterFile& regs = register_file();
+            const auto zc = regs.Get<reg::RB_DEPTHCONTROL>();
+            const auto vgt = regs.Get<reg::VGT_DRAW_INITIATOR>();
+            const auto tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+            const auto br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+            REXGPU_INFO("rt_transfer_trace #{} frame {}: {} <- {} tiles {}..{} px {}{} | draw prim {} n {} "
+                        "z(en {} wr {} fn {}) st {} cmask {:08X} scissor {},{}-{},{}",
+                        dest_updates, command_processor_.GetCurrentFrame(), describe(dest_rt_key),
+                        describe(transfer.source->key()), transfer.start_tiles, transfer.end_tiles, px,
+                        transfer.host_depth_source ? " +hostdepth" : "", uint32_t(vgt.prim_type),
+                        vgt.num_indices, uint32_t(zc.z_enable), uint32_t(zc.z_write_enable), uint32_t(zc.zfunc),
+                        uint32_t(zc.stencil_enable), regs[XE_GPU_REG_RB_COLOR_MASK], tl.tl_x, tl.tl_y, br.br_x,
+                        br.br_y);
+          }
+        }
+        if (dest_updates % stats_every == 0) {
+          std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> v(stats.begin(), stats.end());
+          std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+          uint64_t kept_tiles = 0;
+          for (const auto& e : v) kept_tiles += e.second.second;
+          REXGPU_INFO("rt_transfer_stats after {} destination updates ({} kinds), frame {}: kept {} tiles; "
+                      "elided {} transfers, {} pixels",
+                      dest_updates, v.size(), command_processor_.GetCurrentFrame(), kept_tiles,
+                      elided_transfers_total_, elided_pixels_total_);
+          for (size_t i = 0; i < v.size() && i < 25; ++i) {
+            REXGPU_INFO("  {:>8} transfers {:>10} tiles  {}", v[i].second.first, v[i].second.second, v[i].first);
+          }
+        }
+      }
 
       // Gather shader keys and sort to reduce pipeline state and binding
       // switches. Also gather stencil rectangles to clear if needed.

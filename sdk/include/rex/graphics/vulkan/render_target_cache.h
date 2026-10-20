@@ -111,6 +111,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
+  // DS2 port: the pixel shader of the draw about to call Update (for render_target_transfer_elide_overwritten).
+  void SetDrawPixelShader(const Shader* pixel_shader) { draw_pixel_shader_ = pixel_shader; }
   // Binding information for the last successful update.
   RenderPassKey last_update_render_pass_key() const { return last_update_render_pass_key_; }
   VkRenderPass last_update_render_pass() const { return last_update_render_pass_; }
@@ -862,6 +864,25 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   // Temporary storage for PerformTransfersAndResolveClears.
   std::vector<TransferInvocation> current_transfer_invocations_;
+
+  // DS2 port: transfer elision. When the draw that binds the render targets provably overwrites a whole area
+  // (an opaque full-coverage rectangle: depth written with ALWAYS, colour written without blending), the old
+  // EDRAM contents transferred into that area would be overwritten before anything reads them, so those
+  // transfers are left out. Same image, less GPU work.
+  struct DrawOverwrite {
+    bool valid = false;
+    bool depth = false;
+    bool stencil = false;
+    uint32_t color_rts = 0;  // bit k: colour render target k fully overwritten
+    int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+  };
+  DrawOverwrite ComputeDrawOverwrite(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
+                                     uint32_t normalized_color_mask, const Shader& vertex_shader);
+  const Shader* draw_pixel_shader_ = nullptr;
+  DrawOverwrite draw_overwrite_;
+  uint64_t elided_transfers_total_ = 0;
+  uint64_t elided_pixels_total_ = 0;
+  std::vector<Transfer> elision_filtered_transfers_[1 + xenos::kMaxColorRenderTargets];
 
   // Temporary storage for DumpRenderTargets.
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;

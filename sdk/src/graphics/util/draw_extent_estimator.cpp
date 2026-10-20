@@ -17,6 +17,8 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
+#include <cmath>
+#include <algorithm>
 #include <rex/graphics/format/ucode.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw_extent_estimator.h>
@@ -329,6 +331,188 @@ uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,
   }
 
   return max_y;
+}
+
+bool DrawExtentEstimator::EstimateFullyCoveredRectangle(const Shader& vertex_shader, int32_t& x0_out,
+                                                        int32_t& y0_out, int32_t& x1_out, int32_t& y1_out) {
+  const RegisterFile& regs = register_file_;
+  auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+  const xenos::PrimitiveType prim = vgt_draw_initiator.prim_type;
+  const uint32_t count = vgt_draw_initiator.num_indices;
+  const bool supported = (prim == xenos::PrimitiveType::kRectangleList && count == 3) ||
+                         (prim == xenos::PrimitiveType::kQuadList && count == 4) ||
+                         (prim == xenos::PrimitiveType::kTriangleStrip && count == 4) ||
+                         (prim == xenos::PrimitiveType::kTriangleList && count == 6);
+  if (!supported) {
+    return false;
+  }
+  if (vgt_draw_initiator.source_select != xenos::SourceSelect::kDMA &&
+      vgt_draw_initiator.source_select != xenos::SourceSelect::kAutoIndex) {
+    return false;
+  }
+  if (xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, prim) &&
+      regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select == xenos::VGTOutputPath::kTessellationEnable) {
+    return false;
+  }
+  if (!vertex_shader.is_ucode_analyzed() || !ShaderInterpreter::CanInterpretShader(vertex_shader)) {
+    return false;
+  }
+  auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  // Culling could drop one of the triangles.
+  if (pa_su_sc_mode_cntl.cull_front || pa_su_sc_mode_cntl.cull_back) {
+    return false;
+  }
+
+  auto vgt_dma_size = regs.Get<reg::VGT_DMA_SIZE>();
+  const uint16_t* index_buffer_16 = nullptr;
+  const uint32_t* index_buffer_32 = nullptr;
+  xenos::Endian index_endian = vgt_dma_size.swap_mode;
+  if (vgt_draw_initiator.source_select == xenos::SourceSelect::kDMA) {
+    if (vgt_dma_size.num_words < count) {
+      return false;
+    }
+    uint32_t index_buffer_base = regs[XE_GPU_REG_VGT_DMA_BASE];
+    if (vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16) {
+      if (index_endian == xenos::Endian::k8in32) {
+        index_endian = xenos::Endian::k8in16;
+      } else if (index_endian == xenos::Endian::k16in32) {
+        index_endian = xenos::Endian::kNone;
+      }
+      index_buffer_16 = reinterpret_cast<const uint16_t*>(
+          memory_.TranslatePhysical(index_buffer_base & ~uint32_t(sizeof(uint16_t) - 1)));
+    } else {
+      index_buffer_32 = reinterpret_cast<const uint32_t*>(
+          memory_.TranslatePhysical(index_buffer_base & ~uint32_t(sizeof(uint32_t) - 1)));
+    }
+  }
+  uint32_t index_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
+  uint32_t min_index = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
+  uint32_t max_index = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
+
+  auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
+  const float scale_x =
+      pa_cl_vte_cntl.vport_x_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE) : 1.0f;
+  const float offset_x =
+      pa_cl_vte_cntl.vport_x_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET) : 0.0f;
+  const float scale_y =
+      pa_cl_vte_cntl.vport_y_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE) : 1.0f;
+  const float offset_y =
+      pa_cl_vte_cntl.vport_y_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET) : 0.0f;
+  float half_pixel = regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;
+  auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+  const float window_x = pa_su_sc_mode_cntl.vtx_window_offset_enable ? float(pa_sc_window_offset.window_x_offset) : 0.0f;
+  const float window_y = pa_su_sc_mode_cntl.vtx_window_offset_enable ? float(pa_sc_window_offset.window_y_offset) : 0.0f;
+
+  float vx[6], vy[6];
+  shader_interpreter_.SetShader(vertex_shader);
+  PositionXYExportSink sink;
+  shader_interpreter_.SetExportSink(&sink);
+  bool ok = true;
+  for (uint32_t i = 0; i < count && ok; ++i) {
+    uint32_t vertex_index;
+    if (vgt_draw_initiator.source_select == xenos::SourceSelect::kDMA) {
+      vertex_index = index_buffer_16 ? uint32_t(index_buffer_16[i]) : index_buffer_32[i];
+      vertex_index = xenos::GpuSwap(vertex_index, index_endian) & 0xFFFFFF;
+      if (pa_su_sc_mode_cntl.multi_prim_ib_ena &&
+          vertex_index == regs.Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>().reset_indx) {
+        ok = false;
+        break;
+      }
+    } else {
+      vertex_index = i;
+    }
+    vertex_index = std::min(max_index, std::max(min_index, (vertex_index + index_offset) & 0xFFFFFF));
+    sink.Reset();
+    shader_interpreter_.temp_registers()[0] = float(vertex_index);
+    shader_interpreter_.Execute();
+    if (sink.killed_ || !sink.x_.has_value() || !sink.y_.has_value()) {
+      ok = false;
+      break;
+    }
+    float x = sink.x_.value(), y = sink.y_.value();
+    if (!pa_cl_vte_cntl.vtx_xy_fmt) {
+      if (!sink.w_.has_value() || !(sink.w_.value() > 0.0f)) {
+        ok = false;
+        break;
+      }
+      x /= sink.w_.value();
+      y /= sink.w_.value();
+    }
+    vx[i] = x * scale_x + offset_x + half_pixel + window_x;
+    vy[i] = y * scale_y + offset_y + half_pixel + window_y;
+    if (!std::isfinite(vx[i]) || !std::isfinite(vy[i])) {
+      ok = false;
+    }
+  }
+  shader_interpreter_.SetExportSink(nullptr);
+  if (!ok) {
+    return false;
+  }
+
+  float min_x = vx[0], max_x = vx[0], min_y = vy[0], max_y = vy[0];
+  for (uint32_t i = 1; i < count; ++i) {
+    min_x = std::min(min_x, vx[i]);
+    max_x = std::max(max_x, vx[i]);
+    min_y = std::min(min_y, vy[i]);
+    max_y = std::max(max_y, vy[i]);
+  }
+  if (!(max_x > min_x) || !(max_y > min_y)) {
+    return false;
+  }
+  // Every vertex must be a corner of the bounding box.
+  for (uint32_t i = 0; i < count; ++i) {
+    if ((vx[i] != min_x && vx[i] != max_x) || (vy[i] != min_y && vy[i] != max_y)) {
+      return false;
+    }
+  }
+  const double box_area = double(max_x - min_x) * double(max_y - min_y);
+  auto tri_area = [&](uint32_t a, uint32_t b, uint32_t c) {
+    return 0.5 * std::abs(double(vx[b] - vx[a]) * double(vy[c] - vy[a]) -
+                          double(vx[c] - vx[a]) * double(vy[b] - vy[a]));
+  };
+  if (prim == xenos::PrimitiveType::kRectangleList) {
+    // Three corners of the box: the fourth is implied, the rectangle is the box (its area is twice the triangle's).
+    if (std::abs(2.0 * tri_area(0, 1, 2) - box_area) > box_area * 1e-6) return false;
+  } else {
+    double area = 0.0;
+    if (prim == xenos::PrimitiveType::kTriangleList) {
+      area = tri_area(0, 1, 2) + tri_area(3, 4, 5);
+    } else if (prim == xenos::PrimitiveType::kTriangleStrip) {
+      area = tri_area(0, 1, 2) + tri_area(1, 2, 3);
+    } else {  // quad list: the quad 0-1-2-3 as two triangles
+      area = tri_area(0, 1, 2) + tri_area(0, 2, 3);
+    }
+    if (std::abs(area - box_area) > box_area * 1e-6) return false;
+  }
+
+  // Whole pixels inside the box (all sample positions covered), then the scissor.
+  int32_t x0 = int32_t(std::ceil(std::max(min_x, -16384.0f)));
+  int32_t y0 = int32_t(std::ceil(std::max(min_y, -16384.0f)));
+  int32_t x1 = int32_t(std::floor(std::min(max_x, 16384.0f)));
+  int32_t y1 = int32_t(std::floor(std::min(max_y, 16384.0f)));
+  auto tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+  auto br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+  int32_t sx0 = int32_t(tl.tl_x), sy0 = int32_t(tl.tl_y), sx1 = int32_t(br.br_x), sy1 = int32_t(br.br_y);
+  if (!tl.window_offset_disable) {
+    sx0 += pa_sc_window_offset.window_x_offset;
+    sx1 += pa_sc_window_offset.window_x_offset;
+    sy0 += pa_sc_window_offset.window_y_offset;
+    sy1 += pa_sc_window_offset.window_y_offset;
+  }
+  auto stl = regs.Get<reg::PA_SC_SCREEN_SCISSOR_TL>();
+  auto sbr = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
+  x0 = std::max({x0, sx0, int32_t(stl.tl_x), 0});
+  y0 = std::max({y0, sy0, int32_t(stl.tl_y), 0});
+  x1 = std::min({x1, sx1, int32_t(sbr.br_x)});
+  y1 = std::min({y1, sy1, int32_t(sbr.br_y)});
+  if (x1 <= x0 || y1 <= y0) {
+    return false;
+  }
+  x0_out = x0;
+  y0_out = y0;
+  x1_out = x1;
+  y1_out = y1;
+  return true;
 }
 
 }  // namespace rex::graphics

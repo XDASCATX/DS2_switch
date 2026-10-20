@@ -31,7 +31,36 @@ class DrawExtentEstimator {
   uint32_t EstimateVertexMaxY(const Shader& vertex_shader);
   uint32_t EstimateMaxY(bool try_to_estimate_vertex_max_y, const Shader& vertex_shader);
 
+  // DS2 port: if the draw is provably one axis-aligned screen-space rectangle (a rectangle list of 3 vertices, a
+  // quad list or triangle strip of 4, or a triangle list of 6, whose vertices are all corners of their bounding box
+  // and whose triangles add up exactly to it), the pixels whose whole area it covers, in window coordinates and
+  // clipped to the scissor: [x0, x1) x [y0, y1). Every sample of those pixels is covered. False otherwise.
+  bool EstimateFullyCoveredRectangle(const Shader& vertex_shader, int32_t& x0, int32_t& y0, int32_t& x1,
+                                     int32_t& y1);
+
  private:
+  class PositionXYExportSink : public ShaderInterpreter::ExportSink {
+   public:
+    void Export(ucode::ExportRegister export_register, const float* value, uint32_t value_mask) override {
+      if (export_register == ucode::ExportRegister::kVSPosition) {
+        if (value_mask & 0b0001) x_ = value[0];
+        if (value_mask & 0b0010) y_ = value[1];
+        if (value_mask & 0b1000) w_ = value[3];
+      } else if (export_register == ucode::ExportRegister::kVSPointSizeEdgeFlagKillVertex &&
+                 (value_mask & 0b0100)) {
+        killed_ = true;
+      }
+    }
+    void Reset() {
+      x_.reset();
+      y_.reset();
+      w_.reset();
+      killed_ = false;
+    }
+    std::optional<float> x_, y_, w_;
+    bool killed_ = false;
+  };
+
   class PositionYExportSink : public ShaderInterpreter::ExportSink {
    public:
     void Export(ucode::ExportRegister export_register, const float* value,
