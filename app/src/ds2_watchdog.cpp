@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <malloc.h>
 #include <deque>
 #include <filesystem>
 #include <unistd.h>
@@ -119,11 +120,13 @@ void LogHeartbeat(int seconds, size_t threads, size_t files) {
       if (auto* p = cp->active_pixel_shader()) ps = p->ucode_data_hash();
     }
   }
-  uint64_t used = 0, total = 0;
-  ds2::platform::HostMemory(&used, &total);
-  const std::string line =
-      fmt::format("[ds2 wd] t={}s hb vblank={} cp_vs={:016X} cp_ps={:016X}{} threads={} files={} host_mb={}", seconds,
-                  vblank, vs, ps, paused ? " cp_paused" : "", threads, files, used >> 20);
+  const struct mallinfo mi = mallinfo();
+  const auto k = ds2::platform::QueryKernelStats();
+  const std::string line = fmt::format(
+      "[ds2 wd] t={}s hb vblank={} cp_vs={:016X} cp_ps={:016X}{} threads={} files={} malloc_mb={} blocks={} "
+      "sysres_kb={}/{}",
+      seconds, vblank, vs, ps, paused ? " cp_paused" : "", threads, files, size_t(mi.uordblks) >> 20, k.blocks,
+      k.sysres_used >> 10, k.sysres_total >> 10);
   REXLOG_INFO("{}", line);
   const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
   char stamp[32] = {};
@@ -136,9 +139,18 @@ constexpr int kStallRepeatSeconds = 15;
 
 void LogMemory(const char* tag) {
   uint64_t used = 0, total = 0;
+  const struct mallinfo mi = mallinfo();
   if (ds2::platform::HostMemory(&used, &total)) {
-    REXLOG_INFO("[ds2 wd] {} memory: host {} / {} MB, guest backing committed {} MB, mapped {} MB", tag, used >> 20,
-                total >> 20, ds2::platform::GuestCommitted() >> 20, ds2::platform::GuestMapped() >> 20);
+    const auto k = ds2::platform::QueryKernelStats();
+    REXLOG_INFO("[ds2 wd] {} memory: host {} / {} MB, malloc arena {} MB in use {} MB, guest backing committed {} MB, "
+                "mapped {} MB | kernel: {} memory blocks ({} inaccessible), system resource {} / {} KB, "
+                "guest mapper last result 0x{:X}",
+                tag, used >> 20, total >> 20, size_t(mi.arena) >> 20, size_t(mi.uordblks) >> 20,
+                ds2::platform::GuestCommitted() >> 20, ds2::platform::GuestMapped() >> 20, k.blocks,
+                k.blocks_inaccessible, k.sysres_used >> 10, k.sysres_total >> 10, k.last_gm);
+  } else {
+    REXLOG_INFO("[ds2 wd] {} memory: malloc arena {} MB in use {} MB", tag, size_t(mi.arena) >> 20,
+                size_t(mi.uordblks) >> 20);
   }
 }
 

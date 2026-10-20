@@ -7,6 +7,7 @@ extern "C" {
 size_t RexGmCommittedBytes(void);
 size_t RexGmMappedBytes(void);
 void RexSwitchSaltyNxHabilitar(int habilitado);
+uint32_t RexGmLastResult(void);
 }
 #endif
 
@@ -42,6 +43,29 @@ uint64_t GuestMapped() {
 #else
   return 0;
 #endif
+}
+
+KernelStats QueryKernelStats() {
+  KernelStats k;
+#if defined(__SWITCH__)
+  u64 v = 0;
+  if (R_SUCCEEDED(svcGetInfo(&v, InfoType_SystemResourceSizeUsed, CUR_PROCESS_HANDLE, 0))) k.sysres_used = v;
+  if (R_SUCCEEDED(svcGetInfo(&v, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0))) k.sysres_total = v;
+  u64 addr = 0;
+  for (int guard = 0; guard < 1000000; ++guard) {
+    MemoryInfo mi{};
+    u32 pi = 0;
+    if (R_FAILED(svcQueryMemory(&mi, &pi, addr))) break;
+    ++k.blocks;
+    if (mi.type != MemType_Unmapped && (mi.perm & Perm_Rw) == 0) ++k.blocks_inaccessible;
+    const u64 next = mi.addr + mi.size;
+    if (next <= addr || next == 0) break;
+    addr = next;
+  }
+  k.last_gm = RexGmLastResult();
+  k.valid = true;
+#endif
+  return k;
 }
 
 void SetSaltyNxBridge(bool enabled) {

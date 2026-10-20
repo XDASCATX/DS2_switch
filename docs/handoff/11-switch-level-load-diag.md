@@ -121,3 +121,25 @@ mesa-switch `0ff52079ca9` (26.2.4) без патча nfsmw-nx, собрана т
 (`MESA_DIR=…/mesa-switch-head NFSMW_PATCH=none SDK_OUT=…/mesa-sdk-head tools/switch/toolchain/build-mesa-nvk.sh`).
 `out/app-switch` теперь сконфигурирован на `mesa-sdk-head`; предыдущие NRO — в `releases/`. Тест 6 — кэш Mesa в новой
 папке (`MESA_SHADER_CACHE_DIR`, чтобы не взять шейдеры старого компилятора), тест 7 — без кэша.
+
+## Тесты 6–7 (diag4, новый Mesa) и сборка diag5
+
+С новым драйвером нет ни одного `submission pressure`. Вместо этого на загрузке локации (тест 6: через 45 с после
+`frpg2_sm1002.fsb`; тест 7: через 22 с и повторно через 50 с) драйвер не может создать буфер GPU 2 МБ:
+`nvMapCreate(size=0x200000) failed: 0xce01` — 2001-0103 `KernelError_ResourceExhausted`; NVK делает это через
+`memalign` + `nvMapCreate` + `svcSetMemoryAttribute` (`nouveau_horizon_memory.c`) — память из кучи выделилась, отказал
+вызов ядра. Затем `VK_ERROR_OUT_OF_DEVICE_MEMORY`, `Failed to allocate 2097152 bytes of Vulkan upload buffer`, и
+`Failed flush to file /switch/ds2/logs/ds2_001.log` — даже запись в файл перестаёт работать. Гостевая память при этом
+516 МБ (стабильно).
+
+Рабочая гипотеза: исчерпывается ресурс ядра процесса (блоки памяти / таблицы страниц / системный ресурс), а не память
+игры. Тот же код 2001-0103 nfsmw-nx встречал при ~1,8 ГБ отображений и лечил ленивым отображением кусков гостевой памяти
+в представления (`sdk/src/core/guest_memory_switch.cpp`: «the real ceiling on Horizon is the process limit on mappable
+memory»). Кандидаты на рост у DS2: защита страниц для отслеживания записей в гостевую память (`RexGmProtect`, режим
+«desmapeo» — каждая защищённая страница вырезается из каждого из пяти представлений по отдельности), буферы NVK с
+изменёнными атрибутами, IPC. Со старым драйвером та же нехватка, видимо, выглядела как таймаут kickoff
+(`resource_pressure` включает `InsufficientMemory`) с последующим зависанием.
+
+diag5 (`out/app-switch/releases/diag5/`, sha256 `1007ec95…57ba`): heartbeat и снимки дополнены числом блоков памяти
+процесса (обход `svcQueryMemory`), `InfoType_SystemResourceSizeUsed/Total`, кучей (`mallinfo`) и последним кодом
+`RexGmLastResult`. Тест 8 — как тест 6; тест 9 — плюс `NOUVEAU_HORIZON_BO_CACHE_MB=16` и `nfsmw_io_rangos_mb = 0`.
