@@ -1,0 +1,22 @@
+DS2 Switch - diag4 (newest mesa-switch driver), tests 6 and 7
+==============================================================
+What tests 4 and 5 showed (from ds2_wd_last.txt, which survived the power-off):
+  * test 4 (cache on): the game was alive until 1 s after the level started loading, then everything stopped
+    right after an NVK "submission pressure" warning (the GPU stopped accepting work).
+  * test 5 (cache off): the level loaded; the loading screen went away and the game drew the world at ~1 fps
+    (the black screen with the waves: on the PC this first scene is also very dark). The GPU took ~1 s per frame;
+    then 20 "submission pressure" warnings in 17 s and the game stopped (07:09:56). HOME showed only black: the GPU
+    no longer worked for the system either.
+  -> the hang comes when the GPU runs the level's real shaders; the cache only changes how soon that happens.
+
+diag4 = diag3 linked with the newest mesa-switch (0ff52079ca9, Mesa 26.2.4) WITHOUT the nfsmw-nx patch. It has
+upstream fixes the old driver lacks: GPFIFO submission accounting, indirect data synchronized before method
+headers, depth-stencil memory bindings, a NAK fix for Maxwell (SM50), and named GPU channel errors in the log.
+The previous NRO stays at SW1_ds2/switch/diag3 (and v1 at SW1_ds2/switch/).
+
+Setup: copy diag4/ds2.nro as sdmc:/switch/ds2/ds2.nro. Rename the logs folder of the previous test.
+Test 6 (ds2.toml.test6), then test 7 (ds2.toml.test7) only if 6 hangs. Steps as before:
+  Continue -> intro -> loading. From the loading screen wait up to 10 minutes; press HOME every ~2 minutes;
+  write down what you see and hear and when; exit with HOME -> Close if possible.
+If the world appears: try to move the character for a minute and note the frame rate as you perceive it.
+Send the whole sdmc:/switch/ds2/logs folder (with ds2_wd_last.txt) + notes.

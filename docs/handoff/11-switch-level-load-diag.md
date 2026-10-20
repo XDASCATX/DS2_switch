@@ -93,3 +93,31 @@
 
 diag3 (`out/app-switch/releases/diag3/`, sha256 `2de022b8…55b1`): + `logs/ds2_wd_last.txt` — последняя строка heartbeat
 и последние события файлов, перезаписывается с `fsync` каждые 2 с и переживает выключение питанием.
+
+## Тесты 4–5 (diag3) и сборка diag4
+
+`logs/ds2_wd_last.txt` пережил выключение питанием в обоих тестах и совпал с концом основного лога — значит, обрыв лога
+это момент остановки игры, а не потеря данных.
+
+- Тест 4 (`NVK_SWITCH_NO_UBO_CBUF=1`, кэш Mesa включён): последний признак жизни 07:02:50, через 1 с после
+  `frpg2_sm1002.fsb`, одновременно с `submission pressure`. Путь UBO не помог.
+- Тест 5 (только кэш Mesa выключен): уровень загрузился, экран загрузки исчез (у владельца: чёрный экран и звук волн —
+  та же тёмная сцена, что на ПК), игра рисовала мир: 0,3 → 1,4 fps, 412–571 вызовов отрисовки и 48–59 resolves на кадр,
+  поток GPU Commands почти всё время ждёт fence (118 ожиданий, 983 мс в секунду) — GPU тратит ~0,7–1 с на кадр.
+  Затем 20 `submission pressure` за 07:09:39–56 и остановка в 07:09:56; HOME показал только чёрный экран и выключил звук
+  — GPU перестал работать и для системы.
+
+Вывод (рабочий, не доказан окончательно): зависание GPU наступает, когда GPU выполняет настоящие шейдеры локации; с
+кэшем Mesa это происходит сразу (шейдеры готовы), без кэша — после их компиляции. Не нехватка памяти (гостевая
+516 МБ стабильна), не файлы (все открываются), не оверлей (выключен в тестах 1–5), не мост SaltyNX (выключен).
+
+В закреплённом mesa-switch `1a8c1a66d6f` (+ патч nfsmw-nx) нет 61 более поздних коммитов upstream, среди них:
+`f68a41350db horizon: fix GPFIFO submission capacity accounting`, `bfdbd1d / 6fb46f1 nvk: synchronize Horizon indirect
+data before method headers`, `a72f9551e79 nvk: fix Horizon depth-stencil memory bindings`, `93d3ed1 nak: legalize
+saturated long-immediate FADD on SM50`, `6db57fa nouveau/horizon: name the channel fault notifications`.
+
+diag4 (`out/app-switch/releases/diag4-mesahead/`, sha256 `1631642c…703b`) — тот же код игры и приложения, Mesa =
+mesa-switch `0ff52079ca9` (26.2.4) без патча nfsmw-nx, собрана тем же рецептом
+(`MESA_DIR=…/mesa-switch-head NFSMW_PATCH=none SDK_OUT=…/mesa-sdk-head tools/switch/toolchain/build-mesa-nvk.sh`).
+`out/app-switch` теперь сконфигурирован на `mesa-sdk-head`; предыдущие NRO — в `releases/`. Тест 6 — кэш Mesa в новой
+папке (`MESA_SHADER_CACHE_DIR`, чтобы не взять шейдеры старого компилятора), тест 7 — без кэша.
