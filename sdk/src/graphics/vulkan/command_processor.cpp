@@ -67,6 +67,11 @@ REXCVAR_DEFINE_BOOL(gpu_zone_timing, false, "GPU/Vulkan",
                     "timestamp queries; reported per frame in rex_perfil.log. Adds a little GPU work")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_INT32(gpu_zone_timing_fine_every, 0, "GPU/Vulkan",
+                     "Switch (with gpu_zone_timing): time every game draw and barrier only in one submission of "
+                     "every N (0 = never), reported apart in rex_perfil.log; the other submissions run untouched")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(gpu_zone_timing_fine, false, "GPU/Vulkan",
                     "Switch DIAGNOSTIC (with gpu_zone_timing): also time every game draw and every pipeline barrier. "
                     "Thousands of timestamps per frame, each with a flush of pending writes: costs GPU time itself")
@@ -5186,6 +5191,10 @@ void VulkanCommandProcessor::GpuZonesBeginSubmission() {
   }
   slot.submission = submission;
   slot.count = 0;
+  {
+    const int32_t every = REXCVAR_GET(gpu_zone_timing_fine_every);
+    slot.fine = gpu_zone_fine_ || (every > 0 && !(submission % uint64_t(every)));
+  }
   gpu_zone_current_ = &slot;
   gpu_zone_current_base_ = slot_index * kGpuZoneQueriesPerSlot;
   deferred_command_buffer_.CmdVkResetQueryPool(gpu_zone_pool_, gpu_zone_current_base_, kGpuZoneQueriesPerSlot);
@@ -5196,7 +5205,7 @@ void VulkanCommandProcessor::GpuZonesBeginSubmission() {
 void VulkanCommandProcessor::GpuZoneWrite(uint8_t tag) {
   GpuZoneSlot* slot = gpu_zone_current_;
   if (slot && (tag & 0x7F) != 0x7F &&
-      ((tag & 0x7F) == kGpuZoneGuestDraw || (tag & 0x7F) == kGpuZoneBarrier) && !gpu_zone_fine_) {
+      ((tag & 0x7F) == kGpuZoneGuestDraw || (tag & 0x7F) == kGpuZoneBarrier) && !slot->fine) {
     return;
   }
   if (!slot || slot->count >= kGpuZoneQueriesPerSlot - 1 || (tag != 0xFF && slot->count >= kGpuZoneQueriesPerSlot - 2)) {
@@ -5258,6 +5267,15 @@ void VulkanCommandProcessor::GpuZonesCollect() {
       }
     }
     if (!start || end < start) {
+      continue;
+    }
+    if (slot.fine && !gpu_zone_fine_) {
+      // Sampled fine submission: reported apart (counters 82-86), not mixed into the untimed totals.
+      RexSwitchPerfAdd(82, uint64_t(double(end - start) * kNsPerTick));
+      RexSwitchPerfAdd(83, uint64_t(double(zone_ticks[kGpuZoneGuestDraw]) * kNsPerTick));
+      RexSwitchPerfAdd(84, zone_instances[kGpuZoneGuestDraw]);
+      RexSwitchPerfAdd(85, uint64_t(double(zone_ticks[kGpuZoneBarrier]) * kNsPerTick));
+      RexSwitchPerfCount(86);
       continue;
     }
     RexSwitchPerfAdd(42, uint64_t(double(end - start) * kNsPerTick));

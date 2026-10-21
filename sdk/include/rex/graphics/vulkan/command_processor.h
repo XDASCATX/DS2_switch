@@ -753,6 +753,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint64_t submission = 0;
     uint32_t count = 0;
     bool pending = false;  // recorded, results not read yet
+    bool fine = false;     // game draws and barriers timed in this submission
     uint8_t tags[kGpuZoneQueriesPerSlot];
   };
   void GpuZoneWrite(uint8_t tag);

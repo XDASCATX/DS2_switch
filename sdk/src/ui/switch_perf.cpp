@@ -110,7 +110,7 @@ constexpr u64 kReportSeconds = 10;
 constexpr u64 kStartDelayNs = 8000000000ULL;
 constexpr size_t kMaxSamples = 1 << 15;
 constexpr size_t kFrames = 10;
-constexpr unsigned kCounterCount = 82;  // DS2: 76/77 direct resolves / fallbacks, 78-80 memexport, 81 hoisted uploads
+constexpr unsigned kCounterCount = 87;  // DS2: 76/77 direct resolves / fallbacks, 78-80 memexport, 81 hoisted uploads
 // In <NRO folder>/logs/rex/ (switch_crash_hooks.c computes it at startup).
 std::string ReportPath() {
   return std::string(RexSwitchLogDir()) + "rex_perfil.log";
@@ -628,6 +628,17 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
                      n > 0 ? delta(56 + z) * per * 1000.0 / n : 0.0, z < 7 ? " |" : "\n");
       }
       std::fprintf(f, "     dibujados del juego en RT con MSAA: %.1f por fotograma\n", delta(54) / frames);
+    }
+    // DS2: sampled fine timing (gpu_zone_timing_fine_every): game draws and barriers timed in some submissions only.
+    if (delta(86) > 0) {
+      const double per_f = 1.0 / delta(86) / 1e6;
+      const double draws = delta(84) / delta(86);
+      std::fprintf(f,
+                   "     muestra fina (%.0f envios con cada draw medido): total %.1f ms | dibujados del juego %.1f ms "
+                   "(%.0f x %.0f us) | barreras %.1f ms | el resto %.1f ms\n",
+                   delta(86), delta(82) * per_f, delta(83) * per_f, draws,
+                   draws > 0 ? delta(83) * per_f * 1000.0 / draws : 0.0, delta(85) * per_f,
+                   (delta(82) - delta(83) - delta(85)) * per_f);
     }
     std::fprintf(f,
                  "     dibujados por ancho de superficie: 1600+ %.0f | 1280-1599 %.0f | "
