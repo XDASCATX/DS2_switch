@@ -1623,16 +1623,21 @@ VulkanRenderTargetCache::DrawOverwrite VulkanRenderTargetCache::ComputeDrawOverw
     return ow;
   }
   bool inside_clip_volume = false;
+  draw_extent_estimator().clip_out_ = REXCVAR_GET(rt_transfer_trace) ? ow.clip : nullptr;
   if (!draw_extent_estimator().EstimateFullyCoveredRectangle(vertex_shader, ow.x0, ow.y0, ow.x1, ow.y1,
                                                              &inside_clip_volume,
                                                              REXCVAR_GET(rt_transfer_trace) ? ow.box : nullptr)) {
+    draw_extent_estimator().clip_out_ = nullptr;
     DrawOverwrite none;
     none.reason = 8;
     return none;
   }
+  draw_extent_estimator().clip_out_ = nullptr;
   if (need_inside_clip_volume && !inside_clip_volume) {
     DrawOverwrite none;
     none.reason = 9;
+    std::memcpy(none.box, ow.box, sizeof(none.box));
+    std::memcpy(none.clip, ow.clip, sizeof(none.clip));
     return none;
   }
   ow.valid = true;
@@ -5246,6 +5251,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                         draw_overwrite_.box[3], draw_overwrite_.box[4], draw_overwrite_.box[5],
                         draw_overwrite_.box[6], draw_overwrite_.box[7], draw_overwrite_.box[8],
                         draw_overwrite_.box[9], draw_overwrite_.box[10], draw_overwrite_.box[11]);
+            const float* c = draw_overwrite_.clip;
+            REXGPU_INFO("rt_transfer_trace   clip {} {} {} {} | {} {} {} {} | {} {} {} {} | {} {} {} {}", c[0], c[1],
+                        c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], c[12], c[13], c[14], c[15]);
           }
         }
         if (dest_updates % stats_every == 0) {

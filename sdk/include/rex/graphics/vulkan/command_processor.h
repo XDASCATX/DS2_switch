@@ -432,6 +432,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   // clearing and stopping capturing. Returns whether the submission was done
   // successfully, if it has failed, leaves it open.
   bool EndSubmission(bool is_swap);
+  uint64_t render_target_eviction_frame_ = 0;
+  bool gpu_zone_fine_ = false;
   bool AwaitAllQueueOperationsCompletion() {
     CheckSubmissionFenceAndDeviceLoss(GetCurrentSubmission());
     return !submission_open_ && submissions_in_flight_fences_.empty();

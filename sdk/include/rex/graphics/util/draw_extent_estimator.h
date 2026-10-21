@@ -41,6 +41,10 @@ class DrawExtentEstimator {
                                      int32_t& y1, bool* inside_clip_volume_out = nullptr,
                                      float* box_out = nullptr);
 
+ public:
+  // Development: when set, EstimateFullyCoveredRectangle stores the clip-space x, y, z, w of up to 4 vertices.
+  float* clip_out_ = nullptr;
+
  private:
   class PositionXYExportSink : public ShaderInterpreter::ExportSink {
    public:

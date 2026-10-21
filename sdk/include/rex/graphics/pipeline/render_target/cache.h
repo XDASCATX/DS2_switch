@@ -168,6 +168,13 @@ class RenderTargetCache {
   // here), don't call from destructors (does work not needed for shutdown
   // also).
   virtual void ClearCache();
+  // DS2 port: whether a render target could not be created since the last call (out of memory).
+  bool TakeRenderTargetCreationFailure() {
+    const bool failed = render_target_creation_failed_;
+    render_target_creation_failed_ = false;
+    return failed;
+  }
+  size_t GetRenderTargetCount() const { return render_targets_.size(); }
 
   virtual void BeginFrame();
 
@@ -667,6 +674,7 @@ class RenderTargetCache {
   // Render targets actually used by the draw call with the last successful
   // update. 0 is depth, color starting from 1, nullptr if not bound.
   // Only valid for non-pixel-shader-interlock paths.
+  bool render_target_creation_failed_ = false;
   RenderTarget* last_update_used_render_targets_[1 + xenos::kMaxColorRenderTargets];
   // Render targets used by the draw call with the last successful update or
   // previous updates, unless a different or a totally new one was bound (or

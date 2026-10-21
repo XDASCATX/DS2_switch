@@ -411,8 +411,7 @@ bool DrawExtentEstimator::EstimateFullyCoveredRectangle(const Shader& vertex_sha
   float vx[6], vy[6];
   // Clip-space containment: only meaningful when the shader outputs homogeneous x, y, z, w (no VTE pass-through).
   const bool dx_clip_space = regs.Get<reg::PA_CL_CLIP_CNTL>().dx_clip_space_def;
-  bool inside_clip_volume =
-      !pa_cl_vte_cntl.vtx_xy_fmt && !pa_cl_vte_cntl.vtx_z_fmt && !pa_cl_vte_cntl.vtx_w0_fmt;
+  bool inside_clip_volume = true;
   shader_interpreter_.SetShader(vertex_shader);
   PositionXYExportSink sink;
   shader_interpreter_.SetExportSink(&sink);
@@ -439,19 +438,36 @@ bool DrawExtentEstimator::EstimateFullyCoveredRectangle(const Shader& vertex_sha
       break;
     }
     float x = sink.x_.value(), y = sink.y_.value();
+    if (i < 4 && clip_out_) {
+      clip_out_[4 * i + 0] = x;
+      clip_out_[4 * i + 1] = y;
+      clip_out_[4 * i + 2] = sink.z_.value_or(-999.0f);
+      clip_out_[4 * i + 3] = sink.w_.value_or(-999.0f);
+    }
+    // The clip-space W, as the translated vertex shader rebuilds it (SpirvShaderTranslator::
+    // CompleteVertexOrTessEvalShaderInMain): VTX_W0_FMT set means the shader exports W itself, clear means 1/W.
+    float clip_w = std::numeric_limits<float>::quiet_NaN();
+    if (sink.w_.has_value()) {
+      clip_w = pa_cl_vte_cntl.vtx_w0_fmt ? sink.w_.value() : 1.0f / sink.w_.value();
+    }
     if (inside_clip_volume) {
-      const float w = sink.w_.value_or(0.0f);
-      const float z = sink.z_.value_or(std::numeric_limits<float>::quiet_NaN());
-      inside_clip_volume = w > 0.0f && std::abs(x) <= w && std::abs(y) <= w &&
-                           (dx_clip_space ? (z >= 0.0f && z <= w) : (z >= -w && z <= w));
+      float z = sink.z_.value_or(std::numeric_limits<float>::quiet_NaN());
+      if (pa_cl_vte_cntl.vtx_z_fmt) {
+        z *= clip_w;  // exported already divided by W
+      }
+      // X and Y may be outside: with clipping, the host viewport is the integer rectangle of the guest one
+      // (draw_util::GetHostViewportInfo), and the rectangle is intersected with it below. Z must be inside, or
+      // near / far clipping could cut the primitive.
+      inside_clip_volume = clip_w > 0.0f &&
+                           (dx_clip_space ? (z >= 0.0f && z <= clip_w) : (z >= -clip_w && z <= clip_w));
     }
     if (!pa_cl_vte_cntl.vtx_xy_fmt) {
-      if (!sink.w_.has_value() || !(sink.w_.value() > 0.0f)) {
+      if (!(clip_w > 0.0f)) {
         ok = false;
         break;
       }
-      x /= sink.w_.value();
-      y /= sink.w_.value();
+      x /= clip_w;
+      y /= clip_w;
     }
     vx[i] = x * scale_x + offset_x + half_pixel + window_x;
     vy[i] = y * scale_y + offset_y + half_pixel + window_y;
@@ -531,6 +547,16 @@ bool DrawExtentEstimator::EstimateFullyCoveredRectangle(const Shader& vertex_sha
   y0 = std::max({y0, sy0, int32_t(stl.tl_y), 0});
   x1 = std::min({x1, sx1, int32_t(sbr.br_x)});
   y1 = std::min({y1, sy1, int32_t(sbr.br_y)});
+  if (inside_clip_volume_out && !regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable) {
+    // The host clips (or viewport-scissors) to the guest viewport truncated to whole pixels, with the window and
+    // half-pixel offsets, as draw_util::GetHostViewportInfo computes it.
+    const float vp_offset_x = offset_x + half_pixel + window_x;
+    const float vp_offset_y = offset_y + half_pixel + window_y;
+    x0 = std::max(x0, int32_t(std::max(vp_offset_x - std::abs(scale_x), 0.0f)));
+    y0 = std::max(y0, int32_t(std::max(vp_offset_y - std::abs(scale_y), 0.0f)));
+    x1 = std::min(x1, int32_t(std::max(vp_offset_x + std::abs(scale_x), 0.0f)));
+    y1 = std::min(y1, int32_t(std::max(vp_offset_y + std::abs(scale_y), 0.0f)));
+  }
   if (x1 <= x0 || y1 <= y0) {
     return false;
   }

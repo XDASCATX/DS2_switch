@@ -1168,6 +1168,9 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(Rend
           width, height, uint32_t(1) << uint32_t(key.msaa_samples),
           key.is_depth ? "depth" : "color", static_cast<uint32_t>(key.resource_format),
           static_cast<uint32_t>(key.base_tiles));
+      // DS2 port: usually out of memory. The backend releases the render targets that own no EDRAM data
+      // (ClearCache) when it is safe, which also drops this failed entry so it is created again.
+      render_target_creation_failed_ = true;
     }
     // Insert even if failed to create, not to try to create again.
     render_targets_.emplace(key, render_target);

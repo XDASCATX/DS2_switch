@@ -64,6 +64,11 @@ REXCVAR_DEFINE_BOOL(gpu_zone_timing, false, "GPU/Vulkan",
                     "timestamp queries; reported per frame in rex_perfil.log. Adds a little GPU work")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(gpu_zone_timing_fine, false, "GPU/Vulkan",
+                    "Switch DIAGNOSTIC (with gpu_zone_timing): also time every game draw and every pipeline barrier. "
+                    "Thousands of timestamps per frame, each with a flush of pending writes: costs GPU time itself")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -4264,6 +4269,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       memexport_total_size += memexport_range.size_bytes;
     }
     if (memexport_total_size) {
+#if REX_PLATFORM_SWITCH
+      RexSwitchPerfCount(78);  // DS2 port: draws whose memexport output is read back to guest memory
+      RexSwitchPerfAdd(80, memexport_total_size);
+#endif
+      {
+        // DS2 port, development: how often the game exports from shaders (rare log).
+        static uint64_t memexport_readbacks = 0;
+        if (++memexport_readbacks % 2000 == 1) {
+          REXGPU_INFO("memexport readback #{} frame {}: {} bytes in {} ranges", memexport_readbacks,
+                      frame_current_, memexport_total_size, memexport_ranges_.size());
+        }
+      }
       if (REXCVAR_GET(readback_memexport_fast)) {
         IssueDraw_MemexportReadbackFastPath(memexport_total_size);
       } else {
@@ -4279,6 +4296,9 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
   if (!total_size || memexport_ranges_.empty()) {
     return true;
   }
+#if REX_PLATFORM_SWITCH
+  RexSwitchPerfCount(79);  // DS2 port: memexport readbacks that wait for the whole GPU queue
+#endif
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -5064,7 +5084,9 @@ void VulkanCommandProcessor::GpuZonesBeginSubmission() {
       REXGPU_ERROR("gpu_zone_timing: failed to create the timestamp query pool");
       return;
     }
-    REXGPU_INFO("gpu_zone_timing: on ({} slots x {} timestamps)", kGpuZoneSlots, kGpuZoneQueriesPerSlot);
+    gpu_zone_fine_ = REXCVAR_GET(gpu_zone_timing_fine);
+    REXGPU_INFO("gpu_zone_timing: on ({} slots x {} timestamps), game draws and barriers {}", kGpuZoneSlots,
+                kGpuZoneQueriesPerSlot, gpu_zone_fine_ ? "timed" : "not timed");
   }
   const uint64_t submission = GetCurrentSubmission();
   const uint32_t slot_index = uint32_t(submission % kGpuZoneSlots);
@@ -5084,6 +5106,10 @@ void VulkanCommandProcessor::GpuZonesBeginSubmission() {
 
 void VulkanCommandProcessor::GpuZoneWrite(uint8_t tag) {
   GpuZoneSlot* slot = gpu_zone_current_;
+  if (slot && (tag & 0x7F) != 0x7F &&
+      ((tag & 0x7F) == kGpuZoneGuestDraw || (tag & 0x7F) == kGpuZoneBarrier) && !gpu_zone_fine_) {
+    return;
+  }
   if (!slot || slot->count >= kGpuZoneQueriesPerSlot - 1 || (tag != 0xFF && slot->count >= kGpuZoneQueriesPerSlot - 2)) {
     return;  // keep the last query for the submission end
   }
@@ -5673,6 +5699,19 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     frame_open_ = false;
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kMaxFramesInFlight] = GetCurrentSubmission() - 1;
+
+    // DS2 port: a render target could not be created (out of memory): once the GPU is idle, release the
+    // render targets that own no EDRAM data (their contents are no longer needed), like ClearCache does, at
+    // most once every 30 frames. The failed one is created again on its next use.
+    if (!cache_clear_requested_ && render_target_cache_->TakeRenderTargetCreationFailure() &&
+        frame_current_ >= render_target_eviction_frame_ + 30 && AwaitAllQueueOperationsCompletion()) {
+      render_target_eviction_frame_ = frame_current_;
+      const size_t render_targets_before = render_target_cache_->GetRenderTargetCount();
+      render_target_cache_->ClearCache();
+      REXGPU_WARN("Render target memory: released {} of {} render targets owning no EDRAM data",
+                  render_targets_before - render_target_cache_->GetRenderTargetCount(),
+                  render_targets_before);
+    }
 
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;

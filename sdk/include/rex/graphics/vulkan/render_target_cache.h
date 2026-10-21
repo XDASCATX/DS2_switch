@@ -899,6 +899,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     // 8 not a provable screen rectangle, 9 clipping enabled and a vertex outside the clip volume.
     uint8_t reason = 1;
     float box[12] = {};  // development: estimator box and vertices
+    float clip[16] = {};  // development: clip-space x, y, z, w of the vertices
   };
   DrawOverwrite ComputeDrawOverwrite(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
                                      uint32_t normalized_color_mask, const Shader& vertex_shader);
