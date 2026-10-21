@@ -35,8 +35,11 @@ class DrawExtentEstimator {
   // quad list or triangle strip of 4, or a triangle list of 6, whose vertices are all corners of their bounding box
   // and whose triangles add up exactly to it), the pixels whose whole area it covers, in window coordinates and
   // clipped to the scissor: [x0, x1) x [y0, y1). Every sample of those pixels is covered. False otherwise.
+  // inside_clip_volume_out (optional): whether every vertex is inside the clip volume (|x|, |y| <= w, z in the
+  // clip range), so that the clipper, when enabled, cannot cut anything off.
   bool EstimateFullyCoveredRectangle(const Shader& vertex_shader, int32_t& x0, int32_t& y0, int32_t& x1,
-                                     int32_t& y1);
+                                     int32_t& y1, bool* inside_clip_volume_out = nullptr,
+                                     float* box_out = nullptr);
 
  private:
   class PositionXYExportSink : public ShaderInterpreter::ExportSink {
@@ -45,6 +48,7 @@ class DrawExtentEstimator {
       if (export_register == ucode::ExportRegister::kVSPosition) {
         if (value_mask & 0b0001) x_ = value[0];
         if (value_mask & 0b0010) y_ = value[1];
+        if (value_mask & 0b0100) z_ = value[2];
         if (value_mask & 0b1000) w_ = value[3];
       } else if (export_register == ucode::ExportRegister::kVSPointSizeEdgeFlagKillVertex &&
                  (value_mask & 0b0100)) {
@@ -54,10 +58,11 @@ class DrawExtentEstimator {
     void Reset() {
       x_.reset();
       y_.reset();
+      z_.reset();
       w_.reset();
       killed_ = false;
     }
-    std::optional<float> x_, y_, w_;
+    std::optional<float> x_, y_, z_, w_;
     bool killed_ = false;
   };
 

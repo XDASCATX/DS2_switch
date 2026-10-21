@@ -1,0 +1,32 @@
+# DS2 Switch - v33. Compare with v32 (the control, ~7-10 FPS, correct colours).
+# v33 NRO = v32 + three GPU changes (docs/handoff/16-switch-gpu-optimization.md, section v33):
+#  1. resolves straight from the render targets into game memory in one pass (no dump into the EDRAM buffer);
+#  2. more render target transfers left out: depth-only clears/passes and full-screen passes the draw overwrites;
+#  3. shader compiler (NAK) tuned for the Switch's memory latency (new Mesa shader cache folder below).
+# All three are settings that can also be switched in the L+R+Right menu (GPU/Vulkan) while playing, except 3.
+log_level = "info"
+ds2_watchdog = true
+ds2_switch_saltynx = false
+ds2_mesa_env = "MESA_SHADER_CACHE_DIR=sdmc:/switch/ds2/mesa_cache_v33;NOUVEAU_HORIZON_BO_CACHE_MB=16;NVK_SWITCH_PERF_LOG=1"
+nfsmw_io_rangos_mb = 0
+ds2_switch_nvmap_mb = 64
+# Smaller host texture cache (heap headroom on the console).
+texture_cache_memory_limit_soft = 128
+texture_cache_memory_limit_hard = 256
+texture_cache_memory_limit_soft_lifetime = 5
+ds2_watchdog_probe_tables = 0
+# Guest memory in 2 MB pieces (fewer kernel page tables); 6 MB host stacks are the Switch default.
+ds2_switch_commit_granule_kb = 2048
+# MODE 7 as a permanent setting: depth transfers skip the 8 stencil-bit passes (NVK has no stencil export).
+render_target_transfer_skip = 1
+edram_diagnostic_mode = 0
+# v32: clears and other unclipped screen rectangles: height from their vertices instead of "to the end of EDRAM".
+execute_unclipped_draw_vs_on_cpu = true
+# v32: do not transfer old EDRAM contents into areas the draw then overwrites completely (same image, less GPU work).
+render_target_transfer_elide_overwritten = true
+# NEW in v33: the same for depth-only draws (shadow maps, depth clears) and clipped full-screen passes.
+render_target_transfer_elide_extended = true
+# NEW in v33: one-pass resolves (same bytes in game memory as before - checked byte by byte on PC).
+render_target_direct_resolve = true
+# GPU time per kind of work in rex_perfil.log (same as v32, so the numbers compare).
+gpu_zone_timing = true

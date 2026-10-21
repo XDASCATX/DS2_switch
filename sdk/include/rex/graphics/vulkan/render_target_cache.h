@@ -15,6 +15,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <string>
 #include <unordered_map>
 
 #include <rex/graphics/flags.h>
@@ -755,11 +756,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     }
   };
 
+  // DS2 port: push constants of shaders/ds2/direct_resolve_fast_32bpp.comp.
   struct DirectResolvePushConstants {
     draw_util::ResolveCopyShaderConstants resolve;
     uint32_t source_base_tiles;
     uint32_t source_pitch_tiles;
-    uint32_t dispatch_first_tile;
+    // The tile span of the resolve (ResolveInfo::GetCopyEdramTileSpan) and the part of it owned by
+    // the source render target, in tiles from span_base_tiles.
+    uint32_t span_base_tiles;
+    uint32_t owned_local_start;
+    uint32_t owned_local_end;
   };
 
   struct DirectResolvePipelineKey {
@@ -804,9 +810,22 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   VkPipeline GetDumpPipeline(DumpPipelineKey key);
   VkPipeline GetDirectResolvePipeline(DirectResolvePipelineKey key);
-  bool TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
-                              draw_util::ResolveCopyShaderIndex copy_shader,
-                              bool draw_resolution_scaled);
+  // DS2 port: direct resolve (one pass from the host render targets to guest memory, without the
+  // dump into edram_buffer_). PrepareDirectResolve checks that the resolve can be done that way
+  // (fast 32bpp 1x/2x copy, unscaled, 32bpp owners covering the whole tile span, pipelines
+  // available) and leaves the owners in dump_rectangles_; RecordDirectResolve records it.
+  bool PrepareDirectResolve(const draw_util::ResolveInfo& resolve_info,
+                            draw_util::ResolveCopyShaderIndex copy_shader,
+                            bool draw_resolution_scaled);
+  void RecordDirectResolve(const draw_util::ResolveInfo& resolve_info,
+                           const draw_util::ResolveCopyShaderConstants& copy_shader_constants,
+                           VkDescriptorSet descriptor_set_dest, uint32_t group_count_x,
+                           uint32_t group_count_y);
+  // DS2 port, development (direct_host_resolve_validate): both paths into guest memory, copies of
+  // each result to a host buffer, compared when the submission completes.
+  void ValidateDirectResolveCopy(VkBuffer dest_buffer, uint64_t dest_offset, uint32_t length,
+                                 bool second);
+  void CheckDirectResolveValidations();
 
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
@@ -875,6 +894,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     bool stencil = false;
     uint32_t color_rts = 0;  // bit k: colour render target k fully overwritten
     int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    // Development (rt_transfer_trace): why it is not valid. 0 valid, 1 off/unscaled/not rasterized, 2 edram
+    // mode, 3 kill, 4 alpha test / alpha to mask, 5 clipping, 6 depth/stencil test, 7 nothing written,
+    // 8 not a provable screen rectangle, 9 clipping enabled and a vertex outside the clip volume.
+    uint8_t reason = 1;
+    float box[12] = {};  // development: estimator box and vertices
   };
   DrawOverwrite ComputeDrawOverwrite(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
                                      uint32_t normalized_color_mask, const Shader& vertex_shader);
@@ -888,6 +912,23 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;
   std::vector<DumpInvocation> dump_invocations_;
   std::vector<ResolveCopyDispatch> direct_resolve_dispatches_;
+  // Direct resolve validation (development).
+  VkBuffer direct_resolve_validation_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory direct_resolve_validation_memory_ = VK_NULL_HANDLE;
+  uint8_t* direct_resolve_validation_mapping_ = nullptr;
+  uint64_t direct_resolve_validation_used_ = 0;
+  struct DirectResolveValidation {
+    uint64_t submission;
+    uint64_t offset_direct;
+    uint64_t offset_reference;
+    uint32_t length;
+    std::string description;
+  };
+  std::vector<DirectResolveValidation> direct_resolve_validations_;
+  uint64_t direct_resolve_validation_pending_offset_ = 0;
+  uint64_t direct_resolve_validations_checked_ = 0;
+  uint64_t direct_resolve_validations_failed_ = 0;
+  std::string direct_resolve_validation_description_;
   uint64_t direct_resolve_attempt_count_ = 0;
   uint64_t direct_resolve_success_count_ = 0;
   uint64_t direct_resolve_fallback_count_ = 0;

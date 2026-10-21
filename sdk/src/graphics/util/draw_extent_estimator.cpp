@@ -18,6 +18,7 @@
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
 #include <cmath>
+#include <limits>
 #include <algorithm>
 #include <rex/graphics/format/ucode.h>
 #include <rex/graphics/registers.h>
@@ -334,8 +335,12 @@ uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,
 }
 
 bool DrawExtentEstimator::EstimateFullyCoveredRectangle(const Shader& vertex_shader, int32_t& x0_out,
-                                                        int32_t& y0_out, int32_t& x1_out, int32_t& y1_out) {
+                                                        int32_t& y0_out, int32_t& x1_out, int32_t& y1_out,
+                                                        bool* inside_clip_volume_out, float* box_out) {
   const RegisterFile& regs = register_file_;
+  if (inside_clip_volume_out) {
+    *inside_clip_volume_out = false;
+  }
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
   const xenos::PrimitiveType prim = vgt_draw_initiator.prim_type;
   const uint32_t count = vgt_draw_initiator.num_indices;
@@ -404,6 +409,10 @@ bool DrawExtentEstimator::EstimateFullyCoveredRectangle(const Shader& vertex_sha
   const float window_y = pa_su_sc_mode_cntl.vtx_window_offset_enable ? float(pa_sc_window_offset.window_y_offset) : 0.0f;
 
   float vx[6], vy[6];
+  // Clip-space containment: only meaningful when the shader outputs homogeneous x, y, z, w (no VTE pass-through).
+  const bool dx_clip_space = regs.Get<reg::PA_CL_CLIP_CNTL>().dx_clip_space_def;
+  bool inside_clip_volume =
+      !pa_cl_vte_cntl.vtx_xy_fmt && !pa_cl_vte_cntl.vtx_z_fmt && !pa_cl_vte_cntl.vtx_w0_fmt;
   shader_interpreter_.SetShader(vertex_shader);
   PositionXYExportSink sink;
   shader_interpreter_.SetExportSink(&sink);
@@ -430,6 +439,12 @@ bool DrawExtentEstimator::EstimateFullyCoveredRectangle(const Shader& vertex_sha
       break;
     }
     float x = sink.x_.value(), y = sink.y_.value();
+    if (inside_clip_volume) {
+      const float w = sink.w_.value_or(0.0f);
+      const float z = sink.z_.value_or(std::numeric_limits<float>::quiet_NaN());
+      inside_clip_volume = w > 0.0f && std::abs(x) <= w && std::abs(y) <= w &&
+                           (dx_clip_space ? (z >= 0.0f && z <= w) : (z >= -w && z <= w));
+    }
     if (!pa_cl_vte_cntl.vtx_xy_fmt) {
       if (!sink.w_.has_value() || !(sink.w_.value() > 0.0f)) {
         ok = false;
@@ -455,6 +470,17 @@ bool DrawExtentEstimator::EstimateFullyCoveredRectangle(const Shader& vertex_sha
     max_x = std::max(max_x, vx[i]);
     min_y = std::min(min_y, vy[i]);
     max_y = std::max(max_y, vy[i]);
+  }
+  if (box_out) {
+    // Development: the window-space bounding box and the vertices (up to 4).
+    box_out[0] = min_x;
+    box_out[1] = min_y;
+    box_out[2] = max_x;
+    box_out[3] = max_y;
+    for (uint32_t i = 0; i < 4; ++i) {
+      box_out[4 + 2 * i] = i < count ? vx[i] : -1.0f;
+      box_out[5 + 2 * i] = i < count ? vy[i] : -1.0f;
+    }
   }
   if (!(max_x > min_x) || !(max_y > min_y)) {
     return false;
@@ -512,6 +538,9 @@ bool DrawExtentEstimator::EstimateFullyCoveredRectangle(const Shader& vertex_sha
   y0_out = y0;
   x1_out = x1;
   y1_out = y1;
+  if (inside_clip_volume_out) {
+    *inside_clip_volume_out = inside_clip_volume;
+  }
   return true;
 }
 
