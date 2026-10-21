@@ -169,6 +169,7 @@ class RenderTargetCache {
   // also).
   virtual void ClearCache();
   // DS2 port: whether a render target could not be created since the last call (out of memory).
+  bool HasRenderTargetCreationFailure() const { return render_target_creation_failed_; }
   bool TakeRenderTargetCreationFailure() {
     const bool failed = render_target_creation_failed_;
     render_target_creation_failed_ = false;

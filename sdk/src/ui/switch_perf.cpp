@@ -81,6 +81,13 @@ Result __real_bqDequeueBuffer(Binder* b, bool async, u32 width, u32 height, s32 
 void __real_svcSleepThread(s64 nano);
 }
 
+// Set by the application from its configuration (ds2: switch_perf_stack_sampling), before the profiler thread
+// leaves its start delay; same effect as perfil_pilas.flag.
+static std::atomic<bool> g_stack_sampling_requested{false};
+extern "C" void RexSwitchPerfRequestStackSampling(bool enable) {
+  g_stack_sampling_requested.store(enable, std::memory_order_relaxed);
+}
+
 namespace {
 
 constexpr size_t kMaxThreads = 160;
@@ -888,7 +895,7 @@ void ProfilerMain(void*) {
 
   // Invasive sampling is only enabled explicitly, for diagnostics.
   // The normal mode keeps FPS, CPU and counters, without stopping the game.
-  bool sample_stacks = false;
+  bool sample_stacks = g_stack_sampling_requested.load(std::memory_order_relaxed);
   if (FILE* flag = std::fopen(StackFlagPath().c_str(), "r")) {
     sample_stacks = true;
     std::fclose(flag);

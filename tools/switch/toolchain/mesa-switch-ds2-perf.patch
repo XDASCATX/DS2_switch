@@ -1,7 +1,7 @@
 From 3d5b408944e484b602af0571bfdee750e8c56deb Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 21 Oct 2026 16:06:18 +0300
-Subject: [PATCH 1/3] DS2 Switch: NAK texture/memory latency 200,
+Subject: [PATCH 1/4] DS2 Switch: NAK texture/memory latency 200,
  peephole_select limit 8, bump compiler revision
 
 ---
@@ -71,7 +71,7 @@ index e63104958c0..6ba5a40f0c5 100644
 From 2f46fb83c1215077b093efda4251d032b423bc25 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 21 Oct 2026 17:10:52 +0300
-Subject: [PATCH 2/3] DS2: host (drm-shim) build of this tree needs <dlfcn.h>
+Subject: [PATCH 2/4] DS2: host (drm-shim) build of this tree needs <dlfcn.h>
  in vk_instance.c (not on Switch)
 
 ---
@@ -100,7 +100,7 @@ index 316302221ca..aafc4e4c5f1 100644
 From 7eae6df319738b6f8cf196078f26ad6571d6b255 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 21 Oct 2026 20:58:29 +0300
-Subject: [PATCH 3/3] DS2 Switch: bind set UBO descriptors from the CPU mapping
+Subject: [PATCH 3/4] DS2 Switch: bind set UBO descriptors from the CPU mapping
  on Maxwell (no indirect GPFIFO segments)
 
 NVK_SWITCH_CBUF_DESC_INDIRECT=1 restores the indirect path.
@@ -184,6 +184,84 @@ index 1e3e616ef20..37fbfb23d52 100644
  
     struct nvk_upload_queue upload;
  
+-- 
+2.43.0
+
+
+From c0eeb5a6fe21efa6180db33fad150496e4d111d6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 21 Oct 2026 23:49:46 +0300
+Subject: [PATCH 4/4] DS2 Switch: sparse binding/residency for buffers (images
+ stay off); NVK_SWITCH_SPARSE_BUFFER=0 disables
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LXFoLk8fEvKbvg3kaZBmo7
+---
+ src/nouveau/vulkan/nvk_physical_device.c | 26 ++++++++++++++++++------
+ 1 file changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
+index a9a7985778f..deed747fadd 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -349,9 +349,7 @@ static bool
+ nvk_sparse_binding_supported(const struct nv_device_info *info)
+ {
+ #ifdef __SWITCH__
+-   /* Switch has no ctx_bind implementation; disable sparse features until
+-    * vkQueueBindSparse can be supported.
+-    */
++   /* Images: no sparse residency on Switch yet. */
+    (void)info;
+    return false;
+ #else
+@@ -359,6 +357,22 @@ nvk_sparse_binding_supported(const struct nv_device_info *info)
+ #endif
+ }
+ 
++/* Sparse binding of buffers only.  On Switch the bind context is CPU-side
++ * (nvkmd_switch_ctx_bind maps BOs at fixed offsets of a reserved sparse VA
++ * range).  DS2: Xenia's 512 MB guest-memory mirror is otherwise allocated in
++ * full from the process heap.  NVK_SWITCH_SPARSE_BUFFER=0 turns it off.
++ */
++static bool
++nvk_sparse_buffer_supported(const struct nv_device_info *info)
++{
++#ifdef __SWITCH__
++   (void)info;
++   return debug_get_bool_option("NVK_SWITCH_SPARSE_BUFFER", true);
++#else
++   return nvk_sparse_binding_supported(info);
++#endif
++}
++
+ static void
+ nvk_get_device_features(const struct nv_device_info *info,
+                         const struct vk_device_extension_table *supported_extensions,
+@@ -413,12 +427,12 @@ nvk_get_device_features(const struct nv_device_info *info,
+       .shaderInt16 = true,
+       .shaderResourceResidency = info->cls_eng3d >= VOLTA_A,
+       .shaderResourceMinLod = info->cls_eng3d >= VOLTA_A,
+-      .sparseBinding = nvk_sparse_binding_supported(info),
++      .sparseBinding = nvk_sparse_buffer_supported(info),
+       .sparseResidency2Samples = nvk_sparse_binding_supported(info),
+       .sparseResidency4Samples = nvk_sparse_binding_supported(info),
+       .sparseResidency8Samples = nvk_sparse_binding_supported(info),
+       .sparseResidencyAliased = nvk_sparse_binding_supported(info),
+-      .sparseResidencyBuffer = nvk_sparse_binding_supported(info),
++      .sparseResidencyBuffer = nvk_sparse_buffer_supported(info),
+       .sparseResidencyImage2D = nvk_sparse_binding_supported(info),
+       .sparseResidencyImage3D = nvk_sparse_binding_supported(info),
+       .variableMultisampleRate = true,
+@@ -1712,7 +1726,7 @@ nvk_create_physical_device_from_nvkmd(struct nvk_instance *instance,
+    VkQueueFlags queue_flags = VK_QUEUE_GRAPHICS_BIT |
+                               VK_QUEUE_COMPUTE_BIT |
+                               VK_QUEUE_TRANSFER_BIT;
+-   if (nvk_sparse_binding_supported(&nvkmd->dev_info))
++   if (nvk_sparse_buffer_supported(&nvkmd->dev_info))
+       queue_flags |= VK_QUEUE_SPARSE_BINDING_BIT;
+ 
+    pdev->queue_families[pdev->queue_family_count++] = (struct nvk_queue_family) {
 -- 
 2.43.0
 

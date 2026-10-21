@@ -256,6 +256,17 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_alloca
     return false;
   }
   buffer_memory_.push_back(memory);
+  {
+    // How much of the 512 MB guest memory mirror the GPU really needed (Switch: no sparse before v35, the
+    // whole buffer was allocated from the process heap).
+    static uint64_t sparse_allocated_bytes = 0;
+    const uint64_t before = sparse_allocated_bytes;
+    sparse_allocated_bytes += memory_allocate_info.allocationSize;
+    if ((before >> 25) != (sparse_allocated_bytes >> 25)) {
+      REXGPU_INFO("Shared memory: {} MB of the {} MB sparse buffer allocated",
+                  sparse_allocated_bytes >> 20, kBufferSize >> 20);
+    }
+  }
 
   VkSparseMemoryBind bind;
   bind.resourceOffset = offset_allocations << host_gpu_memory_sparse_granularity_log2();

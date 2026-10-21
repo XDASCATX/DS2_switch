@@ -55,6 +55,7 @@ namespace rex::graphics {
 // because textures are streamed this way anyway.
 class TextureCache {
  public:
+  uint64_t GetTexturesTotalHostMemoryUsage() const { return textures_total_host_memory_usage_; }
   // Hard limit, originating from the half-pixel offset filling hack in the
   // resolve shaders only filling up to 3 pixels, due to the bit counts used for
   // passing the scale to shaders, and because the full 490 MB EDRAM buffer is

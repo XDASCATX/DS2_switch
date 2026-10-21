@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <map>
+#include <unordered_map>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -72,6 +74,17 @@ REXCVAR_DEFINE_BOOL(gpu_zone_timing_fine, false, "GPU/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(vulkan_max_frames_in_flight, 3, "GPU/Vulkan",
+                     "Guest frames the GPU may be behind the command processor (1-3). Fewer = less input latency "
+                     "when the GPU is the bottleneck; 2 keeps the GPU fed with one queued frame");
+
+REXCVAR_DEFINE_INT32(vulkan_memory_report_frames, 0, "GPU/Vulkan",
+                     "Every N frames log GPU memory in use (Vulkan heap usage), textures and render targets. 0 = off");
+
+REXCVAR_DEFINE_INT32(vulkan_barrier_stats, 0, "GPU/Vulkan",
+                     "Development: every N frames log where pipeline barriers come from (call sites) and their "
+                     "stage masks. 0 = off");
 
 REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                     "When async shader compilation is enabled, skip presenting frames that "
@@ -2985,6 +2998,48 @@ GpuZoneEnd(kGpuZoneSwap);
   EndSubmission(true);
 }
 
+namespace {
+// Development statistics for pipeline barriers (vulkan_barrier_stats).
+struct BarrierStats {
+  std::unordered_map<const void*, uint64_t> push_sites;
+  std::map<std::pair<uint32_t, uint32_t>, uint64_t> stage_pairs;
+  uint64_t groups = 0;
+  uint64_t image_barriers = 0;
+  uint64_t buffer_barriers = 0;
+  uint64_t frames = 0;
+};
+BarrierStats g_barrier_stats;
+// Reference point to turn the logged return addresses into offsets for addr2line / nm.
+__attribute__((noinline)) void RexBarrierStatsAnchor() { asm volatile(""); }
+
+void ReportBarrierStats(int interval) {
+  if (interval <= 0 || ++g_barrier_stats.frames < uint64_t(interval)) {
+    return;
+  }
+  const double frames = double(g_barrier_stats.frames);
+  REXGPU_INFO("barrier_stats: {:.1f} vkCmdPipelineBarrier/frame, {:.1f} buffer + {:.1f} image barriers/frame "
+              "(anchor {})",
+              g_barrier_stats.groups / frames, g_barrier_stats.buffer_barriers / frames,
+              g_barrier_stats.image_barriers / frames, (const void*)&RexBarrierStatsAnchor);
+  std::vector<std::pair<uint64_t, std::pair<uint32_t, uint32_t>>> pairs;
+  for (const auto& kv : g_barrier_stats.stage_pairs) pairs.emplace_back(kv.second, kv.first);
+  std::sort(pairs.rbegin(), pairs.rend());
+  for (size_t i = 0; i < pairs.size() && i < 12; ++i) {
+    REXGPU_INFO("barrier_stats:   stages {:08X} -> {:08X}: {:.1f}/frame", pairs[i].second.first,
+                pairs[i].second.second, pairs[i].first / frames);
+  }
+  std::vector<std::pair<uint64_t, const void*>> sites;
+  for (const auto& kv : g_barrier_stats.push_sites) sites.emplace_back(kv.second, kv.first);
+  std::sort(sites.rbegin(), sites.rend());
+  for (size_t i = 0; i < sites.size() && i < 25; ++i) {
+    REXGPU_INFO("barrier_stats:   push site {} (anchor{:+d}): {:.1f}/frame", sites[i].second,
+                (long long)((const char*)sites[i].second - (const char*)&RexBarrierStatsAnchor),
+                sites[i].first / frames);
+  }
+  g_barrier_stats = BarrierStats();
+}
+}  // namespace
+
 bool VulkanCommandProcessor::PushBufferMemoryBarrier(
     VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, VkPipelineStageFlags src_stage_mask,
     VkPipelineStageFlags dst_stage_mask, VkAccessFlags src_access_mask,
@@ -2993,6 +3048,9 @@ bool VulkanCommandProcessor::PushBufferMemoryBarrier(
   if (skip_if_equal && src_stage_mask == dst_stage_mask && src_access_mask == dst_access_mask &&
       src_queue_family_index == dst_queue_family_index) {
     return false;
+  }
+  if (REXCVAR_GET(vulkan_barrier_stats) > 0) {
+    ++g_barrier_stats.push_sites[__builtin_return_address(0)];
   }
 
   // Separate different barriers for overlapping buffer ranges into different
@@ -3044,6 +3102,9 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
   if (skip_if_equal && src_stage_mask == dst_stage_mask && src_access_mask == dst_access_mask &&
       old_layout == new_layout && src_queue_family_index == dst_queue_family_index) {
     return false;
+  }
+  if (REXCVAR_GET(vulkan_barrier_stats) > 0) {
+    ++g_barrier_stats.push_sites[__builtin_return_address(0)];
   }
 
   // Separate different barriers for overlapping image subresource ranges into
@@ -3124,6 +3185,16 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
   for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend(); ++it) {
     auto it_next = std::next(it);
     bool is_last = it_next == pending_barriers_.cend();
+    if (REXCVAR_GET(vulkan_barrier_stats) > 0) {
+      ++g_barrier_stats.groups;
+      ++g_barrier_stats.stage_pairs[{it->src_stage_mask, it->dst_stage_mask}];
+      g_barrier_stats.buffer_barriers += (is_last ? pending_barriers_buffer_memory_barriers_.size()
+                                                  : it_next->buffer_memory_barriers_offset) -
+                                         it->buffer_memory_barriers_offset;
+      g_barrier_stats.image_barriers += (is_last ? pending_barriers_image_memory_barriers_.size()
+                                                 : it_next->image_memory_barriers_offset) -
+                                        it->image_memory_barriers_offset;
+    }
     // .data() + offset, not &[offset], for buffer and image barriers, because
     // if there are no buffer or image memory barriers in the last pipeline
     // barriers, the offsets may be equal to the sizes of the vectors.
@@ -5348,8 +5419,17 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   // resources early) and specifically for frames (not to queue too many), and
   // await the availability of the current frame. Also check whether the device
   // is still available, and whether the await was successful.
-  uint64_t await_submission =
-      is_opening_frame ? closed_frame_submissions_[frame_current_ % kMaxFramesInFlight] : 0;
+  uint64_t await_submission = 0;
+  if (is_opening_frame) {
+    // DS2 port: wait for frame (current - N), N = vulkan_max_frames_in_flight; the ring keeps
+    // kMaxFramesInFlight entries (also used to reclaim per-frame resources).
+    const uint64_t frames_in_flight =
+        std::clamp<uint64_t>(uint64_t(std::max(REXCVAR_GET(vulkan_max_frames_in_flight), 1)), 1,
+                             kMaxFramesInFlight);
+    if (frame_current_ >= frames_in_flight) {
+      await_submission = closed_frame_submissions_[(frame_current_ - frames_in_flight) % kMaxFramesInFlight];
+    }
+  }
   CheckSubmissionFenceAndDeviceLoss(await_submission);
   if (device_lost_ || submission_completed_ < await_submission) {
     return false;
@@ -5698,13 +5778,39 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     }
     frame_open_ = false;
     // Submission already closed now, so minus 1.
+    ReportBarrierStats(REXCVAR_GET(vulkan_barrier_stats));
+    if (REXCVAR_GET(vulkan_memory_report_frames) > 0 &&
+        !(frame_current_ % uint64_t(REXCVAR_GET(vulkan_memory_report_frames)))) {
+      const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+      uint64_t heap_usage = 0;
+      const auto* const vulkan_instance = vulkan_device->vulkan_instance();
+      if (vulkan_device->extensions().ext_EXT_memory_budget &&
+          vulkan_instance->extensions().ext_1_1_KHR_get_physical_device_properties2) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget = {};
+        budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+        VkPhysicalDeviceMemoryProperties2 properties = {};
+        properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+        properties.pNext = &budget;
+        vulkan_instance->functions().vkGetPhysicalDeviceMemoryProperties2(vulkan_device->physical_device(),
+                                                                        &properties);
+        for (uint32_t i = 0; i < properties.memoryProperties.memoryHeapCount; ++i) {
+          heap_usage += budget.heapUsage[i];
+        }
+      }
+      REXGPU_INFO("GPU memory: {} MB in Vulkan heaps, textures {} MB, {} render targets", heap_usage >> 20,
+                  texture_cache_->GetTexturesTotalHostMemoryUsage() >> 20,
+                  render_target_cache_->GetRenderTargetCount());
+    }
     closed_frame_submissions_[(frame_current_++) % kMaxFramesInFlight] = GetCurrentSubmission() - 1;
 
     // DS2 port: a render target could not be created (out of memory): once the GPU is idle, release the
     // render targets that own no EDRAM data (their contents are no longer needed), like ClearCache does, at
     // most once every 30 frames. The failed one is created again on its next use.
-    if (!cache_clear_requested_ && render_target_cache_->TakeRenderTargetCreationFailure() &&
+    // v35: the failure flag is only consumed when the eviction really runs (v34 consumed it inside the
+    // 30-frame window, the failed render target then stayed cached as missing for the rest of the session).
+    if (!cache_clear_requested_ && render_target_cache_->HasRenderTargetCreationFailure() &&
         frame_current_ >= render_target_eviction_frame_ + 30 && AwaitAllQueueOperationsCompletion()) {
+      render_target_cache_->TakeRenderTargetCreationFailure();
       render_target_eviction_frame_ = frame_current_;
       const size_t render_targets_before = render_target_cache_->GetRenderTargetCount();
       render_target_cache_->ClearCache();

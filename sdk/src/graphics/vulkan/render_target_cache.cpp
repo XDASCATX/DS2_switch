@@ -61,6 +61,9 @@ REXCVAR_DEFINE_BOOL(render_target_transfer_elide_extended, false, "GPU/Vulkan",
                     "clipping enabled whose vertices are all inside the clip volume")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(rt_transfer_stats_reset, false, "GPU/Vulkan",
+                    "With rt_transfer_stats: start counting again after every printout (per interval, not per "
+                    "session)");
 REXCVAR_DEFINE_INT32(rt_transfer_stats, 0, "GPU/Vulkan",
                      "DEVELOPMENT: log a histogram of render target ownership transfers (destination <- source "
                      "key) every N render targets receiving transfers (0 = off)")
@@ -1273,6 +1276,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           REXGPU_INFO("resolve_stats after {} resolves, frame {}:", resolve_count, command_processor_.GetCurrentFrame());
           for (size_t i = 0; i < v.size() && i < 20; ++i) {
             REXGPU_INFO("  {:>7} resolves {:>11} px  {}", v[i].second.first, v[i].second.second, v[i].first);
+          }
+          if (REXCVAR_GET(rt_transfer_stats_reset)) {
+            resolve_stats.clear();
           }
         }
       }
@@ -5267,6 +5273,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                       elided_transfers_total_, elided_pixels_total_);
           for (size_t i = 0; i < v.size() && i < 25; ++i) {
             REXGPU_INFO("  {:>8} transfers {:>10} tiles  {}", v[i].second.first, v[i].second.second, v[i].first);
+          }
+          if (REXCVAR_GET(rt_transfer_stats_reset)) {
+            stats.clear();
           }
         }
       }

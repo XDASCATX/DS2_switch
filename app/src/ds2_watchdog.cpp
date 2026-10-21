@@ -29,6 +29,13 @@
 
 #include "ds2_switch_platform.h"
 
+REXCVAR_DEFINE_BOOL(ds2_switch_stack_sampling, false, "DS2",
+                    "Switch profiler: sample thread stacks into rex_perfil.log (same as logs/rex/perfil_pilas.flag)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+#if defined(__SWITCH__)
+extern "C" void RexSwitchPerfRequestStackSampling(bool enable);
+#endif
+
 REXCVAR_DEFINE_BOOL(ds2_watchdog, true, "DS2",
                     "Load/hang telemetry in the main log: snapshots of guest threads, open files and memory, "
                     "file open/close events and stall alarms")
@@ -75,6 +82,9 @@ REXCVAR_DEFINE_BOOL(ds2_switch_saltynx, false, "DS2",
 namespace ds2::watchdog {
 
 void ApplyPlatformSwitches() {
+#if defined(__SWITCH__)
+  RexSwitchPerfRequestStackSampling(REXCVAR_GET(ds2_switch_stack_sampling));
+#endif
   ds2::platform::SetSaltyNxBridge(REXCVAR_GET(ds2_switch_saltynx));
   REXLOG_INFO("[ds2] SaltyNX overlay bridge: {}", REXCVAR_GET(ds2_switch_saltynx) ? "on" : "off");
   {
