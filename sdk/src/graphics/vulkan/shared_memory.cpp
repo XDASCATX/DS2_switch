@@ -23,6 +23,12 @@
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
 
+REXCVAR_DEFINE_BOOL(vulkan_shared_memory_hoist_uploads, false, "GPU/Vulkan",
+                    "Copy guest memory pages that nothing in the current submission has used yet at the start "
+                    "of the submission, with one pair of barriers, instead of a barrier pair and a render pass "
+                    "break per upload")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -288,6 +294,73 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_alloca
 
 bool VulkanSharedMemory::UploadRanges(
     const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
+  return CopyRangesToUploadBuffer(upload_page_ranges, false);
+}
+
+uint64_t VulkanSharedMemory::UploadHoistEpoch() const {
+  const uint64_t submission = command_processor_.GetCurrentSubmission();
+  if (!REXCVAR_GET(vulkan_shared_memory_hoist_uploads)) {
+    hoist_enabled_since_submission_ = UINT64_MAX;
+    return 0;
+  }
+  // Switched on while playing: start with the next submission, so every page requested in a hoisting
+  // submission has been tracked from its beginning.
+  if (hoist_enabled_since_submission_ == UINT64_MAX) {
+    hoist_enabled_since_submission_ = submission + 1;
+  }
+  return submission >= hoist_enabled_since_submission_ ? submission : 0;
+}
+
+bool VulkanSharedMemory::UploadRangesHoisted(
+    const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
+  return CopyRangesToUploadBuffer(upload_page_ranges, true);
+}
+
+uint64_t VulkanSharedMemory::RecordHoistedUploads(VkCommandBuffer command_buffer) {
+  if (hoisted_copies_.empty()) {
+    return 0;
+  }
+  if (hoisted_copies_submission_ != command_processor_.GetCurrentSubmission()) {
+    // Should not happen: they are recorded and consumed within one submission.
+    hoisted_copies_.clear();
+    return 0;
+  }
+  const ui::vulkan::VulkanDevice::Functions& dfn = command_processor_.GetVulkanDevice()->functions();
+  // Earlier submissions may still read or write these pages.
+  VkMemoryBarrier barrier;
+  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.pNext = nullptr;
+  barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                           1, &barrier, 0, nullptr, 0, nullptr);
+  uint64_t bytes = 0;
+  size_t i = 0;
+  while (i < hoisted_copies_.size()) {
+    const VkBuffer source = hoisted_copies_[i].first;
+    upload_regions_.clear();
+    for (; i < hoisted_copies_.size() && hoisted_copies_[i].first == source; ++i) {
+      upload_regions_.push_back(hoisted_copies_[i].second);
+      bytes += hoisted_copies_[i].second.size;
+    }
+    dfn.vkCmdCopyBuffer(command_buffer, source, buffer_, uint32_t(upload_regions_.size()), upload_regions_.data());
+  }
+  upload_regions_.clear();
+  hoisted_copies_.clear();
+  VkPipelineStageFlags read_stages;
+  VkAccessFlags read_access;
+  GetUsageMasks(Usage::kGuestDrawReadWrite, read_stages, read_access);
+  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = read_access | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                          VK_ACCESS_TRANSFER_WRITE_BIT;
+  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           read_stages | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                           1, &barrier, 0, nullptr, 0, nullptr);
+  return bytes;
+}
+
+bool VulkanSharedMemory::CopyRangesToUploadBuffer(
+    const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges, bool hoisted) {
   if (upload_page_ranges.empty()) {
     return true;
   }
@@ -298,18 +371,27 @@ bool VulkanSharedMemory::UploadRanges(
       pages += range.second;
     }
     RexSwitchPerfAdd(15, pages << page_size_log2());
+    if (hoisted) {
+      RexSwitchPerfAdd(81, pages << page_size_log2());
+    }
   }
 #endif
-  // upload_page_ranges are sorted, use them to determine the range for the
-  // ordering barrier.
-  Use(Usage::kTransferDestination,
-      std::make_pair(upload_page_ranges.front().first << page_size_log2(),
-                     (upload_page_ranges.back().first + upload_page_ranges.back().second -
-                      upload_page_ranges.front().first)
-                         << page_size_log2()));
-  command_processor_.SubmitBarriers(true);
+  if (!hoisted) {
+    // upload_page_ranges are sorted, use them to determine the range for the
+    // ordering barrier.
+    Use(Usage::kTransferDestination,
+        std::make_pair(upload_page_ranges.front().first << page_size_log2(),
+                       (upload_page_ranges.back().first + upload_page_ranges.back().second -
+                        upload_page_ranges.front().first)
+                           << page_size_log2()));
+    command_processor_.SubmitBarriers(true);
+  }
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
+  if (hoisted && hoisted_copies_submission_ != submission_current) {
+    hoisted_copies_.clear();
+    hoisted_copies_submission_ = submission_current;
+  }
   bool successful = true;
   upload_regions_.clear();
   VkBuffer upload_buffer_previous = VK_NULL_HANDLE;
@@ -331,17 +413,22 @@ bool VulkanSharedMemory::UploadRanges(
       std::memcpy(upload_buffer_mapping,
                   memory().TranslatePhysical(upload_range_start << page_size_log2()),
                   upload_buffer_size);
-      if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
-        assert_true(upload_buffer_previous != VK_NULL_HANDLE);
-        command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
-                                       uint32_t(upload_regions_.size()), upload_regions_.data());
-        upload_regions_.clear();
-      }
-      upload_buffer_previous = upload_buffer;
-      VkBufferCopy& upload_region = upload_regions_.emplace_back();
+      VkBufferCopy upload_region;
       upload_region.srcOffset = upload_buffer_offset;
       upload_region.dstOffset = VkDeviceSize(upload_range_start << page_size_log2());
       upload_region.size = upload_buffer_size;
+      if (hoisted) {
+        hoisted_copies_.emplace_back(upload_buffer, upload_region);
+      } else {
+        if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
+          assert_true(upload_buffer_previous != VK_NULL_HANDLE);
+          command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
+                                         uint32_t(upload_regions_.size()), upload_regions_.data());
+          upload_regions_.clear();
+        }
+        upload_buffer_previous = upload_buffer;
+        upload_regions_.push_back(upload_region);
+      }
       uint32_t upload_buffer_pages = uint32_t(upload_buffer_size >> page_size_log2());
       upload_range_start += upload_buffer_pages;
       upload_range_length -= upload_buffer_pages;

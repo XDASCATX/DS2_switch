@@ -34,6 +34,8 @@ void SharedMemory::InitializeCommon() {
   num_system_page_flags_ = ((kBufferSize >> page_size_log2_) + 63) / 64;
   system_page_flags_valid_.assign(num_system_page_flags_, 0);
   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
+  submission_touched_pages_.assign(num_system_page_flags_, 0);
+  submission_touched_generation_.assign(num_system_page_flags_, 0);
 
   memory_invalidation_callback_handle_ =
       memory_.RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
@@ -263,6 +265,12 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   uint32_t page_first = start >> page_size_log2_;
   uint32_t page_last = end >> page_size_log2_;
 
+  // Upload hoisting: later uploads of these pages in this submission must stay in order.
+  if (const uint64_t hoist_epoch = UploadHoistEpoch()) {
+    UpdateTouchEpoch(hoist_epoch);
+    TouchPages(page_first, page_last - page_first + 1);
+  }
+
   // Trigger modification callbacks so, for instance, resolved data is loaded to
   // the texture.
   FireWatches(page_first, page_last, true);
@@ -461,11 +469,88 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count",
                     uint32_t(upload_ranges_.size()));
 
-  if (upload_ranges_.empty()) {
-    return true;
+  const uint64_t hoist_epoch = UploadHoistEpoch();
+  if (!hoist_epoch) {
+    if (upload_ranges_.empty()) {
+      return true;
+    }
+    return UploadRanges(upload_ranges_);
   }
+  UpdateTouchEpoch(hoist_epoch);
+  upload_ranges_hoisted_.clear();
+  upload_ranges_in_order_.clear();
+  for (const std::pair<uint32_t, uint32_t>& upload_range : upload_ranges_) {
+    (AnyPageTouched(upload_range.first, upload_range.second) ? upload_ranges_in_order_ : upload_ranges_hoisted_)
+        .push_back(upload_range);
+  }
+  // Everything requested now is used by what follows in this submission.
+  for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+    const uint32_t page_first = range.first >> page_size_log2_;
+    const uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
+    TouchPages(page_first, page_last - page_first + 1);
+  }
+  bool uploaded = true;
+  if (!upload_ranges_hoisted_.empty()) {
+    uploaded = UploadRangesHoisted(upload_ranges_hoisted_) && uploaded;
+  }
+  if (!upload_ranges_in_order_.empty()) {
+    uploaded = UploadRanges(upload_ranges_in_order_) && uploaded;
+  }
+  return uploaded;
+}
 
-  return UploadRanges(upload_ranges_);
+void SharedMemory::UpdateTouchEpoch(uint64_t epoch) {
+  if (epoch != touch_epoch_) {
+    touch_epoch_ = epoch;
+    if (++touch_generation_ == 0) {
+      std::fill(submission_touched_generation_.begin(), submission_touched_generation_.end(), 0);
+      touch_generation_ = 1;
+    }
+  }
+}
+
+bool SharedMemory::AnyPageTouched(uint32_t page_first, uint32_t page_count) {
+  if (!page_count) {
+    return false;
+  }
+  const uint32_t page_last = page_first + page_count - 1;
+  for (uint32_t block = page_first >> 6; block <= (page_last >> 6); ++block) {
+    if (submission_touched_generation_[block] != touch_generation_) {
+      continue;
+    }
+    uint64_t mask = ~uint64_t(0);
+    if (block == (page_first >> 6)) {
+      mask &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (block == (page_last >> 6) && (page_last & 63) != 63) {
+      mask &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    if (submission_touched_pages_[block] & mask) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void SharedMemory::TouchPages(uint32_t page_first, uint32_t page_count) {
+  if (!page_count) {
+    return;
+  }
+  const uint32_t page_last = page_first + page_count - 1;
+  for (uint32_t block = page_first >> 6; block <= (page_last >> 6); ++block) {
+    if (submission_touched_generation_[block] != touch_generation_) {
+      submission_touched_generation_[block] = touch_generation_;
+      submission_touched_pages_[block] = 0;
+    }
+    uint64_t mask = ~uint64_t(0);
+    if (block == (page_first >> 6)) {
+      mask &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (block == (page_last >> 6) && (page_last & 63) != 63) {
+      mask &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    submission_touched_pages_[block] |= mask;
+  }
 }
 
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {

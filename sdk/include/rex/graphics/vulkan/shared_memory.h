@@ -54,6 +54,15 @@ class VulkanSharedMemory : public SharedMemory {
                                         uint32_t length_allocations) override;
 
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
+  uint64_t UploadHoistEpoch() const override;
+  bool UploadRangesHoisted(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
+
+ public:
+  // DS2 port: records the hoisted uploads of the submission (with their two barriers) into the command buffer,
+  // before the submission's deferred commands. Returns the number of bytes copied.
+  uint64_t RecordHoistedUploads(VkCommandBuffer command_buffer);
+
+ protected:
 
  private:
   void GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,
@@ -72,6 +81,13 @@ class VulkanSharedMemory : public SharedMemory {
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
   std::vector<VkBufferCopy> upload_regions_;
+  // Hoisted uploads of the current submission: copies grouped by source buffer, in order.
+  std::vector<std::pair<VkBuffer, VkBufferCopy>> hoisted_copies_;
+  uint64_t hoisted_copies_submission_ = 0;
+  mutable uint64_t hoist_enabled_since_submission_ = UINT64_MAX;
+
+  bool CopyRangesToUploadBuffer(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges,
+                                bool hoisted);
 };
 
 }  // namespace rex::graphics::vulkan

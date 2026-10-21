@@ -15,6 +15,7 @@
 #include <cstring>
 #include <iterator>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <mutex>
 #include <string>
@@ -74,6 +75,11 @@ REXCVAR_DEFINE_BOOL(gpu_zone_timing_fine, false, "GPU/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(readback_resolve_max_bytes, 0, "GPU/Vulkan",
+                     "With readback_resolve: only copy resolves of at most this many bytes back to guest memory "
+                     "(0 = all). Small render-to-texture results (exposure/luminance chains) are what games read "
+                     "on the CPU; large ones only cost copies and memory");
 
 REXCVAR_DEFINE_INT32(vulkan_max_frames_in_flight, 3, "GPU/Vulkan",
                      "Guest frames the GPU may be behind the command processor (1-3). Fewer = less input latency "
@@ -4605,6 +4611,18 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     return true;
   }
+  if (const int32_t max_bytes = REXCVAR_GET(readback_resolve_max_bytes);
+      max_bytes > 0 && written_length > uint32_t(max_bytes)) {
+    return true;
+  }
+  {
+    // DS2 port: which resolves are read back (once per address and size).
+    static std::set<uint64_t> logged;
+    if (logged.size() < 64 && logged.insert(MakeReadbackResolveKey(written_address, written_length)).second) {
+      REXGPU_INFO("Resolve readback: {} bytes at 0x{:08X} copied back to guest memory", written_length,
+                  written_address);
+    }
+  }
 
   auto ensure_readback_slot = [&](ReadbackBuffer& readback, uint32_t index, uint32_t size) -> bool {
     if (readback.buffers[index] != VK_NULL_HANDLE && size <= readback.sizes[index] &&
@@ -5710,6 +5728,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       REXGPU_ERROR("Failed to begin a Vulkan command buffer");
       return false;
     }
+    // DS2 port: uploads hoisted to the beginning of the submission (vulkan_shared_memory_hoist_uploads).
+    shared_memory_->RecordHoistedUploads(command_buffer.buffer);
     deferred_command_buffer_.Execute(command_buffer.buffer);
     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
       REXGPU_ERROR("Failed to end a Vulkan command buffer");

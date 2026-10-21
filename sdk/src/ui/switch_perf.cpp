@@ -110,7 +110,7 @@ constexpr u64 kReportSeconds = 10;
 constexpr u64 kStartDelayNs = 8000000000ULL;
 constexpr size_t kMaxSamples = 1 << 15;
 constexpr size_t kFrames = 10;
-constexpr unsigned kCounterCount = 81;  // DS2: 76/77 direct resolves / fallbacks, 78-80 memexport
+constexpr unsigned kCounterCount = 82;  // DS2: 76/77 direct resolves / fallbacks, 78-80 memexport, 81 hoisted uploads
 // In <NRO folder>/logs/rex/ (switch_crash_hooks.c computes it at startup).
 std::string ReportPath() {
   return std::string(RexSwitchLogDir()) + "rex_perfil.log";
@@ -587,11 +587,11 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
                  "     por fotograma: %.0f dibujados | tijera %.1f pantallas | %.1f envios | "
                  "%.1f resolves (%.2f pantallas) | transferencias: %.1f llamadas, %.1f render "
                  "targets, %.1f dibujados | %.1f texturas cargadas | %.2f MB de memoria "
-                 "compartida subida | pipelines creados en el intervalo: %.0f\n",
+                 "compartida subida (%.2f MB al principio del envio) | pipelines creados en el intervalo: %.0f\n",
                  delta(5) / frames, delta(6) / frames / 921600.0, delta(7) / frames,
                  delta(9) / frames, delta(10) / frames / 921600.0, delta(11) / frames,
                  delta(12) / frames, delta(13) / frames, delta(14) / frames,
-                 delta(15) / frames / 1048576.0, delta(16));
+                 delta(15) / frames / 1048576.0, delta(81) / frames / 1048576.0, delta(16));
     // DS2 port: render target transfers in detail (render_target_cache.cpp, counters 33-41).
     std::fprintf(f,
                  "     transferencias detalle: RT destino profundidad %.1f, color %.1f (MSAA %.1f) | "
