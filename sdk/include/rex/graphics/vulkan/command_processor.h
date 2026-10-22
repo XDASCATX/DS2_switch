@@ -800,8 +800,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool resolve_dump_active_ = false;
   uint32_t resolve_dump_count_ = 0;
   uint64_t resolve_dump_last_ms_ = 0;
+  uint64_t resolve_dump_first_ms_ = 0;
   uint32_t resolve_dump_draws_ = 0;
   std::vector<ResolveDumpEntry> resolve_dump_entries_;
+  std::vector<std::string> resolve_dump_draw_log_;
   VkBuffer resolve_dump_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory resolve_dump_memory_ = VK_NULL_HANDLE;
   void* resolve_dump_mapping_ = nullptr;

@@ -94,6 +94,8 @@ REXCVAR_DEFINE_STRING(resolve_dump_dir, "", "GPU/Vulkan",
                       "DIAGNOSTIC: folder (relative to the executable) where every resolve of one frame is written "
                       "as raw guest memory, with index.txt. Empty = off");
 REXCVAR_DEFINE_INT32(resolve_dump_every_s, 30, "GPU/Vulkan", "DIAGNOSTIC: seconds between resolve dumps");
+REXCVAR_DEFINE_INT32(resolve_dump_start_s, 0, "GPU/Vulkan",
+                     "DIAGNOSTIC: no resolve dump before this many seconds after the first frame");
 REXCVAR_DEFINE_INT32(resolve_dump_max, 10, "GPU/Vulkan", "DIAGNOSTIC: maximum number of resolve dumps");
 REXCVAR_DEFINE_INT32(resolve_dump_max_mb, 96, "GPU/Vulkan", "DIAGNOSTIC: host buffer for one resolve dump, MB");
 
@@ -4194,6 +4196,44 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // Synchronize the memory pages backing memory scatter export streams, and
   // calculate the range that includes the streams for the buffer barrier.
   uint32_t memexport_extent_start = UINT32_MAX, memexport_extent_end = 0;
+  if (resolve_dump_active_ && resolve_dump_draw_log_.size() < 4096) {
+    // DS2 port diagnostic: every draw of the dump frame with its state, textures and pixel shader constants.
+    char line[2048];
+    int n = std::snprintf(
+        line, sizeof(line),
+        "d%u prim=%u count=%u vs=%016llX ps=%016llX surf=%08X c0=%08X c1=%08X c2=%08X c3=%08X depth=%08X "
+        "mask=%08X blend0=%08X colorctl=%08X depthctl=%08X mode=%08X scissor=%08X/%08X",
+        resolve_dump_draws_, uint32_t(prim_type), index_count,
+        (unsigned long long)vertex_shader->ucode_data_hash(),
+        (unsigned long long)(pixel_shader ? pixel_shader->ucode_data_hash() : 0),
+        regs.values[XE_GPU_REG_RB_SURFACE_INFO], regs.values[XE_GPU_REG_RB_COLOR_INFO],
+        regs.values[XE_GPU_REG_RB_COLOR1_INFO], regs.values[XE_GPU_REG_RB_COLOR2_INFO],
+        regs.values[XE_GPU_REG_RB_COLOR3_INFO], regs.values[XE_GPU_REG_RB_DEPTH_INFO],
+        regs.values[XE_GPU_REG_RB_COLOR_MASK], regs.values[XE_GPU_REG_RB_BLENDCONTROL0],
+        regs.values[XE_GPU_REG_RB_COLORCONTROL], regs.values[XE_GPU_REG_RB_DEPTHCONTROL],
+        regs.values[XE_GPU_REG_RB_MODECONTROL], regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
+        regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR]);
+    if (pixel_shader && n > 0) {
+      for (const auto& binding : pixel_shader->texture_bindings()) {
+        if (n >= int(sizeof(line)) - 96) break;
+        const uint32_t* f = &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 6];
+        n += std::snprintf(line + n, sizeof(line) - n, " t%u=%08X,%08X,%08X,%08X", binding.fetch_constant, f[0],
+                           f[1], f[2], f[3]);
+      }
+      const auto& map = pixel_shader->constant_register_map();
+      uint32_t shown = 0;
+      for (uint32_t i = 0; i < 256 && shown < 12; ++i) {
+        if (!(map.float_bitmap[i >> 6] & (uint64_t(1) << (i & 63)))) continue;
+        if (n >= int(sizeof(line)) - 96) break;
+        const uint32_t base = XE_GPU_REG_SHADER_CONSTANT_256_X + i * 4;
+        float v[4];
+        std::memcpy(v, &regs.values[base], sizeof(v));
+        n += std::snprintf(line + n, sizeof(line) - n, " c%u=(%g,%g,%g,%g)", i, v[0], v[1], v[2], v[3]);
+        ++shown;
+      }
+    }
+    resolve_dump_draw_log_.emplace_back(line);
+  }
   if (memexport_writes_possible) {
     // DS2 port diagnostic: which draws export to memory (once per shader pair and range).
     static std::set<uint64_t> logged_memexport;
@@ -4981,6 +5021,13 @@ void VulkanCommandProcessor::DumpResolve(uint32_t written_address, uint32_t writ
   e.depth_info = regs.values[XE_GPU_REG_RB_DEPTH_INFO];
   e.draws_before = resolve_dump_draws_;
   resolve_dump_entries_.push_back(e);
+  {
+    char line[160];
+    std::snprintf(line, sizeof(line), "RESOLVE r%03zu addr=%08X len=%u dest_info=%08X after_draw=%u",
+                  resolve_dump_entries_.size() - 1, written_address, written_length, e.copy_dest_info,
+                  resolve_dump_draws_);
+    resolve_dump_draw_log_.emplace_back(line);
+  }
   resolve_dump_used_ = offset + written_length;
 
   shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
@@ -5058,6 +5105,12 @@ void VulkanCommandProcessor::FinishResolveDump() {
         std::fprintf(index, "\n");
         std::fclose(index);
       }
+      if (FILE* dl = std::fopen((out / "draws.txt").string().c_str(), "w")) {
+        for (const std::string& l : resolve_dump_draw_log_) {
+          std::fprintf(dl, "%s\n", l.c_str());
+        }
+        std::fclose(dl);
+      }
       REXGPU_INFO("resolve dump {}: {} resolves, {} draws, {:.1f} MB -> {} in {} ms", resolve_dump_count_,
                   resolve_dump_entries_.size(), resolve_dump_draws_, written / 1048576.0, out.string(),
                   std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
@@ -5065,6 +5118,7 @@ void VulkanCommandProcessor::FinishResolveDump() {
       ++resolve_dump_count_;
     }
     resolve_dump_entries_.clear();
+    resolve_dump_draw_log_.clear();
     resolve_dump_used_ = 0;
     resolve_dump_last_ms_ = now_ms;
   }
@@ -5074,8 +5128,13 @@ void VulkanCommandProcessor::FinishResolveDump() {
   }
   const uint64_t every_ms = uint64_t(std::max(1, REXCVAR_GET(resolve_dump_every_s))) * 1000;
   if (!resolve_dump_last_ms_) {
-    // First dump one interval after the first frame.
+    // First dump one interval after the first frame (or after resolve_dump_start_s).
+    resolve_dump_first_ms_ = now_ms;
     resolve_dump_last_ms_ = now_ms;
+    return;
+  }
+  if (now_ms - resolve_dump_first_ms_ < uint64_t(std::max(0, REXCVAR_GET(resolve_dump_start_s))) * 1000) {
+    resolve_dump_last_ms_ = now_ms - every_ms;
     return;
   }
   if (now_ms - resolve_dump_last_ms_ >= every_ms) {
