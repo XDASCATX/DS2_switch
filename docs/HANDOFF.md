@@ -55,7 +55,8 @@ tools/build/build-pc.sh                 # ПК: ds2 + librexgpu-xenos.so
 tools/run/run-pc.sh <tag> <сек> $(cat tools/run/pc-args-example.txt)   # ПК-прогон, логи out/run/logs
 tools/build/package-release.sh <NN>     # releases/vNN + части по 14 МБ для Mac
 ```
-На Mac: `SW1_ds2/switch/vNN/` (`cat part_* > ds2.nro`, сверить sha256). На консоли: `sdmc:/switch/ds2/ds2.nro` +
+Копия репозитория у владельца: `SW1_ds2/DS2_switch` (git, ветка `diag/switch-level-load`, origin —
+github.com/XDASCATX/DS2_switch); после каждой версии обновляется (`git pull`). Сборки на Mac: `SW1_ds2/switch/vNN/` (`cat part_* > ds2.nro`, сверить sha256). На консоли: `sdmc:/switch/ds2/ds2.nro` +
 `ds2.toml`. Логи с консоли — `SW1_ds2/ds2_logs/diag_tomlNN` (ds2_*.log, rex/rex_perfil.log).
 Символизация стеков: `aarch64-none-elf-addr2line -e out/app-switch/releases/vNN/ds2.elf <offset>`.
 Все параметры (cvar) — `docs/handoff/17a-cvars-list.md`; меню L+R+→ — `17-switch-settings-menu.md`.
