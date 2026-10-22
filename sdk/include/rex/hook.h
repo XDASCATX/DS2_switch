@@ -69,16 +69,32 @@
   }
 
 // Export: hook + register in global registry for kernel ordinal lookup.
-#define REX_EXPORT(name, function) \
-  REX_HOOK(name, function)         \
+// DS2 port: every export counts its calls (rex::ppc::ExportCallCounter).
+#define REX_EXPORT(name, function)                                 \
+  static rex::ppc::ExportCallCounter _ppc_cnt_##name(#name);       \
+  extern "C" REX_FUNC(name) {                                      \
+    _ppc_cnt_##name.calls.fetch_add(1, std::memory_order_relaxed); \
+    rex::ppc::HostToGuestFunction<function>(ctx, base);            \
+  }                                                                \
   static rex::ppc::detail::PPCFuncRegistrar _ppc_reg_##name(#name, &name);
 
-#define REX_EXPORT_STUB(name) \
-  REX_STUB(name)              \
+#define REX_EXPORT_STUB(name)                                      \
+  static rex::ppc::ExportCallCounter _ppc_cnt_##name(#name);       \
+  extern "C" REX_FUNC(name) {                                      \
+    (void)base;                                                    \
+    _ppc_cnt_##name.calls.fetch_add(1, std::memory_order_relaxed); \
+    REXKRNL_WARN("{} STUB", #name);                                \
+  }                                                                \
   static rex::ppc::detail::PPCFuncRegistrar _ppc_reg_##name(#name, &name);
 
-#define REX_EXPORT_STUB_RETURN(name, retval) \
-  REX_STUB_RETURN(name, retval)              \
+#define REX_EXPORT_STUB_RETURN(name, retval)                                         \
+  static rex::ppc::ExportCallCounter _ppc_cnt_##name(#name);                         \
+  extern "C" REX_FUNC(name) {                                                        \
+    (void)base;                                                                      \
+    _ppc_cnt_##name.calls.fetch_add(1, std::memory_order_relaxed);                   \
+    REXKRNL_WARN("{} STUB - returning {:#x}", #name, static_cast<uint32_t>(retval)); \
+    ctx.r3.u64 = (retval);                                                           \
+  }                                                                                  \
   static rex::ppc::detail::PPCFuncRegistrar _ppc_reg_##name(#name, &name);
 
 namespace rex {

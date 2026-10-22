@@ -17,6 +17,7 @@
 #include <atomic>
 #include <concepts>
 #include <cstdint>
+#include <atomic>
 #include <cstring>
 #include <tuple>
 #include <type_traits>
@@ -48,6 +49,22 @@ inline PPCFunc* FindPPCFuncByName(const char* name) {
       return f;
   }
   return nullptr;
+}
+
+// DS2 port diagnostic: call count of every kernel/XAM export (REX_EXPORT*), read by the app's watchdog.
+struct ExportCallCounter {
+  const char* name;
+  std::atomic<uint64_t> calls{0};
+  uint64_t reported = 0;
+  ExportCallCounter* next;
+  explicit ExportCallCounter(const char* n);
+};
+inline ExportCallCounter*& ExportCallCounterHead() {
+  static ExportCallCounter* head = nullptr;
+  return head;
+}
+inline ExportCallCounter::ExportCallCounter(const char* n) : name(n), next(ExportCallCounterHead()) {
+  ExportCallCounterHead() = this;
 }
 
 namespace detail {

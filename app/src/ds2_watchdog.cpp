@@ -8,13 +8,16 @@
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/logging.h>
 #include <rex/filesystem.h>
+#include <rex/ppc/function.h>
 #include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xfile.h>
 #include <rex/system/xthread.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -40,6 +43,9 @@ REXCVAR_DEFINE_BOOL(ds2_watchdog, true, "DS2",
                     "Load/hang telemetry in the main log: snapshots of guest threads, open files and memory, "
                     "file open/close events and stall alarms")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(ds2_export_stats, false, "DS2",
+                    "DIAGNOSTIC: every heartbeat, log how many times each kernel/XAM export was called since the "
+                    "previous one");
 REXCVAR_DEFINE_INT32(ds2_watchdog_snapshot_s, 10, "DS2", "Seconds between [ds2 wd] snapshots (0 = only on stalls)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(ds2_watchdog_heartbeat_s, 2, "DS2",
@@ -187,6 +193,23 @@ void LogHeartbeat(int seconds, size_t threads, size_t files) {
       seconds, vblank, vs, ps, paused ? " cp_paused" : "", threads, files, size_t(mi.uordblks) >> 20, k.blocks,
       k.sysres_used >> 10, k.sysres_total >> 10, k.coalesced, k.coalesce_failures) + probe;
   REXLOG_INFO("{}", line);
+  // Kernel/XAM exports called since the previous heartbeat (all calls, sorted by count).
+  if (REXCVAR_GET(ds2_export_stats)) {
+    std::vector<std::pair<uint64_t, const char*>> called;
+    for (auto* c = rex::ppc::ExportCallCounterHead(); c; c = c->next) {
+      const uint64_t now_calls = c->calls.load(std::memory_order_relaxed);
+      if (now_calls != c->reported) {
+        called.emplace_back(now_calls - c->reported, c->name);
+        c->reported = now_calls;
+      }
+    }
+    std::sort(called.begin(), called.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string list;
+    for (const auto& [n, name] : called) {
+      list += fmt::format(" {}={}", name, n);
+    }
+    REXLOG_INFO("[ds2 wd] t={}s exports:{}", seconds, list);
+  }
   // A fast rise in memory blocks is what preceded every 2001-0103 so far: record what kind of blocks they are.
   if (k.valid && (g_histogram.empty() || k.blocks > g_histogram_blocks + 500 || k.blocks + 500 < g_histogram_blocks)) {
     g_histogram = ds2::platform::KernelBlockHistogram(8);
