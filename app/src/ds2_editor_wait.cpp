@@ -123,3 +123,46 @@ REX_HOOK_RAW(sub_8243EF40) {
   g_last_ef40 = now;
   REXLOG_INFO("[editor] sub_8243EF40({:08X}) = {} (desde {:08X})", self, ctx.r3.u32, caller);
 }
+
+// Event-script function call (sub_825EC618): r3 = result (value at +0, type at +4), r5 = call object whose
+// vtable[1] returns the function id. ds2_editor_wait_log: every 2 s one line with every id evaluated in that
+// window, how often and its last result - which script function keeps the editor from opening.
+extern "C" void __imp__sub_825EC618(PPCContext& __restrict ctx, uint8_t* base);
+#include <map>
+#include <string>
+namespace {
+struct ScriptCall {
+  uint32_t n = 0, value = 0, type = 0, caller = 0;
+};
+std::map<uint32_t, ScriptCall> g_script;
+Clock::time_point g_last_script{};
+}  // namespace
+REX_HOOK_RAW(sub_825EC618) {
+  if (!REXCVAR_GET(ds2_editor_wait_log)) {
+    __imp__sub_825EC618(ctx, base);
+    return;
+  }
+  const uint32_t out = ctx.r3.u32, call = ctx.r5.u32, caller = uint32_t(ctx.lr);
+  uint32_t id = 0;
+  if (const uint32_t vt = Ld(base, call)) {
+    if (PPCFunc* getter = rex::runtime::ResolveIndirectFunction(Ld(base, vt + 4))) {
+      PPCContext probe = ctx;
+      probe.r3.u64 = call;
+      getter(probe, base);
+      id = probe.r3.u32;
+    }
+  }
+  __imp__sub_825EC618(ctx, base);
+  ScriptCall& s = g_script[id];
+  ++s.n;
+  s.value = Ld(base, out);
+  s.type = Ld(base, out + 4);
+  s.caller = caller;
+  const auto now = Clock::now();
+  if (now - g_last_script < std::chrono::seconds(2)) return;
+  g_last_script = now;
+  std::string line;
+  for (const auto& [k, v] : g_script) line += fmt::format(" {}:{}x={:X}/t{}", k, v.n, v.value, v.type);
+  REXLOG_INFO("[editor] guion (id:llamadas=valor/tipo):{}", line);
+  g_script.clear();
+}
