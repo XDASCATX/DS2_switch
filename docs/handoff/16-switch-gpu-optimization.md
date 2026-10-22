@@ -488,3 +488,18 @@ NVK на Switch берёт память GPU через `memalign` из кучи 
 v48: `render_target_max_height` (1024 в toml) — RT не выше 1024 пикселей (на ПК: 1280x1024, 4xMSAA x1024);
 бюджетное освобождение выключено (`vulkan_render_target_budget_mb = 0`), остаётся освобождение по отказу.
 Риск: draw ниже 1024 пикселей пропадут (у DS2 максимум — каскады теней 1024²). Релиз: nro 9fd38eb6…, toml 1eef9c24….
+
+## v48 на консоли (diag_toml48) и v49
+
+v48: оранжевого экрана нет. Маджула → Лес павших гигантов; на 4-м пехотинце вылет: Atmosphère 2345-0101,
+`InvalidFunctionTrap` ← `sub_82C89558` (главный поток), в логе `Call to invalid or unregistered function at guest
+address 0x82CB81C0`. Адрес — в «дыре» между `sub_82CB8198` (кончается 0x82CB81BC) и `sub_82CB81F0`: код, который
+codegen не нашёл (нет прямых вызовов и абсолютных ссылок). `tools/huecos.py`: 44 291 дыра, почти все — выравнивание;
+663 содержат ≥ 2 настоящих инструкций с blr/bctr/b. Все объявлены в `config/ds2_overrides.gaps.toml` (включён в
+`app/ds2_manifest.diag-dataonly.toml`), codegen заново (273 с, функций 84 186), полная пересборка (~1 ч 40 мин).
+Профиль v48 (Маджула/лес): 11–14 кадр/с, GPU 66–87 мс/кадр: переносы EDRAM 23–29 (~12 полноэкранных: D0x1←D0x4
+800², C0x1/C3x1←D0x4, C0x1←C0x4, D1x1←D1x4 1280×720 и 640×360), resolve ~11 (25 × 0,44), загрузка текстур ~6,5
+(31/кадр), остальное — draw игры. «RAM» в Status Monitor — загрузка шины памяти (EMC).
+v49: + `render_target_transfer_skip_kinds` (биты: 1 глубина 4x→1x, 2 глубина 1x→4x, 4 цвет из глубины, 8 цвет 4x→1x,
+16 глубина из цвета) — тесты `ds2.toml.v49_1_color_from_depth` (4), `_2_depth_msaa_down` (1), `_3_color_msaa_down`
+(8); `ds2_switch_saltynx = true` (FPS в Status Monitor). Релиз: nro 374280a5…, toml 40933c07….

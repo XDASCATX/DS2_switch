@@ -12,4 +12,4 @@ game_root = "../assets/game_root"
 [entrypoint]
 file_path = "../assets/game_root/Default.xex"
 out_directory_path = "generated/diag-dataonly"
-includes = ["../config/ds2_overrides.proposed.toml", "../config/ds2_overrides.diag.toml", "../config/ds2_overrides.dataonly.toml", "../config/ds2_overrides.codeptr.toml"]
+includes = ["../config/ds2_overrides.proposed.toml", "../config/ds2_overrides.diag.toml", "../config/ds2_overrides.dataonly.toml", "../config/ds2_overrides.codeptr.toml", "../config/ds2_overrides.gaps.toml"]

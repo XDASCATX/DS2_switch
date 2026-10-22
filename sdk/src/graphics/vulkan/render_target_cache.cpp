@@ -43,6 +43,13 @@
 #include <string>
 #include <rex/ui/vulkan/util.h>
 
+REXCVAR_DEFINE_INT32(render_target_transfer_skip_kinds, 0, "GPU/Vulkan",
+                     "DS2 port (v49), finer than render_target_transfer_skip - leave out ownership transfer draws of "
+                     "these kinds (bitmask): 1 = depth 4x->1x same format, 2 = depth 1x->4x same format, 4 = color "
+                     "from depth, 8 = color 4x->1x same format, 16 = depth from color. Correct only if the game "
+                     "overwrites the reused EDRAM range")
+    .range(0, 31)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(render_target_transfer_skip, 0, "GPU/Vulkan",
                      "Leave out render target ownership transfer draws (bitmask): 1 = stencil-bit passes, "
                      "2 = depth/stencil transfers, 4 = color transfers. Faster on GPUs without stencil export; "
@@ -5747,6 +5754,24 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             bool transfer_draw = !(transfer_is_stencil_bit && (transfer_skip & 1)) &&
                                  !(dest_rt_key.is_depth && (transfer_skip & 2)) &&
                                  !(!dest_rt_key.is_depth && (transfer_skip & 4));
+            if (const uint32_t kinds = uint32_t(REXCVAR_GET(render_target_transfer_skip_kinds))) {
+              const RenderTargetKey src_key = source_vulkan_rt.key();
+              const bool same_format = src_key.is_depth == dest_rt_key.is_depth &&
+                                       src_key.resource_format == dest_rt_key.resource_format;
+              uint32_t kind = 0;
+              if (dest_rt_key.is_depth && src_key.is_depth && same_format) {
+                kind = src_key.msaa_samples > dest_rt_key.msaa_samples   ? 1
+                       : src_key.msaa_samples < dest_rt_key.msaa_samples ? 2
+                                                                           : 0;
+              } else if (!dest_rt_key.is_depth && src_key.is_depth) {
+                kind = 4;
+              } else if (!dest_rt_key.is_depth && same_format && src_key.msaa_samples > dest_rt_key.msaa_samples) {
+                kind = 8;
+              } else if (dest_rt_key.is_depth && !src_key.is_depth) {
+                kind = 16;
+              }
+              if (kind & kinds) transfer_draw = false;
+            }
 #if REX_PLATFORM_SWITCH
             // Finer A/B lap modes (switch_perf.cpp): 64 stencil-bit passes (8 per depth transfer without
             // VK_EXT_shader_stencil_export, which NVK lacks), 128 depth/stencil transfers, 256 color.
