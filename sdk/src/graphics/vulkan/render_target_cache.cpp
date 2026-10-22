@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <optional>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -4838,7 +4839,6 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     const uint64_t* render_target_resolve_clear_values,
     const Transfer::Rectangle* resolve_clear_rectangle) {
   assert_true(GetPath() == Path::kHostRenderTargets);
-  GpuZoneScope gpu_zone(command_processor_, VulkanCommandProcessor::kGpuZoneTransfers);
 
   // DS2 port: leave out the transfers into areas this draw overwrites anyway (see DrawOverwrite).
   if (render_target_transfers && draw_overwrite_.valid) {
@@ -4905,6 +4905,18 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
 
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
+  // DS2 port: time the zone only when there is work. This is called before almost every draw; a timestamp
+  // around an empty call is a full GPU drain on NVK (~1900 per frame in DS2 with gpu_zone_timing).
+  bool zone_has_work = resolve_clear_needed;
+  if (render_target_transfers) {
+    for (uint32_t i = 0; i < render_target_count && !zone_has_work; ++i) {
+      zone_has_work = !render_target_transfers[i].empty();
+    }
+  }
+  std::optional<GpuZoneScope> gpu_zone;
+  if (zone_has_work) {
+    gpu_zone.emplace(command_processor_, VulkanCommandProcessor::kGpuZoneTransfers);
+  }
   VkClearRect resolve_clear_rect;
   if (resolve_clear_needed) {
     // Assuming the rectangle is already clamped by the setup function from the
