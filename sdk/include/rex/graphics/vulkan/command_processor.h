@@ -788,6 +788,26 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
 
+  // DS2 port diagnostic (resolve_dump_dir): every resolve of one frame copied to a host buffer and written to
+  // files at the Swap, to see which pass of a frame turns black.
+  struct ResolveDumpEntry {
+    uint32_t address, length, offset;
+    uint32_t copy_dest_base, copy_dest_info, copy_dest_pitch, copy_control, surface_info;
+    uint32_t color_info0, depth_info, draws_before;
+  };
+  void DumpResolve(uint32_t written_address, uint32_t written_length);
+  void FinishResolveDump();
+  bool resolve_dump_active_ = false;
+  uint32_t resolve_dump_count_ = 0;
+  uint64_t resolve_dump_last_ms_ = 0;
+  uint32_t resolve_dump_draws_ = 0;
+  std::vector<ResolveDumpEntry> resolve_dump_entries_;
+  VkBuffer resolve_dump_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory resolve_dump_memory_ = VK_NULL_HANDLE;
+  void* resolve_dump_mapping_ = nullptr;
+  uint32_t resolve_dump_size_ = 0;
+  uint32_t resolve_dump_used_ = 0;
+
   // The current dynamic state of the graphics pipeline bind point. Note that
   // binding any pipeline to the bind point with static state (even if it's
   // unused, like depth bias being disabled, but the values themselves still not
