@@ -34,6 +34,11 @@ constexpr float kPack2101010_Max10 = std::bit_cast<float>(0x404001FFu);
 constexpr float kPack2101010_Min2 = std::bit_cast<float>(0x40400000u);
 constexpr float kPack2101010_Max2 = std::bit_cast<float>(0x40400003u);
 
+// FPCR flush-mode switches done by the guest code (racy count, diagnostic) and the fixed-FTZ switch, defined in
+// sdk/src/core/mutex.cpp.
+extern "C" uint64_t rex_fpcr_switches;
+extern "C" bool rex_fpcr_ftz_fixed;
+
 namespace rex::ppc {
 
 //=============================================================================
@@ -189,6 +194,7 @@ struct FPSCRRegister {
 
   inline void enableFlushMode() noexcept {
     if ((csr & FlushMask) != FlushMask) [[unlikely]] {
+      ++rex_fpcr_switches;
       csr |= FlushMask;
       setcsr(csr);
     }
@@ -196,6 +202,10 @@ struct FPSCRRegister {
 
   inline void disableFlushMode() noexcept {
     if ((csr & FlushMask) != 0) [[unlikely]] {
+      // DS2 port (cvar ds2_fpcr_ftz_fixed, PORTING.md 0004 of the Dead Space 2 Switch port): keep flush-to-zero
+      // on for scalar code too, so the FPCR is never rewritten between VMX and scalar code.
+      if (rex_fpcr_ftz_fixed) return;
+      ++rex_fpcr_switches;
       csr &= ~FlushMask;
       setcsr(csr);
     }

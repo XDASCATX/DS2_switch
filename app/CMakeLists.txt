@@ -46,6 +46,7 @@ set(DS2_SOURCES
     src/ds2_input_script.cpp
     src/ds2_dlc.cpp
     src/ds2_watchdog.cpp
+    src/ds2_func_counts.cpp
     src/ds2_switch_platform.cpp
     src/ds2_mode_overlay.cpp
 )

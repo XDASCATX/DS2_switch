@@ -45,6 +45,17 @@ PPCFunc* ResolveIndirectFunction(uint32_t guest_address);
 #define REX_FUNC(x) void x([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base)
 #define REX_EXTERN(x) extern "C" REX_FUNC(x)
 
+// Per-function call counters (DS2 port diagnostic, cvar ds2_func_counts): the generated code calls
+// REX_FUNC_COUNT(guest address) at the top of every function. rex_func_counts_biased is 0 when counting is off
+// (one load and a not-taken branch per call); when on it is (counter array - code base), so the counter of the
+// function at guest address A is the uint32 at rex_func_counts_biased + A (A is 4-aligned).
+extern "C" uintptr_t rex_func_counts_biased;
+#define REX_FUNC_COUNT(addr)                                         \
+  do {                                                               \
+    const uintptr_t rex_fc_ = rex_func_counts_biased;                \
+    if (__builtin_expect(rex_fc_ != 0, 0)) ++*(uint32_t*)(rex_fc_ + (addr)); \
+  } while (0)
+
 //=============================================================================
 // Function Mapping
 //=============================================================================

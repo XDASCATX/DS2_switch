@@ -19,3 +19,9 @@ std::recursive_mutex& global_critical_region::mutex() {
 }
 
 }  // namespace rex::thread
+
+// See REX_FUNC_COUNT (rex/ppc/func.h) and REX_ENTER_GLOBAL_LOCK (codegen pch template).
+extern "C" uintptr_t rex_func_counts_biased = 0;
+extern "C" bool rex_msr_global_lock = true;
+extern "C" uint64_t rex_fpcr_switches = 0;
+extern "C" bool rex_fpcr_ftz_fixed = false;

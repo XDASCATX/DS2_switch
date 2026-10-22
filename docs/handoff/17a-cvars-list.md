@@ -45,6 +45,10 @@
 | Codegen | `max_vtable_iterations` | uint32 | `100` | [init-only] (в меню серым) | Max iterations for vtable discovery |
 | Codegen | `progress_log_frequency` | uint32 | `100` | [init-only] (в меню серым) | Log progress every N functions |
 | Console | `find` | command_args | `ConsoleFind` | [live] | List cvar/command names containing a substring |
+| DS2 | `ds2_func_counts` | bool | `false` | [start] | Диагностика: счётчики вызовов каждой функции игры, раз в `ds2_func_counts_every_s` с в `logs/ds2_llamadas.bin` (декодер `tools/analysis/ds2_func_counts.py`) |
+| DS2 | `ds2_func_counts_every_s` | int32 | `10` | [live] | Секунд в окне `ds2_func_counts` |
+| DS2 | `ds2_msr_per_thread` | bool | `false` | [start] | Области `mfmsr/mtmsrd` как состояние потока вместо общего мьютекса SDK (PORTING.md 5.1 порта Dead Space 2) |
+| DS2 | `ds2_fpcr_ftz_fixed` | bool | `false` | [start] | Flush-to-zero FPCR всегда включён (скалярный код тоже); FPCR не переписывается |
 | DS2 | `ds2_capture_dir` | string | `""` | [live] | Diagnostic: folder where guest output frames are saved as PPM (empty = off) |
 | DS2 | `ds2_capture_every_ms` | int32 | `2000` | [live] | Diagnostic: interval between captured frames, ms |
 | DS2 | `ds2_capture_max` | int32 | `60` | [live] | Diagnostic: maximum number of captured frames |

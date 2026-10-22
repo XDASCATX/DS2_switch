@@ -325,21 +325,38 @@ inline std::atomic<i32>& ppc_global_lock_count_() {
   return count;
 }
 
-#define REX_CHECK_GLOBAL_LOCK()                                        \
-  ([&]() -> u64 {                                                      \
-    auto lock_ = rex::thread::global_critical_region::AcquireDirect(); \
-    return ppc_global_lock_count_().load() ? 0 : 0x8000;               \
+// mfmsr/mtmsrd "interrupts off" regions around lwarx/stwcx. (the atomic itself is a host CAS).
+// rex_msr_global_lock = true (default): each region takes the process-wide recursive mutex that the kernel object
+// table, file system and audio also use, as Xenia does. false (DS2 cvar ds2_msr_per_thread, set before any guest
+// code runs): "interrupts off" is per-thread state, which is what mfmsr reads back; another core is not stopped by
+// it on the console either (idea from the Dead Space 2 Switch port, PORTING.md 5.1).
+extern "C" bool rex_msr_global_lock;
+inline thread_local i32 ppc_msr_depth_ = 0;
+
+#define REX_CHECK_GLOBAL_LOCK()                                          \
+  ([&]() -> u64 {                                                        \
+    if (!rex_msr_global_lock) return ppc_msr_depth_ ? 0 : 0x8000;        \
+    auto lock_ = rex::thread::global_critical_region::AcquireDirect();   \
+    return ppc_global_lock_count_().load() ? 0 : 0x8000;                 \
   }())
 
-#define REX_ENTER_GLOBAL_LOCK()                          \
-  do {                                                   \
-    rex::thread::global_critical_region::mutex().lock(); \
-    ppc_global_lock_count_().fetch_add(1);               \
+#define REX_ENTER_GLOBAL_LOCK()                            \
+  do {                                                     \
+    if (!rex_msr_global_lock) {                            \
+      ++ppc_msr_depth_;                                    \
+    } else {                                               \
+      rex::thread::global_critical_region::mutex().lock(); \
+      ppc_global_lock_count_().fetch_add(1);               \
+    }                                                      \
   } while (0)
 
-#define REX_LEAVE_GLOBAL_LOCK()                                                           \
-  do {                                                                                    \
-    auto old_count_ = ppc_global_lock_count_().fetch_sub(1);                              \
-    assert(old_count_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
-    rex::thread::global_critical_region::mutex().unlock();                                \
+#define REX_LEAVE_GLOBAL_LOCK()                                                             \
+  do {                                                                                      \
+    if (!rex_msr_global_lock) {                                                             \
+      --ppc_msr_depth_;                                                                     \
+    } else {                                                                                \
+      auto old_count_ = ppc_global_lock_count_().fetch_sub(1);                              \
+      assert(old_count_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
+      rex::thread::global_critical_region::mutex().unlock();                                \
+    }                                                                                       \
   } while (0)

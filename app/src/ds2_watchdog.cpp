@@ -31,6 +31,7 @@
 #include <thread>
 
 #include "ds2_switch_platform.h"
+#include "ds2_func_counts.h"
 
 REXCVAR_DEFINE_BOOL(ds2_switch_stack_sampling, false, "DS2",
                     "Switch profiler: sample thread stacks into rex_perfil.log (same as logs/rex/perfil_pilas.flag)")
@@ -282,6 +283,7 @@ void Main() {
     std::this_thread::sleep_for(std::chrono::seconds(1));
     if (!g_run.load()) break;
     ++seconds;
+    ds2::func_counts::Tick(seconds);
     auto* kernel = rex::system::kernel_state();
     if (!kernel) continue;
 

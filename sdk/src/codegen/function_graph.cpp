@@ -480,7 +480,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
 
   // Function signature with weak/alias pattern
   emit_println(out, "DEFINE_REX_FUNC({}) {{", name);
-  emit_println(out, "\tREX_FUNC_PROLOGUE();");
+  emit_println(out, "\tREX_FUNC_PROLOGUE(); REX_FUNC_COUNT(0x{:08X}u);", base());
 
   // --- Second pass: emit instruction code ---
   const JumpTable* activeJt = nullptr;

@@ -9,5 +9,6 @@ if [ ! -f out/app-switch/CMakeCache.txt ]; then
     -DREXGLUE_SWITCH_NVK_SDK="$DS2_MESA_SDK/opt/devkitpro/portlibs/switch"
 fi
 # -j2: more parallel jobs run out of memory on the 7 GB container (cc1plus killed).
+python3 "$DS2_ROOT/tools/build/patch-generated.py" app/generated/diag-dataonly
 cmake --build out/app-switch --target ds2 -j"${JOBS:-2}"
 ls -la out/app-switch/ds2.nro

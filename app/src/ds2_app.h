@@ -12,6 +12,7 @@
 #include "ds2_input_script.h"
 #include "ds2_mode_overlay.h"
 #include "ds2_watchdog.h"
+#include "ds2_func_counts.h"
 
 #include <filesystem>
 #include <string>
@@ -53,6 +54,7 @@ class Ds2App : public rex::ReXApp {
     SetIfDefault("host_thread_stack_mb", "6");
 #endif
     ds2::watchdog::ApplyPlatformSwitches();
+    ds2::func_counts::Configure();
     ds2::mode_overlay::ApplyConfig();
   }
 

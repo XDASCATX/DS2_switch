@@ -1,0 +1,65 @@
+# DS2 Switch - v41. Base = v40 settings, plus (one change per question):
+#  Editor black screen. v40 ruled out: audio (music/fire play, no XMA context stuck), saves/system UI (no XAM
+#  calls on the black screen), loading (the editor data, ~6 MB, is read at the end of the cutscene, then nothing).
+#   1. ds2_func_counts = true: every game function counts its calls; every 10 s the counts go to
+#      logs/ds2_llamadas.bin. Normal play vs black screen shows the code that runs only on the black screen
+#      (what the game is waiting on). Costs ~19 MB and one increment per guest call.
+#  Performance (from v40 [gpu fino]: no single shader dominates; per frame ~40 ms game draws, ~19-39 ms EDRAM
+#  transfers, 7-12 ms resolves; the main thread waits for the GPU ~80 % of the time - GPU-bound):
+#   2. gpu_zone_timing_fine_every = 0 (the data is in; the sampled frames cost time).
+#   3. audio_xma_estado = false (answered).
+#  New switches, OFF here (ds2.toml.B turns them on for a short A/B in the world): ds2_msr_per_thread,
+#  ds2_fpcr_ftz_fixed (ideas from the Dead Space 2 Switch port, PORTING.md 5.1 and 0004).
+log_level = "info"
+ds2_watchdog = true
+ds2_switch_saltynx = false
+ds2_mesa_env = "MESA_SHADER_CACHE_DIR=sdmc:/switch/ds2/mesa_cache_v33;NOUVEAU_HORIZON_BO_CACHE_MB=16;NVK_SWITCH_PERF_LOG=1"
+nfsmw_io_rangos_mb = 0
+ds2_switch_nvmap_mb = 64
+# Smaller host texture cache (heap headroom on the console).
+texture_cache_memory_limit_soft = 128
+texture_cache_memory_limit_hard = 256
+texture_cache_memory_limit_soft_lifetime = 5
+ds2_watchdog_probe_tables = 0
+# Guest memory in 2 MB pieces (fewer kernel page tables); 6 MB host stacks are the Switch default.
+ds2_switch_commit_granule_kb = 2048
+# MODE 7 as a permanent setting: depth transfers skip the 8 stencil-bit passes (NVK has no stencil export).
+render_target_transfer_skip = 1
+edram_diagnostic_mode = 0
+# v32: clears and other unclipped screen rectangles: height from their vertices instead of "to the end of EDRAM".
+execute_unclipped_draw_vs_on_cpu = true
+# v32: do not transfer old EDRAM contents into areas the draw then overwrites completely (same image, less GPU work).
+render_target_transfer_elide_overwritten = true
+# v33: the same for depth-only draws (shadow maps, depth clears) and clipped full-screen passes.
+render_target_transfer_elide_extended = true
+# v33: one-pass resolves (same bytes in game memory as before - checked byte by byte on PC).
+render_target_direct_resolve = true
+# GPU time per kind of work in rex_perfil.log (v38C: switching it off changed nothing visible).
+gpu_zone_timing = true
+gpu_zone_timing_fine = false
+gpu_zone_timing_fine_every = 0
+# v35: at most 2 frames queued for the GPU.
+vulkan_max_frames_in_flight = 2
+# Statistics (log lines every few seconds, no effect on the image).
+vulkan_barrier_stats = 600
+vulkan_memory_report_frames = 300
+rt_transfer_stats = 4000
+rt_transfer_stats_reset = true
+ds2_switch_stack_sampling = true
+# v36: uploads at the start of the frame.
+vulkan_shared_memory_hoist_uploads = true
+# CPU copies of small resolves (v36).
+readback_resolve = "fast"
+readback_resolve_max_bytes = 65536
+# v39-v41 diagnostic
+audio_xma_estado = false
+ds2_func_counts = true
+ds2_func_counts_every_s = 10
+ds2_msr_per_thread = false
+ds2_fpcr_ftz_fixed = false
+ds2_export_stats = true
+resolve_dump_dir = ""
+resolve_dump_start_s = 300
+resolve_dump_every_s = 30
+resolve_dump_max = 6
+resolve_dump_max_mb = 64
