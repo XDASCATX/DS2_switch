@@ -59,6 +59,12 @@ class XmaDecoder {
  private:
   void WorkerThreadMain();
 
+ public:
+  // DS2 port diagnostic (audio_xma_estado), see xma_decoder.cpp.
+  void InformarEstado();
+
+ private:
+
   static uint32_t MMIOReadRegisterThunk(void* ppc_context, XmaDecoder* as, uint32_t addr) {
     return as->ReadRegister(addr);
   }

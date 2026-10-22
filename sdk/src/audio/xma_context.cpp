@@ -340,6 +340,13 @@ int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
  * without subframes, 2 no input, 3 no progress, 4 error). Contexts that never sound again (end of a
  * sound) write nothing. It does not change anything that is decoded. At most 200 lines per run.
  */
+double XmaContext::SilencioMs(uint8_t* motivo, uint32_t* pasadas) const {
+  if (motivo) *motivo = silencio_motivo_;
+  if (pasadas) *pasadas = silencio_pasadas_;
+  if (!en_silencio_) return 0.0;
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - silencio_desde_).count();
+}
+
 void XmaContext::AnotarProduccion(bool produjo, uint8_t motivo, const XMA_CONTEXT_DATA& data) {
   static std::atomic<uint32_t> lineas{0};
   const auto ahora = std::chrono::steady_clock::now();

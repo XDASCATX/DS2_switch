@@ -99,6 +99,11 @@ REXCVAR_DEFINE_INT32(resolve_dump_start_s, 0, "GPU/Vulkan",
 REXCVAR_DEFINE_INT32(resolve_dump_max, 10, "GPU/Vulkan", "DIAGNOSTIC: maximum number of resolve dumps");
 REXCVAR_DEFINE_INT32(resolve_dump_max_mb, 96, "GPU/Vulkan", "DIAGNOSTIC: host buffer for one resolve dump, MB");
 
+REXCVAR_DEFINE_INT32(gpu_draw_only_every_n_frames, 0, "GPU/Vulkan",
+                     "TESTS on a slow PC (software Vulkan): execute draws and resolves only in one frame of every N "
+                     "(0/1 = all). The game runs much faster, the image is updated every N frames and anything it "
+                     "renders to textures in the skipped frames is stale. Never for real play");
+
 REXCVAR_DEFINE_INT32(vulkan_max_frames_in_flight, 3, "GPU/Vulkan",
                      "Guest frames the GPU may be behind the command processor (1-3). Fewer = less input latency "
                      "when the GPU is the bottleneck; 2 keeps the GPU fed with one queued frame");
@@ -3755,6 +3760,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  if (const int32_t every = REXCVAR_GET(gpu_draw_only_every_n_frames);
+      every > 1 && (frame_current_ % uint64_t(every)) != 0) {
+    return true;
+  }
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
   ++resolve_dump_draws_;
@@ -4354,6 +4363,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       shader_32bit_index_dma) {
 #if REX_PLATFORM_SWITCH
     if (regs.Get<reg::RB_SURFACE_INFO>().msaa_samples != xenos::MsaaSamples::k1X) RexSwitchPerfCount(54);
+    gpu_draw_key_ = ((pixel_shader ? pixel_shader->ucode_data_hash() : 0) & 0xFFFFFFFF00000000ull) |
+                    (uint64_t(regs.values[XE_GPU_REG_RB_SURFACE_INFO] & 0x3FFFF) << 12) |
+                    (regs.values[XE_GPU_REG_RB_COLOR_INFO] & 0xFFF);
     GpuZoneBegin(kGpuZoneGuestDraw);
     if (!RexSwitchPerfSkip(1))
 #endif
@@ -4391,6 +4403,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
             : VK_INDEX_TYPE_UINT32);
 #if REX_PLATFORM_SWITCH
     if (regs.Get<reg::RB_SURFACE_INFO>().msaa_samples != xenos::MsaaSamples::k1X) RexSwitchPerfCount(54);
+    gpu_draw_key_ = ((pixel_shader ? pixel_shader->ucode_data_hash() : 0) & 0xFFFFFFFF00000000ull) |
+                    (uint64_t(regs.values[XE_GPU_REG_RB_SURFACE_INFO] & 0x3FFFF) << 12) |
+                    (regs.values[XE_GPU_REG_RB_COLOR_INFO] & 0xFFF);
     GpuZoneBegin(kGpuZoneGuestDraw);
     if (!RexSwitchPerfSkip(1))
 #endif
@@ -4646,6 +4661,10 @@ bool VulkanCommandProcessor::IssueCopy() {
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  if (const int32_t every = REXCVAR_GET(gpu_draw_only_every_n_frames);
+      every > 1 && (frame_current_ % uint64_t(every)) != 0) {
+    return true;
+  }
   if (!BeginSubmission(true)) {
     return false;
   }
@@ -5452,6 +5471,7 @@ void VulkanCommandProcessor::GpuZoneWrite(uint8_t tag) {
   // the work between them (the GPU runs one submission's work in order on this driver).
   deferred_command_buffer_.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_zone_pool_,
                                                gpu_zone_current_base_ + slot->count);
+  slot->keys[slot->count] = gpu_draw_key_;
   slot->tags[slot->count++] = tag;
 }
 
@@ -5498,6 +5518,11 @@ void VulkanCommandProcessor::GpuZonesCollect() {
           zone_is_open[zone] = true;
         } else if (zone_is_open[zone]) {
           if (values[q] >= zone_open[zone]) zone_ticks[zone] += values[q] - zone_open[zone];
+          if (zone == kGpuZoneGuestDraw && slot.fine && !gpu_zone_fine_ && values[q] >= zone_open[zone]) {
+            GpuDrawCost& cost = gpu_draw_costs_[slot.keys[q]];
+            cost.ns += uint64_t(double(values[q] - zone_open[zone]) * kNsPerTick);
+            ++cost.draws;
+          }
           ++zone_instances[zone];
           zone_is_open[zone] = false;
         }
@@ -5513,6 +5538,26 @@ void VulkanCommandProcessor::GpuZonesCollect() {
       RexSwitchPerfAdd(84, zone_instances[kGpuZoneGuestDraw]);
       RexSwitchPerfAdd(85, uint64_t(double(zone_ticks[kGpuZoneBarrier]) * kNsPerTick));
       RexSwitchPerfCount(86);
+      if (++gpu_draw_cost_frames_ >= 20) {
+        // The most expensive game draws, grouped by pixel shader and render target, per sampled frame.
+        std::vector<std::pair<uint64_t, GpuDrawCost>> top(gpu_draw_costs_.begin(), gpu_draw_costs_.end());
+        std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+        uint64_t total = 0;
+        for (const auto& t : top) total += t.second.ns;
+        std::string list;
+        for (size_t i = 0; i < top.size() && i < 16; ++i) {
+          const uint64_t k = top[i].first;
+          const uint32_t surf = uint32_t(k >> 12) & 0x3FFFF;
+          list += fmt::format(" | ps {:08X} pitch {} msaa {} c0 {:03X}: {:.2f} ms, {:.0f} draws", uint32_t(k >> 32),
+                              surf & 0x3FFF, 1u << ((surf >> 16) & 3), uint32_t(k & 0xFFF),
+                              double(top[i].second.ns) / gpu_draw_cost_frames_ / 1e6,
+                              double(top[i].second.draws) / gpu_draw_cost_frames_);
+        }
+        REXGPU_INFO("[gpu fino] {} frames: game draws {:.1f} ms per frame, top{}", gpu_draw_cost_frames_,
+                    double(total) / gpu_draw_cost_frames_ / 1e6, list);
+        gpu_draw_costs_.clear();
+        gpu_draw_cost_frames_ = 0;
+      }
       continue;
     }
     RexSwitchPerfAdd(42, uint64_t(double(end - start) * kNsPerTick));

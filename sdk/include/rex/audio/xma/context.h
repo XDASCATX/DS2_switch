@@ -228,6 +228,9 @@ class XmaContext {
 
   uint32_t id() { return id_; }
   uint32_t guest_ptr() { return guest_ptr_; }
+  // DS2 port diagnostic: how long this context has produced nothing (ms, 0 if it is producing), the last reason
+  // (1 only flush, 2 no input, 3 no progress, 4 error) and the empty passes.
+  double SilencioMs(uint8_t* motivo, uint32_t* pasadas) const;
   bool is_allocated() { return is_allocated_.load(std::memory_order_acquire); }
   bool is_enabled() { return is_enabled_.load(std::memory_order_acquire); }
 

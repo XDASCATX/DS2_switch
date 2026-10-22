@@ -50,6 +50,10 @@ REXCVAR_DECLARE(bool, audio_diag_prioridad_critica);  // definida en audio_syste
 #else
 #define REX_XMA_EN_TRABAJADOR_POR_DEFECTO 0
 #endif
+REXCVAR_DEFINE_BOOL(audio_xma_estado, true, "Audio",
+                    "Diagnostic: every 10 s log the XMA contexts the game enabled that have produced no audio for "
+                    "2+ s (one line)");
+
 REXCVAR_DEFINE_INT32(audio_xma_en_trabajador, REX_XMA_EN_TRABAJADOR_POR_DEFECTO, "Audio",
                      "Quien descodifica el XMA al llegar un kick (XMAEnableContext): 0 = el hilo que lo pide, "
                      "como hasta ahora; 1 = el hilo XMA Decoder, que en la Switch va a 0x2B y no lo preempta "
@@ -253,6 +257,9 @@ void MaximoXma(std::atomic<uint64_t>& maximo, uint64_t valor) {
   }
 }
 
+XmaDecoder* g_decoder_estado = nullptr;
+void InformarEstadoContextos();
+
 void InformarXma() {
   const int64_t ahora = AhoraMsXma();
   int64_t ultimo = g_medida_xma.ultimo_ms.load(std::memory_order_relaxed);
@@ -289,11 +296,49 @@ void InformarXma() {
               double(trabajo_max) / 1e6, del_respaldo,
               latencia_n ? double(latencia_ns) / double(latencia_n) / 1e3 : 0.0, double(latencia_max) / 1e6,
               latencia_n);
+  InformarEstadoContextos();
 }
 
 }  // namespace
 
+namespace {
+void InformarEstadoContextos() {
+  if (!g_decoder_estado || !REXCVAR_GET(audio_xma_estado)) return;
+  g_decoder_estado->InformarEstado();
+}
+}  // namespace
+
+void XmaDecoder::InformarEstado() {
+  // DS2 port diagnostic (audio_xma_estado): contexts the game has enabled that have produced nothing for 2+ s.
+  // A game that waits for a sound to end waits on exactly such a context.
+  uint32_t asignados = 0, habilitados = 0;
+  std::string mudos;
+  uint32_t mudos_n = 0;
+  for (uint32_t i = 0; i < kContextCount; ++i) {
+    XmaContext& c = contexts_[i];
+    if (!c.is_allocated()) continue;
+    ++asignados;
+    if (!c.is_enabled()) continue;
+    ++habilitados;
+    uint8_t motivo = 0;
+    uint32_t pasadas = 0;
+    const double ms = c.SilencioMs(&motivo, &pasadas);
+    if (ms < 2000.0) continue;
+    ++mudos_n;
+    if (mudos_n > 12) continue;
+    const XMA_CONTEXT_DATA data(memory()->TranslateVirtual(c.guest_ptr()));
+    mudos += fmt::format(" [{} {:.0f}s motivo {} in {}{} cur {} rd {} salida {} bucles {} err {}/{} stop {}]", i,
+                         ms / 1000.0, motivo, uint32_t(data.input_buffer_0_valid),
+                         uint32_t(data.input_buffer_1_valid), uint32_t(data.current_buffer),
+                         uint32_t(data.input_buffer_read_offset), uint32_t(data.output_buffer_valid),
+                         uint32_t(data.loop_count), uint32_t(data.error_set), uint32_t(data.parser_error_set),
+                         uint32_t(data.stop_when_done));
+  }
+  REXLOG_INFO("[xma] estado: {} asignados, {} habilitados, {} mudos 2+ s{}", asignados, habilitados, mudos_n, mudos);
+}
+
 void XmaDecoder::WorkerThreadMain() {
+  g_decoder_estado = this;
   while (worker_running_) {
     // Okay, let's loop through XMA contexts to find ones we need to decode!
     bool did_work = false;

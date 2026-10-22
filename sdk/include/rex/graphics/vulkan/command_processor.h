@@ -755,7 +755,18 @@ class VulkanCommandProcessor : public CommandProcessor {
     bool pending = false;  // recorded, results not read yet
     bool fine = false;     // game draws and barriers timed in this submission
     uint8_t tags[kGpuZoneQueriesPerSlot];
+    // Fine submissions: which game draw each kGpuZoneGuestDraw query belongs to (gpu_draw_key_).
+    uint64_t keys[kGpuZoneQueriesPerSlot];
   };
+  // DS2 port: key of the next timed game draw (pixel shader hash high bits | render target), and the GPU time
+  // per key over the sampled fine submissions, logged as the most expensive draws ([gpu fino]).
+  uint64_t gpu_draw_key_ = 0;
+  struct GpuDrawCost {
+    uint64_t ns = 0;
+    uint64_t draws = 0;
+  };
+  std::unordered_map<uint64_t, GpuDrawCost> gpu_draw_costs_;
+  uint32_t gpu_draw_cost_frames_ = 0;
   void GpuZoneWrite(uint8_t tag);
   void GpuZonesBeginSubmission();
   void GpuZonesCollect();

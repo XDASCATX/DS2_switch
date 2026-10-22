@@ -70,7 +70,10 @@ class Ds2App : public rex::ReXApp {
   void OnPreSetup(rex::RuntimeConfig& config) override { ds2::input_script::Wrap(config); }
 
   // DLC packages (--ds2_install_dlc), installed once the XEX is loaded so the title id is known.
-  void OnPostSetup() override { ds2::dlc::InstallConfigured(runtime()); }
+  void OnPostSetup() override {
+    ds2::input_script::ApplyTimeScalar();
+    ds2::dlc::InstallConfigured(runtime());
+  }
 
   // Diagnostic frame capture (off unless --ds2_capture_dir is given), see ds2_capture.h.
   void OnPostLaunchModule(rex::system::XThread* thread) override {

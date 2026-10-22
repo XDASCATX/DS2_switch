@@ -1,5 +1,7 @@
 // ds2 - scripted virtual pad, see ds2_input_script.h.
 
+#include <rex/chrono/clock.h>
+
 #include "ds2_input_script.h"
 
 #include <rex/cvar.h>
@@ -20,10 +22,30 @@
 REXCVAR_DEFINE_STRING(ds2_input_script, "", "DS2",
                       "Tests: virtual pad script in seconds since start, e.g. \"60:start,70:a,80-82:down\" "
                       "(T:button = short press, T1-T2:button = hold). Buttons: a b x y lb rb lt rt up down "
-                      "left right start back lstick_up lstick_down lstick_left lstick_right")
+                      "left right start back lstick_up lstick_down lstick_left lstick_right rstick_up rstick_down rstick_left "
+                      "rstick_right. Times are guest seconds (= real seconds unless ds2_guest_time_scalar is set)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_DOUBLE(ds2_guest_time_scalar, 1.0, "DS2",
+                      "Tests on a slow PC: guest clock speed (0.05 = the game sees 20x less time pass). With software "
+                      "Vulkan at ~1.5 frames/s, 0.05 makes each frame look like ~1/30 s to the game")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(ds2_guest_time_scalar_at, 0, "DS2",
+                     "Tests: apply ds2_guest_time_scalar only from this many guest seconds on (menus at full speed, "
+                     "then slow the world down). Needs ds2_input_script")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace ds2::input_script {
+
+void ApplyTimeScalar() {
+  const double scalar = REXCVAR_GET(ds2_guest_time_scalar);
+  if (REXCVAR_GET(ds2_guest_time_scalar_at) > 0) return;  // applied later by the script pad
+  if (scalar > 0.0 && scalar != 1.0) {
+    rex::chrono::Clock::set_guest_time_scalar(scalar);
+    REXLOG_INFO("[ds2 input] guest time scalar {}", scalar);
+  }
+}
+
 namespace {
 
 using rex::X_RESULT;
@@ -47,12 +69,17 @@ constexpr Button kButtons[] = {
     {"down", 0x0002, 0x5811},    {"left", 0x0004, 0x5812},     {"right", 0x0008, 0x5813},
     {"start", 0x0010, 0x5814},   {"back", 0x0020, 0x5815},     {"lstick_up", 1u << 18, 0x5820},
     {"lstick_down", 1u << 19, 0x5821}, {"lstick_right", 1u << 20, 0x5822}, {"lstick_left", 1u << 21, 0x5823},
+    {"rstick_up", 1u << 22, 0x5830},   {"rstick_down", 1u << 23, 0x5831}, {"rstick_right", 1u << 24, 0x5832},
+    {"rstick_left", 1u << 25, 0x5833},
 };
 
 struct Step {
   double begin;
   double end;
   uint32_t bits;
+  // Polls that saw this step held: a step stays held past its end until the game has read it twice, so a slow
+  // game (a few frames per second on a software-Vulkan PC) never misses a press.
+  uint32_t polls = 0;
 };
 
 bool Number(std::string_view text, double& value) {
@@ -121,6 +148,8 @@ class ScriptPad final : public in::InputDriver {
       out_state->gamepad.right_trigger = ((bits >> 17) & 1) ? 0xFF : 0;
       out_state->gamepad.thumb_ly = ((bits >> 18) & 1) ? 30000 : ((bits >> 19) & 1) ? -30000 : 0;
       out_state->gamepad.thumb_lx = ((bits >> 20) & 1) ? 30000 : ((bits >> 21) & 1) ? -30000 : 0;
+      out_state->gamepad.thumb_ry = ((bits >> 22) & 1) ? 30000 : ((bits >> 23) & 1) ? -30000 : 0;
+      out_state->gamepad.thumb_rx = ((bits >> 24) & 1) ? 30000 : ((bits >> 25) & 1) ? -30000 : 0;
     }
     return X_ERROR_SUCCESS;
   }
@@ -163,10 +192,20 @@ class ScriptPad final : public in::InputDriver {
  private:
   uint32_t Update(uint32_t& packet) {
     std::lock_guard<std::mutex> lock(mutex_);
-    const double t = std::chrono::duration<double>(Clock::now() - start_).count();
+    // Guest seconds since the first poll: the same as real seconds unless ds2_guest_time_scalar slows the game
+    // down (PC runs), so a script written for normal speed still lines up with what the game does.
+    const double t = double(rex::chrono::Clock::QueryGuestUptimeMillis()) / 1000.0;
+    if (!scalar_applied_ && REXCVAR_GET(ds2_guest_time_scalar_at) > 0 && t >= REXCVAR_GET(ds2_guest_time_scalar_at)) {
+      scalar_applied_ = true;
+      rex::chrono::Clock::set_guest_time_scalar(REXCVAR_GET(ds2_guest_time_scalar));
+      REXLOG_INFO("[ds2 input] guest time scalar {} from {:.1f} s", REXCVAR_GET(ds2_guest_time_scalar), t);
+    }
     uint32_t bits = 0;
-    for (const Step& s : steps_) {
-      if (t >= s.begin && t < s.end) bits |= s.bits;
+    for (Step& s : steps_) {
+      if (t >= s.begin && (t < s.end || s.polls < 2)) {
+        bits |= s.bits;
+        ++s.polls;
+      }
     }
     if (bits != current_) {
       for (const Button& b : kButtons) {
@@ -186,11 +225,12 @@ class ScriptPad final : public in::InputDriver {
     return bits;
   }
 
-  const std::vector<Step> steps_;
+  std::vector<Step> steps_;
   const Clock::time_point start_;
   std::mutex mutex_;
   uint32_t current_ = 0;
   uint32_t packet_ = 1;
+  bool scalar_applied_ = false;
   std::deque<in::X_INPUT_KEYSTROKE> keys_;
 };
 

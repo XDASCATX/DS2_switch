@@ -12,5 +12,7 @@ namespace ds2::input_script {
 
 // Wraps config.input_factory to add the script pad if the cvar is not empty. Call it in OnPreSetup.
 void Wrap(rex::RuntimeConfig& config);
+// Applies ds2_guest_time_scalar (call after the runtime has set up its clock).
+void ApplyTimeScalar();
 
 }  // namespace ds2::input_script
