@@ -220,6 +220,7 @@ struct JumpTableMatch {
   bool found_add = false;    // For offset-based types
   bool found_load = false;   // lwzx/lbzx/lhzx
   bool found_shift = false;  // rlwinm for shift
+  bool half_entries = false;  // table loaded with lhzx (16-bit entries)
   bool found_table_lis = false;
   bool found_table_addi = false;
   bool found_base_lis = false;
@@ -388,12 +389,20 @@ std::vector<guest_addr_t> read_table_entries(const FunctionScanner& scanner,
       }
 
       case JumpTableType::kComputed: {
-        // Read byte, shift, add to base
-        auto entry_ptr = scanner.translate_address<u8>(table_addr + i);
-        if (!entry_ptr)
-          goto done;
-        u8 offset = *entry_ptr;
-        target = match.base_address() + (static_cast<u32>(offset) << match.shift_amount);
+        // Read byte (or halfword for lhzx tables), shift, add to base
+        u32 offset;
+        if (match.half_entries) {
+          auto entry_ptr = scanner.translate_address<u16>(table_addr + (i * 2));
+          if (!entry_ptr)
+            goto done;
+          offset = load_and_swap<u16>(entry_ptr);
+        } else {
+          auto entry_ptr = scanner.translate_address<u8>(table_addr + i);
+          if (!entry_ptr)
+            goto done;
+          offset = *entry_ptr;
+        }
+        target = match.base_address() + (offset << match.shift_amount);
         break;
       }
 
@@ -604,7 +613,11 @@ std::optional<JumpTable> FunctionScanner::detect_jump_table(guest_addr_t bctr_ad
 
       // lhzx for SHORTOFFSET
       if (instr.opcode == Opcode::lhzx && instr.X.RT == match.offset_reg) {
-        match.type = JumpTableType::kShortOffset;
+        // lhzx after an offset shift (found first in the backward scan): 16-bit entries, shifted. Keep
+        // kComputed and remember the entry width (DS2: script command dispatcher sub_825EFDF0 used to read
+        // these tables as bytes, sending commands to the wrong handlers).
+        match.half_entries = true;
+        if (!match.found_shift) match.type = JumpTableType::kShortOffset;
         match.table_reg = instr.X.RA;
         match.index_reg = instr.X.RB;
         match.found_load = true;
@@ -1396,6 +1409,7 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
   uint8_t indexReg = 0xFF;       // Current reg being traced (0xFF = stop tracing)
   uint8_t finalIndexReg = 0xFF;  // Last valid indexReg for scanForBounds/output
   int shiftAmount = 0;
+  bool halfEntries = false;  // table loaded with lhzx
 
   // Backward scan from bctr
   uint32_t scanAddr = bctrAddr;
@@ -1453,6 +1467,7 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
 
       // lhzx rD, rA, rB - indexed halfword load (SHORTOFFSET table)
       if (insn->opcode == Opcode::lhzx && insn->X.RT == ctrSourceReg) {
+        halfEntries = true;  // 16-bit entries, also when shifted (kComputed)
         // Don't overwrite kComputed
         if (tableType != JumpTableType::kComputed) {
           tableType = JumpTableType::kShortOffset;
@@ -1719,10 +1734,19 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
         break;
       }
       case JumpTableType::kComputed: {
-        auto val = decoded.read<uint8_t>(tableAddr + i);
-        if (!val)
-          break;
-        target = baseAddr + (static_cast<uint32_t>(*val) << shiftAmount);
+        uint32_t offset = 0;
+        if (halfEntries) {
+          auto val = decoded.read<uint16_t>(tableAddr + i * 2);
+          if (!val)
+            break;
+          offset = *val;
+        } else {
+          auto val = decoded.read<uint8_t>(tableAddr + i);
+          if (!val)
+            break;
+          offset = *val;
+        }
+        target = baseAddr + (offset << shiftAmount);
         break;
       }
       case JumpTableType::kShortOffset: {
