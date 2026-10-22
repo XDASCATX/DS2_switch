@@ -9,6 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#if defined(__SWITCH__)
+#include <switch.h>
+#endif
 #include <rex/logging.h>
 #include <rex/runtime.h>
 #include <rex/string.h>
@@ -432,6 +435,53 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
   assert_true(overlapped.guest_address() != 0);
 
   auto buffer_size = static_cast<size_t>(buffer_length) * 2;
+
+#if defined(__SWITCH__)
+  // On the Switch there is no physical keyboard for the ImGui dialog: use the system software keyboard
+  // (library applet swkbd). It blocks until the player confirms or cancels, so it runs on the deferred overlapped
+  // thread like the other XAM UIs (the game keeps running and sees XN_SYS_UI meanwhile).
+  {
+    auto utf8 = [](const mapped_wstring& w) -> std::string {
+      return w ? rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(
+                     REX_KERNEL_MEMORY()->TranslateVirtual(w.guest_address())))
+               : std::string();
+    };
+    const std::string title_str = utf8(title), desc_str = utf8(description), def_str = utf8(default_text);
+    auto run = [title_str, desc_str, def_str, buffer, buffer_length, buffer_size](
+                   uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+      length = 0;
+      SwkbdConfig kbd;
+      Result rc = swkbdCreate(&kbd, 0);
+      if (R_FAILED(rc)) {
+        REXKRNL_ERROR("XamShowKeyboardUI: swkbdCreate failed 0x{:X}", rc);
+        extended_error = X_ERROR_CANCELLED;
+        return X_ERROR_SUCCESS;
+      }
+      swkbdConfigMakePresetDefault(&kbd);
+      if (!title_str.empty()) swkbdConfigSetHeaderText(&kbd, title_str.c_str());
+      if (!desc_str.empty()) swkbdConfigSetGuideText(&kbd, desc_str.c_str());
+      if (!def_str.empty()) swkbdConfigSetInitialText(&kbd, def_str.c_str());
+      if (buffer_length > 1) swkbdConfigSetStringLenMax(&kbd, buffer_length - 1);
+      std::vector<char> out(size_t(buffer_length) * 4 + 4, 0);
+      rc = swkbdShow(&kbd, out.data(), out.size());
+      swkbdClose(&kbd);
+      if (R_FAILED(rc)) {
+        REXKRNL_INFO("XamShowKeyboardUI: keyboard cancelled (0x{:X})", rc);
+        extended_error = X_ERROR_CANCELLED;
+        return X_ERROR_SUCCESS;
+      }
+      std::memset(buffer, 0, buffer_size);
+      auto text = rex::string::to_utf16(std::string(out.data()));
+      rex::string::copy_and_swap_truncating(buffer, text, buffer_length);
+      REXKRNL_INFO("XamShowKeyboardUI: entered '{}'", out.data());
+      extended_error = X_ERROR_SUCCESS;
+      return X_ERROR_SUCCESS;
+    };
+    REXKRNL_INFO("XamShowKeyboardUI: system keyboard (title '{}', default '{}', {} chars)", title_str, def_str,
+                 uint32_t(buffer_length));
+    return xeXamDispatchHeadlessEx(run, overlapped.guest_address());
+  }
+#endif
 
   X_RESULT result;
   if (REXCVAR_GET(headless)) {

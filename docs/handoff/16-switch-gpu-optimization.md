@@ -436,3 +436,12 @@ v44: лог каждой команды скрипта (`[editor] orden del guio
 эксперимент `ds2_editor_open_mode` (1 = как 130459, 2 = как 130461) — через `ds2_editor_open_after_s` (8) с ожидания
 открыть меню типа 4 самим. Тесты: `ds2.toml.v44_1_open130461`, `ds2.toml.v44_2_open130459`.
 Релиз: nro 041cbd7e…, toml1 afbeb290…, toml2 9589c1bb….
+
+## v44 на консоли и v45
+
+v44 тест 1 (`ds2_editor_open_mode = 2`, меню типа 4 как команда 130461): **редактор открылся** — окно ввода имени;
+экранная клавиатура не появилась. На Switch `XamShowKeyboardUI` открывала ImGui-поле, которому нужна физическая
+клавиатура. v45: на Switch — системная клавиатура libnx (`swkbd`, апплет) в отложенном overlapped-потоке; отмена →
+`X_ERROR_CANCELLED`. Лог: `XamShowKeyboardUI: system keyboard … / entered '…' / keyboard cancelled`.
+Настоящую причину (почему скрипт не дал команду 130461 сам) ещё предстоит найти по логу команд v44.
+Релиз v45: nro 7734bae9…, toml 3a536e72….
