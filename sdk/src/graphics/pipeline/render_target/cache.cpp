@@ -28,6 +28,9 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 
+REXCVAR_DEFINE_INT32(render_target_max_height, 0, "GPU",
+                     "DS2 port: maximum height in guest pixels of a host render target (0 = to the end of the EDRAM, "
+                     "the default). Saves memory; draws below that height would be lost");
 REXCVAR_DEFINE_BOOL(mrt_edram_used_range_clamp_to_min, true, "GPU",
                     "Clamp MRT EDRAM used range to minimum");
 
@@ -802,6 +805,13 @@ uint32_t RenderTargetCache::GetRenderTargetHeight(uint32_t pitch_tiles_at_32bpp,
                 "of an EDRAM tile height");
   uint32_t max_height_scaled = std::min(
       xenos::kTexture2DCubeMaxWidthHeight * draw_resolution_scale_y(), GetMaxRenderTargetHeight());
+  // DS2 port (v48): host render targets are normally as tall as the whole EDRAM from their base (1280x2048,
+  // 160x4096 4xMSAA - ~10 MB each). On the Switch their memory comes from the process heap, and in Majula ~40-70
+  // of them fragmented it until render targets could no longer be created (orange screen). Clamp to the
+  // tallest render target the game draws.
+  if (const int32_t max_height = REXCVAR_GET(render_target_max_height); max_height > 0) {
+    max_height_scaled = std::min(max_height_scaled, uint32_t(max_height) * draw_resolution_scale_y());
+  }
   uint32_t msaa_samples_y_log2 = uint32_t(msaa_samples >= xenos::MsaaSamples::k2X);
   uint32_t tile_height_samples_scaled = xenos::kEdramTileHeightSamples * draw_resolution_scale_y();
   tile_rows =

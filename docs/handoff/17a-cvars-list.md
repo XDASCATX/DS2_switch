@@ -45,6 +45,8 @@
 | Codegen | `max_vtable_iterations` | uint32 | `100` | [init-only] (в меню серым) | Max iterations for vtable discovery |
 | Codegen | `progress_log_frequency` | uint32 | `100` | [init-only] (в меню серым) | Log progress every N functions |
 | Console | `find` | command_args | `ConsoleFind` | [live] | List cvar/command names containing a substring |
+| GPU | `render_target_max_height` | int32 | `0` | [start] | Максимальная высота RT хоста в пикселях гостя (0 = до конца EDRAM); экономит память |
+| GPU/Vulkan | `vulkan_render_target_budget_mb` | int32 | `0` | [live] | Освобождать RT без данных EDRAM, когда кучи Vulkan больше N МБ (0 = только после отказа) |
 | DS2 | `ds2_func_counts` | bool | `false` | [start] | Диагностика: счётчики вызовов каждой функции игры, раз в `ds2_func_counts_every_s` с в `logs/ds2_llamadas.bin` (декодер `tools/analysis/ds2_func_counts.py`) |
 | DS2 | `ds2_func_counts_every_s` | int32 | `10` | [live] | Секунд в окне `ds2_func_counts` |
 | DS2 | `ds2_msr_per_thread` | bool | `false` | [start] | Области `mfmsr/mtmsrd` как состояние потока вместо общего мьютекса SDK (PORTING.md 5.1 порта Dead Space 2) |
