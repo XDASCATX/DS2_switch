@@ -108,6 +108,9 @@ REXCVAR_DEFINE_INT32(vulkan_max_frames_in_flight, 3, "GPU/Vulkan",
                      "Guest frames the GPU may be behind the command processor (1-3). Fewer = less input latency "
                      "when the GPU is the bottleneck; 2 keeps the GPU fed with one queued frame");
 
+REXCVAR_DEFINE_INT32(vulkan_render_target_budget_mb, 0, "GPU/Vulkan",
+                     "DS2 port: when the Vulkan heaps hold more than this many MB (checked every 30 frames), release "
+                     "the render targets owning no EDRAM data before an allocation fails (0 = only after a failure)");
 REXCVAR_DEFINE_INT32(vulkan_memory_report_frames, 0, "GPU/Vulkan",
                      "Every N frames log GPU memory in use (Vulkan heap usage), textures and render targets. 0 = off");
 
@@ -6128,8 +6131,37 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     // most once every 30 frames. The failed one is created again on its next use.
     // v35: the failure flag is only consumed when the eviction really runs (v34 consumed it inside the
     // 30-frame window, the failed render target then stayed cached as missing for the rest of the session).
-    if (!cache_clear_requested_ && render_target_cache_->HasRenderTargetCreationFailure() &&
+    // v47: also when another allocation failed (shared memory sparse pages: in Majula the heap ran out with 73
+    // render targets cached and the game drew garbage at 1 fps), or when the heaps exceed
+    // vulkan_render_target_budget_mb.
+    bool over_budget = false;
+    if (REXCVAR_GET(vulkan_render_target_budget_mb) > 0 && frame_current_ >= gpu_memory_check_frame_ + 30) {
+      gpu_memory_check_frame_ = frame_current_;
+      const ui::vulkan::VulkanDevice* const vk_device = GetVulkanDevice();
+      const auto* const vk_instance = vk_device->vulkan_instance();
+      if (vk_device->extensions().ext_EXT_memory_budget &&
+          vk_instance->extensions().ext_1_1_KHR_get_physical_device_properties2) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget = {};
+        budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+        VkPhysicalDeviceMemoryProperties2 properties = {};
+        properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+        properties.pNext = &budget;
+        vk_instance->functions().vkGetPhysicalDeviceMemoryProperties2(vk_device->physical_device(), &properties);
+        uint64_t usage = 0;
+        for (uint32_t i = 0; i < properties.memoryProperties.memoryHeapCount; ++i) usage += budget.heapUsage[i];
+        over_budget = usage > (uint64_t(REXCVAR_GET(vulkan_render_target_budget_mb)) << 20);
+        if (over_budget) {
+          REXGPU_INFO("Render target memory: Vulkan heaps {} MB over the {} MB budget, {} render targets",
+                      usage >> 20, REXCVAR_GET(vulkan_render_target_budget_mb),
+                      render_target_cache_->GetRenderTargetCount());
+        }
+      }
+    }
+    if (!cache_clear_requested_ &&
+        (render_target_cache_->HasRenderTargetCreationFailure() || render_target_eviction_requested_ ||
+         over_budget) &&
         frame_current_ >= render_target_eviction_frame_ + 30 && AwaitAllQueueOperationsCompletion()) {
+      render_target_eviction_requested_ = false;
       render_target_cache_->TakeRenderTargetCreationFailure();
       render_target_eviction_frame_ = frame_current_;
       const size_t render_targets_before = render_target_cache_->GetRenderTargetCount();

@@ -258,7 +258,13 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_alloca
   memory_allocate_info.memoryTypeIndex = buffer_memory_type_;
   VkDeviceMemory memory;
   if (dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &memory) != VK_SUCCESS) {
-    REXGPU_ERROR("Shared memory: Failed to allocate sparse buffer memory");
+    // DS2 port (v47): ask the command processor to release unused render targets at the end of the frame,
+    // and do not flood the log (thousands of lines per minute on the SD card cost CPU time).
+    command_processor_.RequestRenderTargetEviction();
+    static uint64_t failures = 0;
+    if (!(failures++ & (failures < 16 ? 0 : 1023))) {
+      REXGPU_ERROR("Shared memory: Failed to allocate sparse buffer memory ({} failures)", failures);
+    }
     return false;
   }
   buffer_memory_.push_back(memory);

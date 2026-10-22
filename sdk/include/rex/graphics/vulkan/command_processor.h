@@ -433,6 +433,16 @@ class VulkanCommandProcessor : public CommandProcessor {
   // successfully, if it has failed, leaves it open.
   bool EndSubmission(bool is_swap);
   uint64_t render_target_eviction_frame_ = 0;
+  // DS2 port: set when a Vulkan allocation outside the render target cache failed (shared memory sparse
+  // pages): the render targets owning no EDRAM data are released at the end of the frame, like on an RT
+  // creation failure.
+  bool render_target_eviction_requested_ = false;
+  uint64_t gpu_memory_check_frame_ = 0;
+
+ public:
+  void RequestRenderTargetEviction() { render_target_eviction_requested_ = true; }
+
+ private:
   bool gpu_zone_fine_ = false;
   bool AwaitAllQueueOperationsCompletion() {
     CheckSubmissionFenceAndDeviceLoss(GetCurrentSubmission());
