@@ -28,6 +28,15 @@ REXCVAR_DEFINE_BOOL(ds2_editor_wait_log, false, "DS2",
 REXCVAR_DEFINE_INT32(ds2_editor_force_free_s, 0, "DS2",
                      "Experiment: after N s of continuous 'UI busy' (sub_8239A2E8 = 0), answer 'free' (0 = off)");
 
+REXCVAR_DEFINE_INT32(ds2_editor_open_mode, 0, "DS2",
+                     "Experiment: on the editor black screen open UI menu type 4 ourselves: 1 = like script command "
+                     "130459 (sub_8239A2A8), 2 = like 130461 (sub_8239A2C8), 0 = off");
+REXCVAR_DEFINE_INT32(ds2_editor_open_after_s, 8, "DS2",
+                     "Seconds of the black-screen wait (script polling function 130442) before ds2_editor_open_mode acts");
+extern "C" void __imp__sub_825EFDF0(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_82679B88(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_8239A2A8(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_8239A2C8(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" void __imp__sub_8239A2E8(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" void __imp__sub_8239ABA0(PPCContext& __restrict ctx, uint8_t* base);
 
@@ -77,6 +86,30 @@ REX_HOOK_RAW(sub_8239A2E8) {
         Ld(base, inner + 20), Ld(base, inner + 24), flow, flow ? Ld(base, flow + 84) : 0,
         flow ? Ld(base, flow + 88) : 0, ui ? Ld(base, ui + 108) : 0, ui ? Ld(base, ui + 120) : 0,
         forcing ? " -> FORZADO libre" : "");
+  }
+  {
+    // Black-screen wait streak: sub_8239A2E8 is only polled by the script on that screen (v41 counts).
+    static Clock::time_point streak_start{}, streak_last{};
+    static bool opened = false;
+    if (streak_last == Clock::time_point{} || now - streak_last > std::chrono::seconds(1)) streak_start = now;
+    streak_last = now;
+    const int mode = REXCVAR_GET(ds2_editor_open_mode);
+    if (mode && !opened && now - streak_start >= std::chrono::seconds(REXCVAR_GET(ds2_editor_open_after_s))) {
+      opened = true;
+      const uint32_t g = Ld(base, kGlobal);
+      PPCContext c = ctx;
+      c.r3.u64 = g ? Ld(base, Ld(base, g + 68) + 40) : 0;
+      REXLOG_WARN("[editor] EXPERIMENTO: se abre el menu tipo 4 como la orden {} ({})", mode == 2 ? 130461 : 130459,
+                  mode == 2 ? "sub_8239A2C8" : "sub_8239A2A8");
+      if (mode == 2)
+        __imp__sub_8239A2C8(c, base);
+      else
+        __imp__sub_8239A2A8(c, base);
+      const uint32_t ui = g ? Ld(base, g + 3296) : 0;
+      const uint32_t x = ui ? Ld(base, ui + 116) : 0;
+      REXLOG_WARN("[editor] EXPERIMENTO hecho: ui[116] {:08X} x[16] {:08X} x[20] {:08X} x[24] {:08X}", x,
+                  Ld(base, x + 16), Ld(base, x + 20), Ld(base, x + 24));
+    }
   }
   if (forcing) {
     if (g_forced++ == 0) REXLOG_WARN("[editor] UI ocupada {:.1f} s: se responde 'libre' (ds2_editor_force_free_s)", busy_s);
@@ -165,4 +198,33 @@ REX_HOOK_RAW(sub_825EC618) {
   for (const auto& [k, v] : g_script) line += fmt::format(" {}:{}x={:X}/t{}", k, v.n, v.value, v.type);
   REXLOG_INFO("[editor] guion (id:llamadas=valor/tipo):{}", line);
   g_script.clear();
+}
+
+// v44. Event-script commands (sub_825EFDF0: r4 = call object, vtable[2] returns the command id) - rare, each one
+// logged - and the UI's "open menu of type N" (sub_82679B88). Command 130459 / 130461 open menu type 4 through
+// sub_8239A2A8 / sub_8239A2C8 (sub_82679DC0 / sub_82679D58, they differ only in byte [20] of the menu object: 0 / 1);
+// type 4 is the object in ui[116] that script function 130442 checks every frame on the black screen.
+REX_HOOK_RAW(sub_825EFDF0) {
+  const uint32_t call = ctx.r4.u32, caller = uint32_t(ctx.lr), r3 = ctx.r3.u32, r5 = ctx.r5.u32;
+  uint32_t id = 0;
+  if (REXCVAR_GET(ds2_editor_wait_log)) {
+    if (const uint32_t vt = Ld(base, call)) {
+      if (PPCFunc* getter = rex::runtime::ResolveIndirectFunction(Ld(base, vt + 8))) {
+        PPCContext probe = ctx;
+        probe.r3.u64 = call;
+        getter(probe, base);
+        id = probe.r3.u32;
+      }
+    }
+  }
+  __imp__sub_825EFDF0(ctx, base);
+  if (REXCVAR_GET(ds2_editor_wait_log))
+    REXLOG_INFO("[editor] orden del guion {} (desde {:08X}, r3 {:08X} r5 {:08X}) -> {:08X}", id, caller, r3, r5,
+                ctx.r3.u32);
+}
+REX_HOOK_RAW(sub_82679B88) {
+  const uint32_t type = ctx.r4.u32, caller = uint32_t(ctx.lr);
+  __imp__sub_82679B88(ctx, base);
+  if (REXCVAR_GET(ds2_editor_wait_log))
+    REXLOG_INFO("[editor] UI abre menu tipo {} (desde {:08X})", type, caller);
 }
