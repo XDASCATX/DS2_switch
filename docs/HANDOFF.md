@@ -40,6 +40,7 @@
 | `docs/handoff/` | Журнал работ по этапам и TOML всех версий (`15-ds2.toml.vNN`). |
 | `docs/nfsmw/` | Документы nfsmw-nx (сборка, платформа, глоссарий). |
 | `tests/` | Тесты инструментов. |
+| `audit/` | Хэши и размеры файлов игры владельца (сверка копий, без самих файлов). |
 
 Вне git (по правилам): `assets/` и `out/run/game_root` (файлы игры), `app/generated/` (код из xex), `out/` (сборки,
 релизы `out/app-switch/releases/vNN` с ELF для символизации), исходники Mesa (`DS2_MESA_SRC`, база
@@ -55,8 +56,10 @@ tools/build/build-pc.sh                 # ПК: ds2 + librexgpu-xenos.so
 tools/run/run-pc.sh <tag> <сек> $(cat tools/run/pc-args-example.txt)   # ПК-прогон, логи out/run/logs
 tools/build/package-release.sh <NN>     # releases/vNN + части по 14 МБ для Mac
 ```
-Копия репозитория у владельца: `SW1_ds2/DS2_switch` (git, ветка `diag/switch-level-load`, origin —
-github.com/XDASCATX/DS2_switch); после каждой версии обновляется (`git pull`). Сборки на Mac: `SW1_ds2/switch/vNN/` (`cat part_* > ds2.nro`, сверить sha256). На консоли: `sdmc:/switch/ds2/ds2.nro` +
+Корень проекта у владельца — сама папка `SW1_ds2` на Mac: это и есть репозиторий (ветка `diag/switch-level-load`,
+origin github.com/XDASCATX/DS2_switch), обновляется после каждой версии. Локальные папки там же, вне git
+(`.gitignore`): `DARK.SOULS…/` (игра), `switch/vNN/` (сборки), `ds2_logs/diag_tomlNN` (логи консоли), `backups/`,
+`logs/`, `_xfer/`, `_to_delete/` (на удаление). Сборки на Mac: `SW1_ds2/switch/vNN/` (`cat part_* > ds2.nro`, сверить sha256). На консоли: `sdmc:/switch/ds2/ds2.nro` +
 `ds2.toml`. Логи с консоли — `SW1_ds2/ds2_logs/diag_tomlNN` (ds2_*.log, rex/rex_perfil.log).
 Символизация стеков: `aarch64-none-elf-addr2line -e out/app-switch/releases/vNN/ds2.elf <offset>`.
 Все параметры (cvar) — `docs/handoff/17a-cvars-list.md`; меню L+R+→ — `17-switch-settings-menu.md`.
