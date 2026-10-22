@@ -296,5 +296,5 @@ depth pre-pass), а проверка признавала только `kColorDe
 На ПК (lavapipe) до редактора не доходили: кадры с «Sword & Hilt Armor» в run16/run68 — экраны загрузки.
 
 v37 = v36 + `resolve_dump_dir` (раз в N с все resolve одного кадра сырыми данными + index.txt с регистрами и
-гамма-таблицей; декодер `tools/ds2_resolve_dump.py`, проверен на ПК) + лог memexport-draw. Вариант B TOML —
+гамма-таблицей; декодер `tools/analysis/ds2_resolve_dump.py`, проверен на ПК) + лог memexport-draw. Вариант B TOML —
 `readback_resolve_max_bytes = 0`. Релиз: nro 8af6ce83…, toml 164721d0…, toml.B 12594825….

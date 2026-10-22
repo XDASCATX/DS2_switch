@@ -1,0 +1,116 @@
+# DS2 SotFS → Nintendo Switch: главный handoff
+
+**Текущая версия: v37** (выдана 2026-10-22, ждёт теста на консоли). Следующая версия (v38) начинается только после
+теста v37 и отзыва владельца. Этот файл обновляется после каждой версии: раздел «Состояние», таблица версий,
+список документов.
+
+## 1. Что это
+
+Порт Dark Souls II: Scholar of the First Sin (Xbox 360, TitleID 465307E4) на Nintendo Switch статической рекомпиляцией:
+`Default.xex` → C++ (ReXGlue codegen) → NRO под devkitA64. Графика — эмуляция GPU Xenos через Vulkan на NVK
+(Mesa для Switch). Референс — порт NFSMW (StevensND/nfsmw-nx), см. `docs/nfsmw/`.
+
+Цели (владелец):
+1. Стабильные 30+ кадр/с в реальных сценах при одинаковых частотах, повторяемые замеры.
+2. Рабочий редактор персонажа после кат-сцены со старухами (сейчас — чёрный экран, блокер).
+
+## 2. Правила
+
+- Ветка работы — `diag/switch-level-load`; `main` не трогать.
+- Прошлые версии (сборки и TOML) не менять; `Default.xex` не менять.
+- Игровые файлы, сгенерированный из игры код и бинарники в git не коммитить (`.gitignore`).
+- Не жертвовать правильностью графики ради кадров; целые этапы рендера не выключать без доказательства.
+- Замеры отделять от предположений; «решено» — только после проверки на Switch.
+- Тестовые переключатели — через TOML, не через меню.
+- Общение — по-русски и коротко.
+
+## 3. Структура репозитория
+
+| Путь | Что |
+|---|---|
+| `app/` | Приложение DS2: `main.cpp`, платформа Switch, watchdog/профайлер, захват кадров, скрипт ввода, DLC. `ds2_manifest*.toml` — манифест codegen. |
+| `sdk/` | ReXGlue SDK с правками порта (GPU Vulkan, shared memory, render target cache, ядро, Switch-слой). |
+| `config/` | Overrides для codegen (`ds2_overrides.*.toml`), списки исключений. |
+| `tools/build/` | `env.sh` (все пути и переменные), `build-switch.sh`, `build-pc.sh`, `build-mesa.sh`, `package-release.sh`. |
+| `tools/run/` | `run-pc.sh` — запуск на ПК без экрана; `pc-args-example.txt` — типовые аргументы. |
+| `tools/switch/` | Тулчейн из исходников (`toolchain/`), CMake-тулчейн devkitA64, патчи Mesa (`mesa-switch-ds2-perf.patch`), hbl. |
+| `tools/analysis/` | Разбор логов консоли: `perf.py` (rex_perfil.log), `gaps.py`, `ds2_resolve_dump.py` (дампы resolve → PNG), `cvars.py`, `bnd4.py`, `hdr2spv.py`. |
+| `tools/shaders/` | XenosRecomp-драйвер и DXC-скрипт (исследование своего рендерера). |
+| `tools/*.py` | Инструменты codegen/трассировки (см. `docs/handoff/06-tools-source.md`). |
+| `docs/handoff/` | Журнал работ по этапам и TOML всех версий (`15-ds2.toml.vNN`). |
+| `docs/nfsmw/` | Документы nfsmw-nx (сборка, платформа, глоссарий). |
+| `tests/` | Тесты инструментов. |
+
+Вне git (по правилам): `assets/` и `out/run/game_root` (файлы игры), `app/generated/` (код из xex), `out/` (сборки,
+релизы `out/app-switch/releases/vNN` с ELF для символизации), исходники Mesa (`DS2_MESA_SRC`, база
+`danfromtico/mesa-switch@0ff52079ca9e` + патч из `tools/switch/toolchain`).
+
+## 4. Сборка, запуск, выдача
+
+```
+. tools/build/env.sh                    # пути, DEVKITPRO, rustc 1.91, SDK Mesa
+tools/build/build-mesa.sh <sdk-name>    # только если менялся Mesa
+tools/build/build-switch.sh             # out/app-switch/ds2.nro
+tools/build/build-pc.sh                 # ПК: ds2 + librexgpu-xenos.so
+tools/run/run-pc.sh <tag> <сек> $(cat tools/run/pc-args-example.txt)   # ПК-прогон, логи out/run/logs
+tools/build/package-release.sh <NN>     # releases/vNN + части по 14 МБ для Mac
+```
+На Mac: `SW1_ds2/switch/vNN/` (`cat part_* > ds2.nro`, сверить sha256). На консоли: `sdmc:/switch/ds2/ds2.nro` +
+`ds2.toml`. Логи с консоли — `SW1_ds2/ds2_logs/diag_tomlNN` (ds2_*.log, rex/rex_perfil.log).
+Символизация стеков: `aarch64-none-elf-addr2line -e out/app-switch/releases/vNN/ds2.elf <offset>`.
+Все параметры (cvar) — `docs/handoff/17a-cvars-list.md`; меню L+R+→ — `17-switch-settings-menu.md`.
+
+## 5. Состояние (после v37)
+
+Замеры на консоли (разгон GPU 1228.8 / CPU 2397 МГц):
+- Запуск, вступление, мир — работают. v36: ~8,8 кадр/с в редакторе, GPU ~98 мс/кадр, из них переносы EDRAM ~36 мс,
+  resolve 6,5, текстуры 6,3, остальное — draw игры. Барьеров ~150 на кадр (было ~690).
+- Чёрный экран редактора (diag_toml36): игра в устойчивом состоянии (ничего не грузит), рисует полный кадр
+  (тени, глубина, цепочка яркости FP16, финал 1280×720), ошибок GPU нет. Причина не установлена.
+- v37 = v36 + дампы всех resolve одного кадра раз в 40 с (`resolve_dump_dir`, на SD `dumps37/`), лог memexport.
+  Вариант `ds2.toml.B` — полный readback resolve. Задача теста: дампы с чёрного экрана → найти проход, где кадр
+  становится чёрным (`tools/analysis/ds2_resolve_dump.py dump_NN`).
+- Долгий путь к 30+ кадр/с — свой рендерер (как rexglue-sdk-nx/deko3d): `docs/handoff/18-native-renderer-study.md`.
+
+## 6. Версии
+
+| Версия | Что | Результат на консоли |
+|---|---|---|
+| v1–diag12 | Первый NRO, разбор чёрного экрана после ролика (память ядра, таблицы страниц, стеки) | Тест 21: вход в мир (`11`, `12`) |
+| test13–29 | Диагностические режимы GPU MODE 0…10, FSI, потолки | Узкое место — GPU, переносы EDRAM (`13`, `11`) |
+| v30–v31b | Измерители GPU | Переносы в глубину — главный расход (`16`) |
+| v32 | Не переносить то, что draw перезапишет | ~7,4 кадр/с, цвета верны |
+| v33 | То же для глубины и полноэкранных проходов | ~15 кадр/с в лесу |
+| v34 | UBO напрямую в NVK, оценщик с W | GPFIFO без ожиданий, ~+10 % |
+| v35 | Sparse-буфер, освобождение RT, 2 кадра в полёте, стеки | Памяти хватает; редактор чёрный |
+| v36 | Загрузки в начало отправки, readback ≤64 КБ | Барьеры 690→150; редактор чёрный |
+| v37 | Дампы resolve кадра, лог memexport | Ждёт теста |
+
+TOML каждой версии — `docs/handoff/15-ds2.toml.vNN` (ранние — `11-*`, `14-*`). Сборки — `out/app-switch/releases/`.
+
+## 7. Документы
+
+| Файл | О чём |
+|---|---|
+| `docs/handoff/README.md` | Ранняя передача проекта (до Switch) |
+| `01-status-and-rules.md` | Исходное состояние и правила |
+| `02-host-build.md` | Сборка host-инструмента `rexglue` |
+| `03-xex-and-game-files.md` | `Default.xex` и файлы игры |
+| `04-codegen-run-1.md`, `05-unresolved-analysis.md` | Первый codegen, разбор UnresolvedCall |
+| `06-tools-source.md` | Исходники инструментов и конфигов codegen |
+| `07-next-steps.md`, `08-session-2026-10-19.md` | План и сессия 19.10 (аудит, codegen 2) |
+| `09-first-boot-pc.md` | Первый запуск на ПК (lavapipe), скрипт ввода, захват кадров |
+| `10-switch-build.md` | Тулчейн Switch из исходников, первый NRO |
+| `11-switch-level-load-diag.md` + `11-switch-test-plan*.txt` | Чёрный экран после ролика: тесты 1–25 |
+| `12-switch-first-ingame.md` | Первый вход в мир на Switch |
+| `13-switch-diag-modes.md` | Режимы GPU MODE 0…10 |
+| `16-switch-gpu-optimization.md` | Оптимизация GPU v30–v37 с замерами |
+| `17-switch-settings-menu.md`, `17a-cvars-list.md` | Меню L+R+→ и все cvar |
+| `18-native-renderer-study.md` | Сторонние проекты, XenosRecomp на шейдерах DS2, план своего рендерера |
+| `docs/handoff/data/` | Сводки codegen и трассировок |
+| `docs/nfsmw/` | Документация nfsmw-nx (референс) |
+
+## 8. Следующий шаг
+
+Ждать теста v37 и отзыва. Затем: декодировать `dumps37`, найти проход, дающий чёрный кадр, исправить в v38;
+параллельно — переносы EDRAM (D1x4↔D1x1 p13, ~36 мс).
