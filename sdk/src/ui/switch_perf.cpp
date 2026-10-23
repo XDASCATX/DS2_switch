@@ -1206,4 +1206,18 @@ void RexSwitchPerfSetThreadName(u32 handle, const char* name) {
   }
 }
 
+// DS2 v55: the native renderer's capture combo (L3 + R3). Reads the npad shared memory directly, so it needs
+// no pad configuration of its own (SDL already initialized hid).
+int RexSwitchStickClicksHeld(void) {
+  const uint64_t combo = HidNpadButton_StickL | HidNpadButton_StickR;
+  uint64_t buttons = 0;
+  HidNpadHandheldState hh = {};
+  if (hidGetNpadStatesHandheld(HidNpadIdType_Handheld, &hh, 1)) buttons |= hh.buttons;
+  HidNpadFullKeyState fk = {};
+  if (hidGetNpadStatesFullKey(HidNpadIdType_No1, &fk, 1)) buttons |= fk.buttons;
+  HidNpadJoyDualState jd = {};
+  if (hidGetNpadStatesJoyDual(HidNpadIdType_No1, &jd, 1)) buttons |= jd.buttons;
+  return (buttons & combo) == combo;
+}
+
 }  // extern "C"

@@ -86,11 +86,30 @@ REXCVAR_DEFINE_BOOL(ds2_switch_saltynx, false, "DS2",
                     "Switch: publish FPS/resolution to SaltyNX overlays (Status Monitor) and follow ReverseNX")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+// v55: clocks for the session (through the clock sysmodule, Horizon OC / sys-clk). 0 = leave that clock alone.
+REXCVAR_DEFINE_INT32(ds2_switch_cpu_mhz, 0, "DS2", "Switch: CPU clock for the session in MHz (0 = not touched)")
+    .range(0, 3000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(ds2_switch_gpu_mhz, 0, "DS2", "Switch: GPU clock for the session in MHz (0 = not touched)")
+    .range(0, 2000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(ds2_switch_mem_mhz, 0, "DS2", "Switch: memory clock for the session in MHz (0 = not touched)")
+    .range(0, 4000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+#if defined(__SWITCH__)
+extern "C" void RexSwitchRelojesFijar(unsigned cpu_mhz, unsigned gpu_mhz, unsigned mem_mhz);
+#endif
+
 namespace ds2::watchdog {
 
 void ApplyPlatformSwitches() {
 #if defined(__SWITCH__)
   RexSwitchPerfRequestStackSampling(REXCVAR_GET(ds2_switch_stack_sampling));
+  RexSwitchRelojesFijar(unsigned(REXCVAR_GET(ds2_switch_cpu_mhz)), unsigned(REXCVAR_GET(ds2_switch_gpu_mhz)),
+                        unsigned(REXCVAR_GET(ds2_switch_mem_mhz)));
+  REXLOG_INFO("[ds2] session clocks requested: CPU {} MHz, GPU {} MHz, memory {} MHz (0 = not touched)",
+              REXCVAR_GET(ds2_switch_cpu_mhz), REXCVAR_GET(ds2_switch_gpu_mhz), REXCVAR_GET(ds2_switch_mem_mhz));
 #endif
   ds2::platform::SetSaltyNxBridge(REXCVAR_GET(ds2_switch_saltynx));
   REXLOG_INFO("[ds2] SaltyNX overlay bridge: {}", REXCVAR_GET(ds2_switch_saltynx) ? "on" : "off");

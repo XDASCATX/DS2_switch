@@ -406,6 +406,33 @@ void Habilitar(bool habilitado) {
 
 }  // namespace rex::ui::switch_sysclk
 
+/*
+ * DS2 v55: fixed clocks for the whole session, from the TOML (ds2_switch_cpu_mhz / gpu / mem). The
+ * console starts the game with the stock handheld clocks (CPU 1020, GPU 307.2) and before this they had
+ * to be raised by hand in the overlay every time. Same mechanism as above (SetOverride on the clock
+ * sysmodule), released when the game exits cleanly. 0 = that module is not touched.
+ */
+extern "C" void RexSwitchRelojesFijar(unsigned cpu_mhz, unsigned gpu_mhz, unsigned mem_mhz) {
+  using namespace rex::ui::switch_sysclk;
+  if (!cpu_mhz && !gpu_mhz && !mem_mhz) {
+    return;
+  }
+  if (!Abrir()) {
+    Aviso("[relojes] fijos pedidos en el TOML, pero no hay sysmodule de relojes: se quedan como estan");
+    return;
+  }
+  const unsigned mhz[kModulos] = {cpu_mhz, gpu_mhz, mem_mhz};
+  Result rc[kModulos] = {0, 0, 0};
+  for (unsigned m = 0; m < kModulos; ++m) {
+    if (!mhz[m]) continue;
+    rc[m] = PonerOverride(m, mhz[m] * 1000000u);
+    if (R_SUCCEEDED(rc[m])) g_puesto[m] = true;
+  }
+  std::fprintf(stderr,
+               "[relojes] fijos del TOML: CPU %u MHz (0x%X), GPU %u MHz (0x%X), memoria %u MHz (0x%X); 0 = sin tocar\n",
+               cpu_mhz, (unsigned)rc[0], gpu_mhz, (unsigned)rc[1], mem_mhz, (unsigned)rc[2]);
+}
+
 extern "C" void RexSwitchRelojesReverseHabilitar(int habilitado) {
   rex::ui::switch_sysclk::Habilitar(habilitado != 0);
 }

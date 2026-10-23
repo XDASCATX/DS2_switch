@@ -8,12 +8,18 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <unordered_set>
+#include <pthread.h>
+#include <sys/stat.h>
 #include <unordered_map>
 #include <vector>
 
@@ -73,7 +79,25 @@ REXCVAR_DEFINE_INT32(ds2_native_max_anisotropy, 0, "GPU",
                      "DS2 native renderer (v54): anisotropic filtering cap (0/1 = off; the game's request is capped "
                      "to this)")
     .range(0, 16);
-REXCVAR_DEFINE_BOOL(ds2_native_occlusion_queries, true, "GPU",
+REXCVAR_DEFINE_BOOL(ds2_native_async_pipelines, true, "GPU",
+                    "DS2 native renderer (v55): compile new pipelines on a worker thread; an object whose pipeline is "
+                    "not ready is skipped for those frames instead of freezing the picture (full-screen passes still "
+                    "wait)");
+REXCVAR_DEFINE_INT32(ds2_native_hitch_ms, 100, "GPU",
+                     "DS2 native renderer (v55): log what a frame spent its time on when it takes longer than this "
+                     "(0 = never)")
+    .range(0, 100000);
+REXCVAR_DEFINE_BOOL(ds2_native_capture_combo, true, "GPU",
+                    "DS2 native renderer (v55, Switch): holding L3 + R3 (both sticks pressed) for ~1 s traces the "
+                    "next in-game frame into the log and writes its render targets as images under "
+                    "sdmc:/switch/ds2/native_dump (or ds2_native_dump_dir)");
+REXCVAR_DEFINE_BOOL(ds2_native_pass_barriers, false, "GPU",
+                    "DS2 native renderer (v55): full barrier before every render pass (true = as v51-v54; for "
+                    "checking if something renders wrong without it)");
+REXCVAR_DEFINE_BOOL(ds2_native_early_z, true, "GPU",
+                    "DS2 native renderer (v55): early depth test for pixel shaders without kill / depth output / "
+                    "alpha-dependent coverage (the emulation does the same)");
+REXCVAR_DEFINE_BOOL(ds2_native_occlusion_queries, false, "GPU",
                     "DS2 native renderer (v54): real occlusion queries (Vulkan), the result reaches the game a few "
                     "frames late. false = a fixed 'visible' result as in the emulation (query_occlusion_fake_sample_"
                     "count): glows and flares then show through walls");
@@ -82,6 +106,7 @@ REXCVAR_DECLARE(int32_t, query_occlusion_fake_sample_count);
 
 #if REX_PLATFORM_SWITCH
 extern "C" void RexSwitchPerfCount(unsigned id);  // switch_perf.cpp: 0 = swaps (FPS for the overlay / SaltyNX)
+extern "C" int RexSwitchStickClicksHeld(void);     // switch_perf.cpp: L3 and R3 both held (handheld or pad 1)
 #endif
 
 namespace rex::graphics::native {
@@ -603,6 +628,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t upload_bytes = 0, pipelines = 0, render_passes_begun = 0;
     uint64_t prim_counts[32] = {};
     uint64_t conversions = 0, texture_levels = 0, texture_upload_bytes = 0, submits = 0;
+    uint64_t early_z_draws = 0, draws_pipeline_pending = 0, pipelines_async = 0;
     uint64_t skip_no_vs = 0, skip_no_raster = 0, skip_no_pitch = 0, skip_no_target = 0;
     uint64_t occlusion_begins = 0, occlusion_ends = 0, occlusion_lost = 0, occlusion_visible = 0;
     // CPU time on the command processor thread, microseconds.
@@ -632,7 +658,12 @@ class NativeCommandProcessor final : public CommandProcessor {
   const PipelineLayoutEntry* GetPipelineLayout(uint32_t tv, uint32_t sv, uint32_t tp, uint32_t sp);
   VkDescriptorSetLayout GetTextureSetLayout(bool vertex, uint32_t textures, uint32_t samplers);
   VkPipeline GetPipeline(const PipelineKey& key, VulkanShader::VulkanTranslation* vs,
-                         VulkanShader::VulkanTranslation* ps, VkPipelineLayout layout);
+                         VulkanShader::VulkanTranslation* ps, VkPipelineLayout layout, bool allow_async,
+                         bool& pending_out);
+  VkPipeline CreatePipelineObject(const PipelineKey& key, VkShaderModule vs, VkShaderModule ps,
+                                  VkPipelineLayout layout);
+  static void* PipelineThreadMain(void* self);
+  void StopPipelineThread();
   VkSampler GetSampler(const VulkanShader::SamplerBinding& binding, const xenos::xe_gpu_texture_fetch_t& fetch);
   VkImageView GetTextureView(uint32_t fetch_index, xenos::FetchOpDimension dimension, bool& resolved_out);
   VkImageView GetSwizzleView(std::unordered_map<uint32_t, VkImageView>& views, const NativeImage& image,
@@ -651,9 +682,14 @@ class NativeCommandProcessor final : public CommandProcessor {
   void CollectProfile(FrameSlot& s);
   uint32_t ReadPixel(NativeImage& img, uint32_t x, uint32_t y, VkImageAspectFlags aspect);
   bool Tracing() const {
-    return REXCVAR_GET(ds2_native_dump_swap) > 0 && !dumped_ &&
-           heavy_frames_ + 1 == uint64_t(REXCVAR_GET(ds2_native_dump_swap));
+    return combo_tracing_ || (REXCVAR_GET(ds2_native_dump_swap) > 0 && !dumped_ &&
+                              heavy_frames_ + 1 == uint64_t(REXCVAR_GET(ds2_native_dump_swap)));
   }
+  std::string DumpDir() const;
+  void PollDumpCombo();
+  bool combo_tracing_ = false;   // this frame is traced because the player asked for a capture
+  uint32_t combo_held_frames_ = 0;
+  uint32_t combo_dumps_ = 0;
 
   const VulkanDevice* vulkan_device_ = nullptr;
   PFN_vkCmdBlitImage cmd_blit_image_ = nullptr;
@@ -713,6 +749,27 @@ class NativeCommandProcessor final : public CommandProcessor {
   uint64_t last_log_frame_ = 0;
   uint64_t draws_this_frame_ = 0, heavy_frames_ = 0;
   bool dumped_ = false;
+
+  // Async pipeline compilation (v55).
+  struct PipelineJob {
+    uint64_t hash;
+    PipelineKey key;
+    VkShaderModule vs, ps;
+    VkPipelineLayout layout;
+  };
+  std::mutex pipeline_mutex_;
+  std::condition_variable pipeline_cv_;
+  std::deque<PipelineJob> pipeline_jobs_;
+  std::vector<std::pair<uint64_t, VkPipeline>> pipeline_done_;
+  std::atomic<uint32_t> pipeline_done_count_{0};
+  std::unordered_set<uint64_t> pipeline_pending_;
+  pthread_t pipeline_thread_{};
+  bool pipeline_thread_started_ = false;
+  bool pipeline_quit_ = false;
+  std::atomic<uint64_t> pipeline_async_us_{0};
+  // Hitch report: the counters at the previous swap.
+  uint64_t hitch_prev_[6] = {};
+  uint64_t hitch_prev_pipelines_ = 0;
 
   // Occlusion queries: last measured sample count per guest result address; the active query index or -1.
   std::unordered_map<uint32_t, uint32_t> occlusion_results_;
@@ -864,6 +921,11 @@ bool NativeCommandProcessor::SetupContext() {
     const uint32_t bits = family < qf_count ? qf[family].timestampValidBits : 0;
     if (bits && pdp.limits.timestampPeriod > 0) {
       timestamp_period_ns_ = pdp.limits.timestampPeriod;
+#if REX_PLATFORM_SWITCH
+      // Measured on the console (v54): NVK reports 1 ns, but the Tegra X1 GPU timer runs at 614.4 MHz (the
+      // NVN conversion is ticks * 625 / 384): with 1 ns the GPU time came out 1.63x short of the frame time.
+      if (timestamp_period_ns_ == 1.0) timestamp_period_ns_ = 625.0 / 384.0;
+#endif
       timestamp_mask_ = bits >= 64 ? ~uint64_t(0) : ((uint64_t(1) << bits) - 1);
       profiling_ = true;
       for (FrameSlot& s : slots_) {
@@ -942,7 +1004,10 @@ void NativeCommandProcessor::ShutdownContext() {
   for (auto m : convert_fs_) {
     if (m) dfn().vkDestroyShaderModule(dev, m, nullptr);
   }
-  for (auto& [k, p] : pipelines_) dfn().vkDestroyPipeline(dev, p, nullptr);
+  StopPipelineThread();
+  for (auto& [k, p] : pipelines_) {
+    if (p) dfn().vkDestroyPipeline(dev, p, nullptr);
+  }
   for (auto& [k, f] : framebuffers_) dfn().vkDestroyFramebuffer(dev, f, nullptr);
   for (auto& [k, p] : render_passes_) dfn().vkDestroyRenderPass(dev, p, nullptr);
   for (auto& [k, s] : samplers_) dfn().vkDestroySampler(dev, s, nullptr);
@@ -1750,23 +1815,119 @@ const NativeCommandProcessor::PipelineLayoutEntry* NativeCommandProcessor::GetPi
 }
 
 VkPipeline NativeCommandProcessor::GetPipeline(const PipelineKey& key, VulkanShader::VulkanTranslation* vs,
-                                               VulkanShader::VulkanTranslation* ps, VkPipelineLayout layout) {
+                                               VulkanShader::VulkanTranslation* ps, VkPipelineLayout layout,
+                                               bool allow_async, bool& pending_out) {
+  pending_out = false;
+  if (pipeline_done_count_.load(std::memory_order_acquire)) {
+    std::lock_guard<std::mutex> lock(pipeline_mutex_);
+    for (const auto& [h, p] : pipeline_done_) {
+      pipelines_[h] = p;
+      pipeline_pending_.erase(h);
+    }
+    pipeline_done_.clear();
+    pipeline_done_count_.store(0, std::memory_order_release);
+  }
   const uint64_t hash = XXH3_64bits(&key, sizeof(key));
   auto it = pipelines_.find(hash);
   if (it != pipelines_.end()) return it->second;
+  const VkShaderModule vsm = vs->shader_module(), psm = ps ? ps->shader_module() : VK_NULL_HANDLE;
+  if (pipeline_pending_.count(hash)) {
+    if (allow_async) {
+      pending_out = true;
+      return VK_NULL_HANDLE;
+    }
+    // Needed now (full-screen pass): wait for the worker.
+    ScopedUs timer(stats_.us_pipelines);
+    std::unique_lock<std::mutex> lock(pipeline_mutex_);
+    for (;;) {
+      for (const auto& [h, p] : pipeline_done_) {
+        pipelines_[h] = p;
+        pipeline_pending_.erase(h);
+      }
+      pipeline_done_.clear();
+      pipeline_done_count_.store(0, std::memory_order_release);
+      auto found = pipelines_.find(hash);
+      if (found != pipelines_.end()) return found->second;
+      pipeline_cv_.wait_for(lock, std::chrono::milliseconds(1));
+    }
+  }
+  if (allow_async && REXCVAR_GET(ds2_native_async_pipelines)) {
+    if (!pipeline_thread_started_) {
+      pthread_attr_t attr;
+      pthread_attr_init(&attr);
+      pthread_attr_setstacksize(&attr, 4 << 20);  // the shader compiler recurses deeply
+      pipeline_thread_started_ = pthread_create(&pipeline_thread_, &attr, &PipelineThreadMain, this) == 0;
+      pthread_attr_destroy(&attr);
+    }
+    if (pipeline_thread_started_) {
+      {
+        std::lock_guard<std::mutex> lock(pipeline_mutex_);
+        pipeline_jobs_.push_back({hash, key, vsm, psm, layout});
+      }
+      pipeline_cv_.notify_all();
+      pipeline_pending_.insert(hash);
+      ++stats_.pipelines_async;
+      pending_out = true;
+      return VK_NULL_HANDLE;
+    }
+  }
   ScopedUs timer(stats_.us_pipelines);
+  VkPipeline pipeline = CreatePipelineObject(key, vsm, psm, layout);
+  ++stats_.pipelines;
+  pipelines_.emplace(hash, pipeline);
+  return pipeline;
+}
 
+void* NativeCommandProcessor::PipelineThreadMain(void* param) {
+  auto* self = static_cast<NativeCommandProcessor*>(param);
+  for (;;) {
+    PipelineJob job;
+    {
+      std::unique_lock<std::mutex> lock(self->pipeline_mutex_);
+      self->pipeline_cv_.wait(lock, [self] { return self->pipeline_quit_ || !self->pipeline_jobs_.empty(); });
+      if (self->pipeline_quit_) return nullptr;
+      job = self->pipeline_jobs_.front();
+      self->pipeline_jobs_.pop_front();
+    }
+    const uint64_t start = NowUs();
+    VkPipeline p = self->CreatePipelineObject(job.key, job.vs, job.ps, job.layout);
+    self->pipeline_async_us_.fetch_add(NowUs() - start, std::memory_order_relaxed);
+    {
+      std::lock_guard<std::mutex> lock(self->pipeline_mutex_);
+      self->pipeline_done_.emplace_back(job.hash, p);
+      self->pipeline_done_count_.store(uint32_t(self->pipeline_done_.size()), std::memory_order_release);
+    }
+    self->pipeline_cv_.notify_all();
+  }
+}
+
+void NativeCommandProcessor::StopPipelineThread() {
+  if (!pipeline_thread_started_) return;
+  {
+    std::lock_guard<std::mutex> lock(pipeline_mutex_);
+    pipeline_quit_ = true;
+    pipeline_jobs_.clear();
+  }
+  pipeline_cv_.notify_all();
+  pthread_join(pipeline_thread_, nullptr);
+  pipeline_thread_started_ = false;
+  for (const auto& [h, p] : pipeline_done_) pipelines_[h] = p;
+  pipeline_done_.clear();
+}
+
+VkPipeline NativeCommandProcessor::CreatePipelineObject(const PipelineKey& key, VkShaderModule vs_module,
+                                                        VkShaderModule ps_module, VkPipelineLayout layout) {
   VkPipelineShaderStageCreateInfo stages[2] = {};
   uint32_t stage_count = 0;
   stages[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
   stages[stage_count].stage = VK_SHADER_STAGE_VERTEX_BIT;
-  stages[stage_count].module = vs->shader_module();
+  stages[stage_count].module = vs_module;
   stages[stage_count].pName = "main";
   ++stage_count;
-  if (ps) {
+  if (ps_module) {
     stages[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[stage_count].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[stage_count].module = ps->shader_module();
+    stages[stage_count].module = ps_module;
     stages[stage_count].pName = "main";
     ++stage_count;
   }
@@ -1846,8 +2007,6 @@ VkPipeline NativeCommandProcessor::GetPipeline(const PipelineKey& key, VulkanSha
     REXGPU_ERROR("[native] pipeline creation failed (vs {:016X} ps {:016X})", key.vs_hash, key.ps_hash);
     pipeline = VK_NULL_HANDLE;
   }
-  ++stats_.pipelines;
-  pipelines_.emplace(hash, pipeline);
   return pipeline;
 }
 
@@ -2233,7 +2392,18 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       ps_mod.pixel.param_gen_interpolator = ps_param_gen_pos;
       ps_mod.pixel.param_gen_point = prim_type == xenos::PrimitiveType::kPointList ? 1 : 0;
     }
-    ps_mod.pixel.depth_stencil_mode = SpirvShaderTranslator::Modification::DepthStencilMode::kNoModifiers;
+    // v55: early depth/stencil tests (as the emulation's pipeline cache does): without this every pixel shader
+    // carries the dynamic alpha test (OpKill) and alpha to coverage code, which forces late Z, so hidden
+    // fragments are shaded too.
+    using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
+    if (!ps->is_ucode_analyzed()) ps->AnalyzeUcode(ucode_disasm_buffer_);
+    ps_mod.pixel.depth_stencil_mode =
+        REXCVAR_GET(ds2_native_early_z) && ps->implicit_early_z_write_allowed() &&
+                (!ps->writes_color_target(0) ||
+                 !draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>()))
+            ? DepthStencilMode::kEarlyHint
+            : DepthStencilMode::kNoModifiers;
+    if (ps_mod.pixel.depth_stencil_mode == DepthStencilMode::kEarlyHint) ++stats_.early_z_draws;
   }
   auto* vst = static_cast<VulkanShader::VulkanTranslation*>(vs->GetOrCreateTranslation(vs_mod.value));
   auto* pst = ps ? static_cast<VulkanShader::VulkanTranslation*>(ps->GetOrCreateTranslation(ps_mod.value)) : nullptr;
@@ -2393,7 +2563,14 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   key.depth_clamp = regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable ? 1 : 0;
   key.texture_layout = uint32_t(vs_textures.size()) | (uint32_t(vs_samplers.size()) << 8) |
                        (uint32_t(ps_textures.size()) << 16) | (uint32_t(ps_samplers.size()) << 24);
-  VkPipeline pipeline = GetPipeline(key, vst, pst, layout->layout);
+  // Full-screen passes (rectangles, a few vertices) wait for their pipeline: skipping one would flash the frame.
+  const bool allow_async = prim_type != xenos::PrimitiveType::kRectangleList && index_count > 6;
+  bool pipeline_pending = false;
+  VkPipeline pipeline = GetPipeline(key, vst, pst, layout->layout, allow_async, pipeline_pending);
+  if (pipeline_pending) {
+    ++stats_.draws_pipeline_pending;
+    return true;
+  }
   if (!pipeline) {
     ++stats_.draws_failed;
     return true;
@@ -2744,7 +2921,11 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       framebuffers_.emplace(fb_key, fb);
       for (uint32_t i = 0; i < n; ++i) fb_by_view_.emplace(views[i], fb_key);
     }
-    Barrier();
+    // v55: no full barrier between two render passes. Every copy, clear, conversion and upload already ends
+    // with one, and textures never sample a render target directly (resolves copy it), so only attachment
+    // after attachment remains, which the GPU keeps in order. Each NVK barrier is a wait-for-idle plus cache
+    // flushes (~50 per frame in DS2).
+    if (REXCVAR_GET(ds2_native_pass_barriers)) Barrier();
     if (profiling_) {
       VkFormat cf[4];
       for (uint32_t i = 0; i < color_count; ++i) cf[i] = color_rts[i]->format;
@@ -2777,11 +2958,11 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     ++stats_.render_passes_begun;
   }
 
-  if (Tracing() && !REXCVAR_GET(ds2_native_dump_dir).empty()) {
+  if (Tracing() && !DumpDir().empty()) {
     // Shader disassembly of the traced frame, one file per shader.
     for (VulkanShader* sh : {vs, ps}) {
       if (!sh) continue;
-      const std::string path = fmt::format("{}/shader_{:016X}_{}.txt", REXCVAR_GET(ds2_native_dump_dir),
+      const std::string path = fmt::format("{}/shader_{:016X}_{}.txt", DumpDir(),
                                            sh->ucode_data_hash(), sh->type() == xenos::ShaderType::kVertex ? "vs" : "ps");
       if (FILE* f = std::fopen(path.c_str(), "wb")) {
         std::fwrite(sh->ucode_disassembly().data(), 1, sh->ucode_disassembly().size(), f);
@@ -3180,8 +3361,23 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   ++stats_.swaps;
   {
     const uint64_t now = NowUs();
-    if (last_swap_us_) stats_.us_frame += now - last_swap_us_;
+    const uint64_t frame_us = last_swap_us_ ? now - last_swap_us_ : 0;
+    if (last_swap_us_) stats_.us_frame += frame_us;
     last_swap_us_ = now;
+    const uint64_t cur[6] = {stats_.us_fence_wait, stats_.us_draws, stats_.us_textures, stats_.us_pipelines,
+                             stats_.us_copies, stats_.texture_uploads};
+    const int32_t hitch_ms = REXCVAR_GET(ds2_native_hitch_ms);
+    if (hitch_ms > 0 && frame_us > uint64_t(hitch_ms) * 1000 && draws_this_frame_ > 0) {
+      REXGPU_WARN("[native] hitch: frame took {:.1f} ms ({} draws): waiting for the GPU {:.1f}, draws {:.1f} "
+                  "(textures {:.1f}, {} uploads; shaders+pipelines {:.1f}), resolves {:.1f}; outside the command "
+                  "processor {:.1f} ms",
+                  frame_us / 1000.0, draws_this_frame_, (cur[0] - hitch_prev_[0]) / 1000.0,
+                  (cur[1] - hitch_prev_[1]) / 1000.0, (cur[2] - hitch_prev_[2]) / 1000.0, cur[5] - hitch_prev_[5],
+                  (cur[3] - hitch_prev_[3]) / 1000.0, (cur[4] - hitch_prev_[4]) / 1000.0,
+                  (int64_t(frame_us) - int64_t(cur[0] - hitch_prev_[0]) - int64_t(cur[1] - hitch_prev_[1]) -
+                   int64_t(cur[4] - hitch_prev_[4])) / 1000.0);
+    }
+    std::memcpy(hitch_prev_, cur, sizeof(cur));
   }
 #if REX_PLATFORM_SWITCH
   RexSwitchPerfCount(0);
@@ -3298,13 +3494,46 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   LogStats();
   EvictTextures();
   // Development dump: at the N-th frame with more than 200 draws (in game, not menus).
-  if (draws_this_frame_ > 200) ++heavy_frames_;
+  const bool heavy = draws_this_frame_ > 200;
+  if (heavy) ++heavy_frames_;
   draws_this_frame_ = 0;
   if (REXCVAR_GET(ds2_native_dump_swap) > 0 && heavy_frames_ == uint64_t(REXCVAR_GET(ds2_native_dump_swap)) &&
-      !dumped_ && !REXCVAR_GET(ds2_native_dump_dir).empty()) {
+      !dumped_ && !DumpDir().empty()) {
     dumped_ = true;
     DumpImages();
   }
+  // v55: capture on request (hold both sticks pressed, L3 + R3, for about a second): the next in-game frame is
+  // traced into the log and its render targets are written as images.
+  if (combo_tracing_ && heavy) {
+    combo_tracing_ = false;
+    DumpImages();
+    REXGPU_WARN("[native] capture {} done (trace above, images in {})", combo_dumps_, DumpDir());
+  }
+  PollDumpCombo();
+}
+
+std::string NativeCommandProcessor::DumpDir() const {
+  std::string d = REXCVAR_GET(ds2_native_dump_dir);
+#if REX_PLATFORM_SWITCH
+  if (d.empty()) d = "sdmc:/switch/ds2/native_dump";
+#endif
+  if (!d.empty() && combo_dumps_) d += fmt::format("/capture_{:02}", combo_dumps_);
+  return d;
+}
+
+void NativeCommandProcessor::PollDumpCombo() {
+#if REX_PLATFORM_SWITCH
+  if (!REXCVAR_GET(ds2_native_capture_combo) || combo_tracing_) return;
+  combo_held_frames_ = RexSwitchStickClicksHeld() ? combo_held_frames_ + 1 : 0;
+  if (combo_held_frames_ == 20 && combo_dumps_ < 20) {
+    ++combo_dumps_;
+    const std::string dir = DumpDir();
+    mkdir("sdmc:/switch/ds2/native_dump", 0777);
+    mkdir(dir.c_str(), 0777);
+    combo_tracing_ = true;
+    REXGPU_WARN("[native] capture {} requested (L3+R3): tracing the next in-game frame into {}", combo_dumps_, dir);
+  }
+#endif
 }
 
 uint32_t NativeCommandProcessor::ReadPixel(NativeImage& img, uint32_t x, uint32_t y, VkImageAspectFlags aspect) {
@@ -3457,14 +3686,42 @@ void NativeCommandProcessor::DumpImages() {
     dfn().vkUnmapMemory(dev, mem);
     dfn().vkDestroyBuffer(dev, buf, nullptr);
     dfn().vkFreeMemory(dev, mem, nullptr);
-    const std::string path = REXCVAR_GET(ds2_native_dump_dir) + "/" + name + ".ppm";
+    const std::string path = DumpDir() + "/" + name + ".ppm";
+    // On the console the images are halved when wide (SD card time and space).
+    uint32_t step = 1;
+#if REX_PLATFORM_SWITCH
+    if (img->width > 800) step = 2;
+#endif
+    uint32_t ow = img->width / step, oh = img->height / step;
+    // Render targets of unknown height are 2048 tall: keep only the rows that were drawn (non-black).
+    uint32_t last_row = 0;
+    for (uint32_t y = 0; y < img->height; ++y) {
+      const uint8_t* row = rgb.data() + size_t(y) * img->width * 3;
+      for (uint32_t x = 0; x < img->width * 3; ++x) {
+        if (row[x]) {
+          last_row = y;
+          break;
+        }
+      }
+    }
+    oh = std::max<uint32_t>(1, std::min(oh, (last_row + step) / step));
     if (FILE* f = std::fopen(path.c_str(), "wb")) {
-      std::fprintf(f, "P6\n%u %u\n255\n", img->width, img->height);
-      std::fwrite(rgb.data(), 1, rgb.size(), f);
+      std::fprintf(f, "P6\n%u %u\n255\n", ow, oh);
+      if (step == 1) {
+        std::fwrite(rgb.data(), 1, size_t(ow) * oh * 3, f);
+      } else {
+        std::vector<uint8_t> small(size_t(ow) * oh * 3);
+        for (uint32_t y = 0; y < oh; ++y) {
+          for (uint32_t x = 0; x < ow; ++x) {
+            std::memcpy(&small[(size_t(y) * ow + x) * 3], &rgb[(size_t(y * step) * img->width + x * step) * 3], 3);
+          }
+        }
+        std::fwrite(small.data(), 1, small.size(), f);
+      }
       std::fclose(f);
     }
   }
-  REXGPU_INFO("[native] dumped {} images to {}", list.size(), REXCVAR_GET(ds2_native_dump_dir));
+  REXGPU_INFO("[native] dumped {} images to {}", list.size(), DumpDir());
 }
 
 void NativeCommandProcessor::LogStats() {
@@ -3485,6 +3742,10 @@ void NativeCommandProcessor::LogStats() {
   for (uint32_t i = 0; i < 32; ++i) {
     if (stats_.prim_counts[i]) prims += fmt::format(" {}:{:.0f}", i, stats_.prim_counts[i] / n);
   }
+  REXGPU_INFO("[native] early-z draws per frame: {:.0f} | pipelines: {} new on the worker ({:.1f} ms of compile), "
+              "{:.1f} draws per frame skipped waiting for one",
+              stats_.early_z_draws / n, stats_.pipelines_async, pipeline_async_us_.exchange(0) / 1000.0,
+              stats_.draws_pipeline_pending / n);
   REXGPU_INFO("[native] primitive types per frame:{} | skipped: no vertex shader {:.1f}, no rasterization {:.1f}, "
               "no pitch {:.1f}, no target {:.1f}",
               prims, stats_.skip_no_vs / n, stats_.skip_no_raster / n, stats_.skip_no_pitch / n,
@@ -3520,6 +3781,7 @@ void NativeCommandProcessor::LogStats() {
   }
   const uint64_t pipelines = stats_.pipelines, swaps = stats_.swaps, presented = stats_.swaps_presented;
   stats_ = Stats();
+  std::memset(hitch_prev_, 0, sizeof(hitch_prev_));
   stats_.pipelines = pipelines;
   stats_.swaps = swaps;
   stats_.swaps_presented = presented;
