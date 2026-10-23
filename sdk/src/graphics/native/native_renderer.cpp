@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -62,6 +63,22 @@ REXCVAR_DEFINE_BOOL(ds2_native_gamma_ramp, true, "GPU",
 REXCVAR_DEFINE_BOOL(ds2_native_textures, true, "GPU",
                     "DS2 native renderer: load guest textures (false = a white 1x1 texture everywhere, for "
                     "checking geometry)");
+REXCVAR_DEFINE_BOOL(ds2_native_gpu_profile, false, "GPU",
+                    "DS2 native renderer (v54): GPU timestamps around every render pass, resolve, clear and upload; "
+                    "the GPU time per frame and the most expensive pass kinds are logged with the statistics");
+REXCVAR_DEFINE_BOOL(ds2_native_mips, true, "GPU",
+                    "DS2 native renderer (v54): load the mip levels of guest textures (false = base level only, as "
+                    "v51-v53)");
+REXCVAR_DEFINE_INT32(ds2_native_max_anisotropy, 0, "GPU",
+                     "DS2 native renderer (v54): anisotropic filtering cap (0/1 = off; the game's request is capped "
+                     "to this)")
+    .range(0, 16);
+REXCVAR_DEFINE_BOOL(ds2_native_occlusion_queries, true, "GPU",
+                    "DS2 native renderer (v54): real occlusion queries (Vulkan), the result reaches the game a few "
+                    "frames late. false = a fixed 'visible' result as in the emulation (query_occlusion_fake_sample_"
+                    "count): glows and flares then show through walls");
+
+REXCVAR_DECLARE(int32_t, query_occlusion_fake_sample_count);
 
 #if REX_PLATFORM_SWITCH
 extern "C" void RexSwitchPerfCount(unsigned id);  // switch_perf.cpp: 0 = swaps (FPS for the overlay / SaltyNX)
@@ -324,6 +341,7 @@ struct NativeImage {
   VkImageView stencil_view = VK_NULL_HANDLE;  // stencil aspect only, for sampling
   VkFormat format = VK_FORMAT_UNDEFINED;
   uint32_t width = 0, height = 0;
+  uint32_t levels = 1;
   bool depth = false;
   bool initialized = false;  // transitioned to GENERAL
 };
@@ -524,6 +542,7 @@ class NativeCommandProcessor final : public CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count, IndexBufferInfo* index_buffer_info,
                  bool major_mode_explicit) override;
   bool IssueCopy() override;
+  bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet, uint32_t count) override;
 
  private:
   struct FrameSlot {
@@ -542,7 +561,18 @@ class NativeCommandProcessor final : public CommandProcessor {
     std::vector<std::pair<VkImage, VkDeviceMemory>> deferred_destroy;
     std::vector<VkImageView> deferred_views;
     std::vector<VkFramebuffer> deferred_framebuffers;
+    // GPU profile: timestamp i starts segment i (label query_labels[i], draws seg_draws[i]).
+    VkQueryPool query_pool = VK_NULL_HANDLE;
+    uint32_t queries = 0;
+    std::vector<uint16_t> query_labels;
+    std::vector<uint32_t> seg_draws;
+    // Occlusion queries recorded in this buffer: (guest sample count address, query index).
+    VkQueryPool occlusion_pool = VK_NULL_HANDLE;
+    uint32_t occlusion_used = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> occlusion_pending;
   };
+  static constexpr uint32_t kMaxOcclusionQueries = 512;
+  static constexpr uint32_t kMaxQueries = 2048;
   struct PipelineLayoutEntry {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout textures_vertex = VK_NULL_HANDLE;
@@ -572,6 +602,16 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t texture_uploads = 0, texture_unsupported = 0, texture_from_resolve = 0;
     uint64_t upload_bytes = 0, pipelines = 0, render_passes_begun = 0;
     uint64_t prim_counts[32] = {};
+    uint64_t conversions = 0, texture_levels = 0, texture_upload_bytes = 0, submits = 0;
+    uint64_t skip_no_vs = 0, skip_no_raster = 0, skip_no_pitch = 0, skip_no_target = 0;
+    uint64_t occlusion_begins = 0, occlusion_ends = 0, occlusion_lost = 0, occlusion_visible = 0;
+    // CPU time on the command processor thread, microseconds.
+    uint64_t us_fence_wait = 0, us_draws = 0, us_textures = 0, us_pipelines = 0, us_copies = 0, us_frame = 0;
+  };
+  struct ProfileLabel {
+    std::string name;
+    double ms = 0;
+    uint64_t count = 0, draws = 0;
   };
 
   const VulkanDevice* device() const { return vulkan_device_; }
@@ -583,7 +623,8 @@ class NativeCommandProcessor final : public CommandProcessor {
   uint8_t* Upload(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset_out);
   void Barrier();
   void EndRenderPass();
-  bool CreateImage(NativeImage& img, VkFormat format, uint32_t w, uint32_t h, bool depth, VkImageUsageFlags usage);
+  bool CreateImage(NativeImage& img, VkFormat format, uint32_t w, uint32_t h, bool depth, VkImageUsageFlags usage,
+                   uint32_t levels = 1);
   void DestroyImage(NativeImage& img, bool deferred);
   void EnsureGeneral(NativeImage& img);
   NativeImage* GetRenderTarget(uint32_t base, uint32_t pitch, uint32_t format, bool depth, uint32_t height_hint);
@@ -604,6 +645,10 @@ class NativeCommandProcessor final : public CommandProcessor {
   void LogStats();
   void DumpImages();
   void EvictTextures();
+  // GPU profile: a timestamp that ends the current segment and starts one labelled `label`.
+  void Mark(const std::string& label);
+  void MarkPass(const VkFormat* color_formats, uint32_t color_count, VkFormat depth_format, uint32_t w, uint32_t h);
+  void CollectProfile(FrameSlot& s);
   uint32_t ReadPixel(NativeImage& img, uint32_t x, uint32_t y, VkImageAspectFlags aspect);
   bool Tracing() const {
     return REXCVAR_GET(ds2_native_dump_swap) > 0 && !dumped_ &&
@@ -668,6 +713,36 @@ class NativeCommandProcessor final : public CommandProcessor {
   uint64_t last_log_frame_ = 0;
   uint64_t draws_this_frame_ = 0, heavy_frames_ = 0;
   bool dumped_ = false;
+
+  // Occlusion queries: last measured sample count per guest result address; the active query index or -1.
+  std::unordered_map<uint32_t, uint32_t> occlusion_results_;
+  int32_t occlusion_active_ = -1;
+  bool occlusion_unmeasured_ = false;
+  void EndOcclusionQuery(uint32_t result_address);
+
+  // GPU profile.
+  bool profiling_ = false;
+  double timestamp_period_ns_ = 1.0;
+  uint64_t timestamp_mask_ = ~uint64_t(0);
+  std::vector<ProfileLabel> profile_labels_;
+  std::unordered_map<std::string, uint16_t> profile_label_ids_;
+  double profile_gpu_ms_ = 0;      // sum of command buffer spans
+  uint64_t profile_buffers_ = 0;   // command buffers measured
+  uint64_t last_swap_us_ = 0;
+};
+
+uint64_t NowUs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+
+// Adds the time of a scope to a counter.
+struct ScopedUs {
+  uint64_t& counter;
+  uint64_t start;
+  explicit ScopedUs(uint64_t& c) : counter(c), start(NowUs()) {}
+  ~ScopedUs() { counter += NowUs() - start; }
 };
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -768,6 +843,45 @@ bool NativeCommandProcessor::SetupContext() {
     if (dfn().vkCreateDescriptorPool(dev, &dpci, nullptr, &s.descriptor_pool) != VK_SUCCESS) return false;
   }
 
+  for (FrameSlot& s : slots_) {
+    VkQueryPoolCreateInfo qci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    qci.queryType = VK_QUERY_TYPE_OCCLUSION;
+    qci.queryCount = kMaxOcclusionQueries;
+    if (dfn().vkCreateQueryPool(dev, &qci, nullptr, &s.occlusion_pool) != VK_SUCCESS) {
+      s.occlusion_pool = VK_NULL_HANDLE;
+    }
+  }
+
+  if (REXCVAR_GET(ds2_native_gpu_profile)) {
+    const auto& ifn2 = vulkan_device_->vulkan_instance()->functions();
+    VkPhysicalDeviceProperties pdp;
+    ifn2.vkGetPhysicalDeviceProperties(vulkan_device_->physical_device(), &pdp);
+    uint32_t qf_count = 0;
+    ifn2.vkGetPhysicalDeviceQueueFamilyProperties(vulkan_device_->physical_device(), &qf_count, nullptr);
+    std::vector<VkQueueFamilyProperties> qf(qf_count);
+    ifn2.vkGetPhysicalDeviceQueueFamilyProperties(vulkan_device_->physical_device(), &qf_count, qf.data());
+    const uint32_t family = vulkan_device_->queue_family_graphics_compute();
+    const uint32_t bits = family < qf_count ? qf[family].timestampValidBits : 0;
+    if (bits && pdp.limits.timestampPeriod > 0) {
+      timestamp_period_ns_ = pdp.limits.timestampPeriod;
+      timestamp_mask_ = bits >= 64 ? ~uint64_t(0) : ((uint64_t(1) << bits) - 1);
+      profiling_ = true;
+      for (FrameSlot& s : slots_) {
+        VkQueryPoolCreateInfo qci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qci.queryCount = kMaxQueries;
+        if (dfn().vkCreateQueryPool(dev, &qci, nullptr, &s.query_pool) != VK_SUCCESS) {
+          profiling_ = false;
+          break;
+        }
+        s.query_labels.reserve(kMaxQueries);
+        s.seg_draws.reserve(kMaxQueries);
+      }
+    }
+    REXGPU_INFO("[native] GPU profile {}: timestamp bits {}, period {} ns", profiling_ ? "on" : "unavailable", bits,
+                pdp.limits.timestampPeriod);
+  }
+
   if (!BeginFrame()) return false;
   // 1x1 white texture for fetches that cannot be served.
   if (!CreateImage(white_, VK_FORMAT_R8G8B8A8_UNORM, 1, 1, false,
@@ -841,6 +955,8 @@ void NativeCommandProcessor::ShutdownContext() {
       dfn().vkDestroyImage(dev, i, nullptr);
       dfn().vkFreeMemory(dev, m, nullptr);
     }
+    if (s.query_pool) dfn().vkDestroyQueryPool(dev, s.query_pool, nullptr);
+    if (s.occlusion_pool) dfn().vkDestroyQueryPool(dev, s.occlusion_pool, nullptr);
     if (s.descriptor_pool) dfn().vkDestroyDescriptorPool(dev, s.descriptor_pool, nullptr);
     if (s.upload) dfn().vkDestroyBuffer(dev, s.upload, nullptr);
     if (s.upload_memory) dfn().vkFreeMemory(dev, s.upload_memory, nullptr);
@@ -859,10 +975,23 @@ bool NativeCommandProcessor::BeginFrame() {
   FrameSlot& s = slot();
   const VkDevice dev = vulkan_device_->device();
   if (s.submitted) {
-    dfn().vkWaitForFences(dev, 1, &s.fence, VK_TRUE, UINT64_MAX);
+    {
+      ScopedUs t(stats_.us_fence_wait);
+      dfn().vkWaitForFences(dev, 1, &s.fence, VK_TRUE, UINT64_MAX);
+    }
     dfn().vkResetFences(dev, 1, &s.fence);
     s.submitted = false;
+    CollectProfile(s);
+    for (const auto& [address, index] : s.occlusion_pending) {
+      uint64_t samples = 0;
+      if (dfn().vkGetQueryPoolResults(dev, s.occlusion_pool, index, 1, sizeof(samples), &samples, sizeof(samples),
+                                      VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+        occlusion_results_[address] = uint32_t(std::min<uint64_t>(samples, 0xFFFFFFFFu));
+      }
+    }
   }
+  s.occlusion_pending.clear();
+  s.occlusion_used = 0;
   for (VkFramebuffer fb : s.deferred_framebuffers) dfn().vkDestroyFramebuffer(dev, fb, nullptr);
   s.deferred_framebuffers.clear();
   for (VkImageView v : s.deferred_views) dfn().vkDestroyImageView(dev, v, nullptr);
@@ -894,13 +1023,99 @@ bool NativeCommandProcessor::BeginFrame() {
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   if (dfn().vkBeginCommandBuffer(s.cmd, &bi) != VK_SUCCESS) return false;
   frame_open_ = true;
+  s.queries = 0;
+  s.query_labels.clear();
+  s.seg_draws.clear();
+  if (s.occlusion_pool) dfn().vkCmdResetQueryPool(s.cmd, s.occlusion_pool, 0, kMaxOcclusionQueries);
+  if (profiling_ && s.query_pool) {
+    dfn().vkCmdResetQueryPool(s.cmd, s.query_pool, 0, kMaxQueries);
+    Mark("other (between passes)");
+  }
   return true;
+}
+
+void NativeCommandProcessor::Mark(const std::string& label) {
+  if (!profiling_ || !frame_open_) return;
+  FrameSlot& s = slot();
+  if (!s.query_pool || s.queries + 1 >= kMaxQueries) return;  // one query kept for the end of the buffer
+  uint16_t id;
+  auto it = profile_label_ids_.find(label);
+  if (it != profile_label_ids_.end()) {
+    id = it->second;
+  } else {
+    id = uint16_t(profile_labels_.size());
+    profile_labels_.push_back({label});
+    profile_label_ids_.emplace(label, id);
+  }
+  dfn().vkCmdWriteTimestamp(s.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s.query_pool, s.queries++);
+  s.query_labels.push_back(id);
+  s.seg_draws.push_back(0);
+}
+
+const char* VkFormatShortName(VkFormat f) {
+  switch (f) {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+      return "8888";
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+      return "2_10_10_10";
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+      return "16f x4";
+    case VK_FORMAT_R16G16_SFLOAT:
+      return "16f x2";
+    case VK_FORMAT_R32_SFLOAT:
+      return "32f";
+    case VK_FORMAT_D24_UNORM_S8_UINT:
+      return "D24S8";
+    case VK_FORMAT_D32_SFLOAT_S8_UINT:
+      return "D32FS8";
+    default:
+      return "fmt?";
+  }
+}
+
+void NativeCommandProcessor::MarkPass(const VkFormat* color_formats, uint32_t color_count, VkFormat depth_format,
+                                      uint32_t w, uint32_t h) {
+  if (!profiling_) return;
+  std::string l = fmt::format("pass {}x{}", w, h);
+  for (uint32_t i = 0; i < color_count; ++i) l += fmt::format(" {}", VkFormatShortName(color_formats[i]));
+  if (depth_format != VK_FORMAT_UNDEFINED) l += fmt::format(" +{}", VkFormatShortName(depth_format));
+  Mark(l);
+}
+
+void NativeCommandProcessor::CollectProfile(FrameSlot& s) {
+  if (!profiling_ || s.queries < 2) return;
+  uint64_t ts[kMaxQueries];
+  if (dfn().vkGetQueryPoolResults(vulkan_device_->device(), s.query_pool, 0, s.queries, sizeof(uint64_t) * s.queries,
+                                  ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+    return;
+  }
+  for (uint32_t i = 0; i + 1 < s.queries; ++i) {
+    const double ms = double((ts[i + 1] - ts[i]) & timestamp_mask_) * timestamp_period_ns_ * 1e-6;
+    ProfileLabel& l = profile_labels_[s.query_labels[i]];
+    l.ms += ms;
+    ++l.count;
+    l.draws += s.seg_draws[i];
+  }
+  profile_gpu_ms_ += double((ts[s.queries - 1] - ts[0]) & timestamp_mask_) * timestamp_period_ns_ * 1e-6;
+  ++profile_buffers_;
 }
 
 void NativeCommandProcessor::SubmitFrame() {
   if (!frame_open_) return;
   EndRenderPass();
   FrameSlot& s = slot();
+  if (occlusion_active_ >= 0) {
+    // A query cannot span command buffers: this one is dropped (the game gets the previous result).
+    dfn().vkCmdEndQuery(s.cmd, s.occlusion_pool, uint32_t(occlusion_active_));
+    occlusion_active_ = -1;
+    ++stats_.occlusion_lost;
+  }
+  if (profiling_ && s.query_pool && s.queries > 0 && s.queries < kMaxQueries) {
+    dfn().vkCmdWriteTimestamp(s.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s.query_pool, s.queries++);
+    s.query_labels.push_back(0);
+    s.seg_draws.push_back(0);
+  }
+  ++stats_.submits;
   dfn().vkEndCommandBuffer(s.cmd);
   if (s.upload_used) {
     ui::vulkan::util::FlushMappedMemoryRange(vulkan_device_, s.upload_memory, s.upload_memory_type, 0,
@@ -957,12 +1172,12 @@ void NativeCommandProcessor::EndRenderPass() {
 }
 
 bool NativeCommandProcessor::CreateImage(NativeImage& img, VkFormat format, uint32_t w, uint32_t h, bool depth,
-                                         VkImageUsageFlags usage) {
+                                         VkImageUsageFlags usage, uint32_t levels) {
   VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   ci.imageType = VK_IMAGE_TYPE_2D;
   ci.format = format;
   ci.extent = {std::max(w, 1u), std::max(h, 1u), 1};
-  ci.mipLevels = 1;
+  ci.mipLevels = std::max(levels, 1u);
   ci.arrayLayers = 1;
   ci.samples = VK_SAMPLE_COUNT_1_BIT;
   ci.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -997,6 +1212,7 @@ bool NativeCommandProcessor::CreateImage(NativeImage& img, VkFormat format, uint
   img.format = format;
   img.width = ci.extent.width;
   img.height = ci.extent.height;
+  img.levels = ci.mipLevels;
   img.depth = depth;
   img.initialized = false;
   return true;
@@ -1413,6 +1629,7 @@ bool NativeCommandProcessor::Convert(ConvertMode mode, NativeImage& src, NativeI
   }
   EndRenderPass();
   Barrier();
+  if (profiling_) Mark(fmt::format("convert mode {} {}x{}", uint32_t(mode), dst.width, dst.height));
   VkCommandBuffer cmd = slot().cmd;
   VkRenderPassBeginInfo bi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
   bi.renderPass = pass;
@@ -1432,6 +1649,7 @@ bool NativeCommandProcessor::Convert(ConvertMode mode, NativeImage& src, NativeI
   dfn().vkCmdEndRenderPass(cmd);
   Barrier();
   ++conversions_;
+  ++stats_.conversions;
   return true;
 }
 
@@ -1536,6 +1754,7 @@ VkPipeline NativeCommandProcessor::GetPipeline(const PipelineKey& key, VulkanSha
   const uint64_t hash = XXH3_64bits(&key, sizeof(key));
   auto it = pipelines_.find(hash);
   if (it != pipelines_.end()) return it->second;
+  ScopedUs timer(stats_.us_pipelines);
 
   VkPipelineShaderStageCreateInfo stages[2] = {};
   uint32_t stage_count = 0;
@@ -1653,18 +1872,42 @@ VkSampler NativeCommandProcessor::GetSampler(const VulkanShader::SamplerBinding&
     }
   };
   const VkSamplerAddressMode u = clamp(fetch.clamp_x), v = clamp(fetch.clamp_y), w = clamp(fetch.clamp_z);
+  // Mips (v54): mip filter, minimum level and anisotropy as in the emulation's sampler parameters.
+  const xenos::TextureFilter mip_filter =
+      binding.mip_filter == xenos::TextureFilter::kUseFetchConst ? fetch.mip_filter : binding.mip_filter;
+  const bool mip_linear = mip_filter == xenos::TextureFilter::kLinear;
+  const bool base_map = mip_filter == xenos::TextureFilter::kBaseMap || !REXCVAR_GET(ds2_native_mips);
+  uint32_t mip_min_level = 0;
+  texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, nullptr, nullptr, &mip_min_level,
+                                                 nullptr);
+  if (!REXCVAR_GET(ds2_native_mips)) mip_min_level = 0;
+  const xenos::AnisoFilter aniso_filter =
+      binding.aniso_filter == xenos::AnisoFilter::kUseFetchConst ? fetch.aniso_filter : binding.aniso_filter;
+  uint32_t aniso = 1;
+  if (aniso_filter != xenos::AnisoFilter::kDisabled && aniso_filter <= xenos::AnisoFilter::kMax_16_1) {
+    aniso = 1u << (uint32_t(aniso_filter) - 1);
+  }
+  aniso = std::min<uint32_t>(aniso, uint32_t(std::max(REXCVAR_GET(ds2_native_max_anisotropy), 1)));
+  if (!device()->properties().samplerAnisotropy || base_map) aniso = 1;
+  aniso = std::min<uint32_t>(aniso, uint32_t(device()->properties().maxSamplerAnisotropy));
   const uint64_t key = uint64_t(mag) | (uint64_t(min) << 2) | (uint64_t(u) << 4) | (uint64_t(v) << 8) |
-                       (uint64_t(w) << 12);
+                       (uint64_t(w) << 12) | (uint64_t(mip_linear) << 16) | (uint64_t(base_map) << 17) |
+                       (uint64_t(mip_min_level) << 18) | (uint64_t(aniso) << 24);
   auto it = samplers_.find(key);
   if (it != samplers_.end()) return it->second;
   VkSamplerCreateInfo ci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-  ci.magFilter = mag;
-  ci.minFilter = min;
-  ci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  ci.magFilter = aniso > 1 ? VK_FILTER_LINEAR : mag;
+  ci.minFilter = aniso > 1 ? VK_FILTER_LINEAR : min;
+  ci.mipmapMode = (mip_linear || aniso > 1) ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
   ci.addressModeU = u;
   ci.addressModeV = v;
   ci.addressModeW = w;
-  ci.maxLod = 0.0f;
+  ci.minLod = float(mip_min_level);
+  ci.maxLod = base_map ? ci.minLod + 0.25f : VK_LOD_CLAMP_NONE;
+  if (aniso > 1) {
+    ci.anisotropyEnable = VK_TRUE;
+    ci.maxAnisotropy = float(aniso);
+  }
   ci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
   VkSampler s = VK_NULL_HANDLE;
   dfn().vkCreateSampler(vulkan_device_->device(), &ci, nullptr, &s);
@@ -1737,7 +1980,15 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
     ++stats_.texture_unsupported;
     return white_view_;
   }
-  const uint64_t key = XXH3_64bits(&fetch.dword_0, 3 * sizeof(uint32_t)) ^ (uint64_t(fetch.endianness) << 60);
+  // Mip levels (v54): level 0 from base_address, levels 1..mip_max_level from mip_address (packed mip tail as in
+  // texture_util / the emulation's texture loader).
+  uint32_t base_page = 0, mip_page = 0, mip_min_level = 0, mip_max_level = 0;
+  texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, &base_page, &mip_page,
+                                                 &mip_min_level, &mip_max_level);
+  if (!REXCVAR_GET(ds2_native_mips) || !mip_page) mip_max_level = 0;
+  const uint32_t levels = mip_max_level + 1;
+  const uint32_t key_words[5] = {fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_5, levels};
+  const uint64_t key = XXH3_64bits(key_words, sizeof(key_words)) ^ (uint64_t(fetch.endianness) << 60);
   TextureEntry& t = textures_[key];
   t.last_use_frame = frame_;
   // Guest layout of the base level.
@@ -1758,58 +2009,109 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
   if (!need_check) {
     return GetSwizzleView(t.swizzle_views, t.image, fetch.swizzle | (fi.host_swizzle << 12));
   }
+  ScopedUs texture_timer(stats_.us_textures);
   t.last_check_frame = frame_;
-  const uint64_t content = XXH3_64bits(guest, std::min<size_t>(guest_size, 64 << 20));
+  texture_util::TextureGuestLayout layout = {};
+  const uint8_t* guest_mips = nullptr;
+  if (levels > 1) {
+    layout = texture_util::GetGuestTextureLayout(xenos::DataDimension::k2DOrStacked, fetch.pitch, width, height, 1,
+                                                 fetch.tiled, fetch.format, fetch.packed_mips, true, levels - 1);
+    guest_mips = memory_->TranslatePhysical<const uint8_t*>(mip_page << 12);
+    if (!guest_mips || !layout.mips_total_extent_bytes) return white_view_;
+  }
+  uint64_t content = XXH3_64bits(guest, std::min<size_t>(guest_size, 64 << 20));
+  if (guest_mips) {
+    content ^= XXH3_64bits(guest_mips, std::min<size_t>(layout.mips_total_extent_bytes, 64 << 20)) * 31;
+  }
   if (t.image.image && content == t.content_hash) {
     return GetSwizzleView(t.swizzle_views, t.image, fetch.swizzle | (fi.host_swizzle << 12));
   }
   if (!t.image.image) {
     if (!CreateImage(t.image, fi.format, width, height, false,
-                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, levels)) {
       textures_.erase(key);
       return white_view_;
     }
   }
   t.content_hash = content;
-  // Untile / copy the base level into the upload buffer, swapping the byte order.
-  const VkDeviceSize row_bytes = VkDeviceSize(bw) * fi.bytes_per_block;
+  // Untile / copy every level into the upload buffer, swapping the byte order.
+  VkDeviceSize level_offsets[xenos::kTextureMaxMips + 1];
+  VkDeviceSize total = 0;
+  for (uint32_t l = 0; l < levels; ++l) {
+    const uint32_t lbw = (std::max(width >> l, 1u) + fi.block_size - 1) / fi.block_size;
+    const uint32_t lbh = (std::max(height >> l, 1u) + fi.block_size - 1) / fi.block_size;
+    level_offsets[l] = total;
+    total += rex::align<VkDeviceSize>(VkDeviceSize(lbw) * lbh * fi.bytes_per_block, 16);
+  }
   VkDeviceSize offset;
-  uint8_t* dst = Upload(row_bytes * bh, 16, offset);
-  if (!dst) return white_view_;
-  for (uint32_t y = 0; y < bh; ++y) {
-    uint8_t* row = dst + row_bytes * y;
-    if (fetch.tiled) {
-      for (uint32_t x = 0; x < bw; ++x) {
-        const int32_t o = texture_util::GetTiledOffset2D(int32_t(x + off_x), int32_t(y + off_y), pitch_aligned,
-                                                         bpb_log2);
-        if (o < 0 || size_t(o) + fi.bytes_per_block > guest_size) {
-          std::memset(row + size_t(x) * fi.bytes_per_block, 0, fi.bytes_per_block);
-          continue;
+  uint8_t* dst_all = Upload(total, 16, offset);
+  if (!dst_all) return white_view_;
+  // One level: blocks (x + ox, y + oy) of a guest image with the given pitch (blocks for tiled, bytes per row
+  // for linear), bounded by src_size bytes.
+  auto copy_level = [&](uint8_t* dst, uint32_t lbw, uint32_t lbh, const uint8_t* src, size_t src_size,
+                        uint32_t tiled_pitch_blocks, size_t linear_row_bytes, uint32_t ox, uint32_t oy) {
+    const VkDeviceSize row_bytes = VkDeviceSize(lbw) * fi.bytes_per_block;
+    for (uint32_t y = 0; y < lbh; ++y) {
+      uint8_t* row = dst + row_bytes * y;
+      if (fetch.tiled) {
+        for (uint32_t x = 0; x < lbw; ++x) {
+          const int32_t o = texture_util::GetTiledOffset2D(int32_t(x + ox), int32_t(y + oy), tiled_pitch_blocks,
+                                                           bpb_log2);
+          if (o < 0 || size_t(o) + fi.bytes_per_block > src_size) {
+            std::memset(row + size_t(x) * fi.bytes_per_block, 0, fi.bytes_per_block);
+            continue;
+          }
+          std::memcpy(row + size_t(x) * fi.bytes_per_block, src + o, fi.bytes_per_block);
         }
-        std::memcpy(row + size_t(x) * fi.bytes_per_block, guest + o, fi.bytes_per_block);
-      }
-    } else {
-      const size_t src = (size_t(y + off_y) * pitch_aligned + off_x) * fi.bytes_per_block;
-      if (src + row_bytes <= guest_size) {
-        std::memcpy(row, guest + src, row_bytes);
       } else {
-        std::memset(row, 0, row_bytes);
+        const size_t so = size_t(y + oy) * linear_row_bytes + size_t(ox) * fi.bytes_per_block;
+        if (so + row_bytes <= src_size) {
+          std::memcpy(row, src + so, row_bytes);
+        } else {
+          std::memset(row, 0, row_bytes);
+        }
       }
+      SwapElements(row, row_bytes, fetch.endianness);
     }
-    SwapElements(row, row_bytes, fetch.endianness);
+  };
+  copy_level(dst_all, bw, bh, guest, guest_size, pitch_aligned, size_t(pitch_aligned) * fi.bytes_per_block, off_x,
+             off_y);
+  for (uint32_t l = 1; l < levels; ++l) {
+    const uint32_t lbw = (std::max(width >> l, 1u) + fi.block_size - 1) / fi.block_size;
+    const uint32_t lbh = (std::max(height >> l, 1u) + fi.block_size - 1) / fi.block_size;
+    const uint32_t stored = std::min(l, layout.packed_level);
+    const auto& ll = layout.mips[stored];
+    uint32_t ox = 0, oy = 0, oz = 0;
+    if (l >= layout.packed_level) {
+      texture_util::GetPackedMipOffset(width, height, 1, fetch.format, l, ox, oy, oz);
+    }
+    const uint32_t mo = layout.mip_offsets_bytes[stored];
+    if (mo >= layout.mips_total_extent_bytes) {
+      std::memset(dst_all + level_offsets[l], 0, size_t(lbw) * lbh * fi.bytes_per_block);
+      continue;
+    }
+    copy_level(dst_all + level_offsets[l], lbw, lbh, guest_mips + mo, layout.mips_total_extent_bytes - mo,
+               ll.row_pitch_bytes >> bpb_log2, ll.row_pitch_bytes, ox, oy);
   }
   EndRenderPass();
   EnsureGeneral(t.image);
   Barrier();
-  VkBufferImageCopy r = {};
-  r.bufferOffset = offset;
-  r.bufferRowLength = bw * fi.block_size;
-  r.bufferImageHeight = bh * fi.block_size;
-  r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  r.imageExtent = {width, height, 1};
-  dfn().vkCmdCopyBufferToImage(slot().cmd, slot().upload, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+  if (profiling_) Mark("texture upload");
+  VkBufferImageCopy regions[xenos::kTextureMaxMips + 1] = {};
+  for (uint32_t l = 0; l < levels; ++l) {
+    const uint32_t lw = std::max(width >> l, 1u), lh = std::max(height >> l, 1u);
+    VkBufferImageCopy& r = regions[l];
+    r.bufferOffset = offset + level_offsets[l];
+    r.bufferRowLength = (lw + fi.block_size - 1) / fi.block_size * fi.block_size;
+    r.bufferImageHeight = (lh + fi.block_size - 1) / fi.block_size * fi.block_size;
+    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, 1};
+    r.imageExtent = {lw, lh, 1};
+  }
+  dfn().vkCmdCopyBufferToImage(slot().cmd, slot().upload, t.image.image, VK_IMAGE_LAYOUT_GENERAL, levels, regions);
   Barrier();
   ++stats_.texture_uploads;
+  stats_.texture_levels += levels;
+  stats_.texture_upload_bytes += total;
   return GetSwizzleView(t.swizzle_views, t.image, fetch.swizzle | (fi.host_swizzle << 12));
 }
 
@@ -1835,12 +2137,14 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   const RegisterFile& regs = *register_file_;
   const xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) return IssueCopy();
+  ScopedUs draw_timer(stats_.us_draws);
   ++stats_.prim_counts[uint32_t(prim_type) & 31];
   if (!frame_open_ && !BeginFrame()) return false;
 
   auto* vs = static_cast<VulkanShader*>(active_vertex_shader());
   if (!vs) {
     ++stats_.draws_skipped;
+    ++stats_.skip_no_vs;
     return true;
   }
   if (!vs->is_ucode_analyzed()) vs->AnalyzeUcode(ucode_disasm_buffer_);
@@ -1848,6 +2152,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   const bool rasterization = draw_util::IsRasterizationPotentiallyDone(regs, polygonal);
   if (!rasterization || regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0) {
     ++stats_.draws_skipped;
+    ++(rasterization ? stats_.skip_no_pitch : stats_.skip_no_raster);
     return true;
   }
   VulkanShader* ps = nullptr;
@@ -1932,6 +2237,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   auto* vst = static_cast<VulkanShader::VulkanTranslation*>(vs->GetOrCreateTranslation(vs_mod.value));
   auto* pst = ps ? static_cast<VulkanShader::VulkanTranslation*>(ps->GetOrCreateTranslation(ps_mod.value)) : nullptr;
+  uint64_t translate_start = NowUs();
   if (!vst->is_translated()) {
     if (!translator_->TranslateAnalyzedShader(*vst) || !vst->GetOrCreateShaderModule()) {
       REXGPU_ERROR("[native] vertex shader {:016X} translation failed", vs->ucode_data_hash());
@@ -1942,6 +2248,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       REXGPU_ERROR("[native] pixel shader {:016X} translation failed", ps->ucode_data_hash());
     }
   }
+  stats_.us_pipelines += NowUs() - translate_start;
   if (!vst->is_valid() || !vst->shader_module() || (pst && (!pst->is_valid() || !pst->shader_module()))) {
     ++stats_.draws_failed;
     return true;
@@ -2000,6 +2307,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   if (!color_count && !depth_rt) {
     ++stats_.draws_skipped;
+    ++stats_.skip_no_target;
+    if (occlusion_active_ >= 0) occlusion_unmeasured_ = true;  // every sample would pass: not measurable here
     return true;
   }
   VkRenderPass pass = GetRenderPass(color_formats, color_count, depth_rt ? depth_rt->format : VK_FORMAT_UNDEFINED);
@@ -2436,6 +2745,11 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       for (uint32_t i = 0; i < n; ++i) fb_by_view_.emplace(views[i], fb_key);
     }
     Barrier();
+    if (profiling_) {
+      VkFormat cf[4];
+      for (uint32_t i = 0; i < color_count; ++i) cf[i] = color_rts[i]->format;
+      MarkPass(cf, color_count, depth_rt ? depth_rt->format : VK_FORMAT_UNDEFINED, rt_width, rt_height);
+    }
     VkRenderPassBeginInfo bi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     bi.renderPass = pass;
     bi.framebuffer = fb;
@@ -2529,6 +2843,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   ++stats_.draws;
   ++draws_this_frame_;
+  if (profiling_ && !slot().seg_draws.empty()) ++slot().seg_draws.back();
   return true;
 }
 
@@ -2560,6 +2875,7 @@ bool NativeCommandProcessor::ClearRect(NativeImage& rt, const VkClearValue& valu
   }
   EndRenderPass();
   Barrier();
+  if (profiling_) Mark(fmt::format("clear {} {}x{}", rt.depth ? "depth" : "color", rt.width, rt.height));
   VkRenderPassBeginInfo bi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
   bi.renderPass = pass;
   bi.framebuffer = fb;
@@ -2580,7 +2896,67 @@ bool NativeCommandProcessor::ClearRect(NativeImage& rt, const VkClearValue& valu
   return true;
 }
 
+bool NativeCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
+                                                                uint32_t count) {
+  if (!REXCVAR_GET(ds2_native_occlusion_queries) || !vulkan_device_) {
+    return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
+  }
+  // Direct3D writes 0xFFFFFEED (big endian) to the result block on D3DISSUE_END and waits for the GPU to replace
+  // it; the begin block is read back too and subtracted (begin = zeros here, as in the emulation).
+  const uint32_t kQueryFinished = rex::byte_swap(0xFFFFFEED);
+  const uint32_t initiator = reader->ReadAndSwap<uint32_t>();
+  WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
+  const uint32_t address = register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
+  auto* counts = memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(address);
+  if (!counts) return true;
+  const bool is_end = counts->ZPass_A == kQueryFinished || counts->ZPass_B == kQueryFinished ||
+                      counts->ZFail_A == kQueryFinished || counts->ZFail_B == kQueryFinished;
+  std::memset(counts, 0, sizeof(*counts));
+  if (!frame_open_ && !BeginFrame()) return true;
+  FrameSlot& s = slot();
+  if (!is_end) {
+    ++stats_.occlusion_begins;
+    if (occlusion_active_ >= 0) EndOcclusionQuery(0);  // unmatched begin: dropped
+    if (s.occlusion_pool && s.occlusion_used < kMaxOcclusionQueries) {
+      EndRenderPass();
+      occlusion_active_ = int32_t(s.occlusion_used++);
+      occlusion_unmeasured_ = false;
+      dfn().vkCmdBeginQuery(s.cmd, s.occlusion_pool, uint32_t(occlusion_active_),
+                            device()->properties().occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+    }
+    return true;
+  }
+  ++stats_.occlusion_ends;
+  EndOcclusionQuery(address);
+  // The newest measured result of this query (its memory is fixed per Direct3D query object); a query not
+  // measured yet reports visible, as the emulation does.
+  auto it = occlusion_results_.find(address);
+  const uint32_t samples = it != occlusion_results_.end() ? it->second
+                                                          : uint32_t(std::max(REXCVAR_GET(query_occlusion_fake_sample_count), 0));
+  if (samples) ++stats_.occlusion_visible;
+  counts->ZPass_A = samples;
+  counts->Total_A = samples;
+  return true;
+}
+
+void NativeCommandProcessor::EndOcclusionQuery(uint32_t result_address) {
+  if (occlusion_active_ < 0) return;
+  EndRenderPass();
+  FrameSlot& s = slot();
+  dfn().vkCmdEndQuery(s.cmd, s.occlusion_pool, uint32_t(occlusion_active_));
+  if (result_address) {
+    if (occlusion_unmeasured_) {
+      occlusion_results_[result_address] = uint32_t(std::max(REXCVAR_GET(query_occlusion_fake_sample_count), 1));
+    } else {
+      s.occlusion_pending.emplace_back(result_address, uint32_t(occlusion_active_));
+    }
+  }
+  occlusion_active_ = -1;
+  occlusion_unmeasured_ = false;
+}
+
 bool NativeCommandProcessor::IssueCopy() {
+  ScopedUs copy_timer(stats_.us_copies);
   const RegisterFile& regs = *register_file_;
   if (!frame_open_ && !BeginFrame()) return false;
   ++stats_.copies;
@@ -2735,6 +3111,9 @@ bool NativeCommandProcessor::IssueCopy() {
       Convert(kConvertDepthToRgba8, *src, r.image, x0, y0,
               {{dst_x0, dst_y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}}, float24);
     } else {
+    if (profiling_) {
+      Mark(fmt::format("resolve copy {} {}x{}", is_depth ? "depth" : "color", src->width, src->height));
+    }
     Barrier();
     VkImageCopy c = {};
     c.srcSubresource = {VkImageAspectFlags(is_depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
@@ -2799,6 +3178,11 @@ bool NativeCommandProcessor::IssueCopy() {
 void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   ++stats_.swaps;
+  {
+    const uint64_t now = NowUs();
+    if (last_swap_us_) stats_.us_frame += now - last_swap_us_;
+    last_swap_us_ = now;
+  }
 #if REX_PLATFORM_SWITCH
   RexSwitchPerfCount(0);
 #endif
@@ -2814,6 +3198,7 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   }
   auto rit = resolved_.find(base);
   if (rit == resolved_.end()) rit = resolved_.find(frontbuffer_ptr & 0x1FFFFFFF);
+  bool presented_this_swap = false;
   if (presenter && rit != resolved_.end()) {
     NativeImage& src = rit->second.image;
     const uint32_t w = frontbuffer_width ? std::min(frontbuffer_width, src.width) : src.width;
@@ -2880,6 +3265,7 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           wr[1].pBufferInfo = &bi;
           dfn().vkUpdateDescriptorSets(dev, 2, wr, 0, nullptr);
           Barrier();
+          Mark("present");
           VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
           rbi.renderPass = present_pass_;
           rbi.framebuffer = fb;
@@ -2901,11 +3287,14 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           dfn().vkCmdDraw(cmd, 3, 1, 0, 0);
           dfn().vkCmdEndRenderPass(cmd);
           SubmitFrame();
+          presented_this_swap = true;
           ++stats_.swaps_presented;
           return true;
         });
   }
-  if (frame_open_) SubmitFrame();
+  // v54: submit only when the present did not (v51-v53 submitted an extra empty command buffer here every frame,
+  // so the 3 frame slots held 1.5 guest frames and the command processor waited for the GPU twice per frame).
+  if (frame_open_ && !presented_this_swap) SubmitFrame();
   LogStats();
   EvictTextures();
   // Development dump: at the N-th frame with more than 200 draws (in game, not menus).
@@ -3085,10 +3474,10 @@ void NativeCommandProcessor::LogStats() {
   last_log_frame_ = stats_.swaps;
   REXGPU_INFO(
       "[native] per frame: {:.0f} draws ({:.1f} skipped, {:.1f} unsupported prim, {:.1f} failed), {:.1f} resolves, "
-      "{:.1f} clears, {:.1f} passes, {} conversions, {:.1f} texture uploads ({:.1f} from resolves, {:.1f} unsupported), {:.2f} MB "
+      "{:.1f} clears, {:.1f} passes, {:.1f} conversions, {:.1f} texture uploads ({:.1f} from resolves, {:.1f} unsupported), {:.2f} MB "
       "uploaded | totals: {} pipelines, {} render targets, {} textures, {} resolve targets, presented {}/{} swaps",
       stats_.draws / n, stats_.draws_skipped / n, stats_.draws_unsupported_prim / n, stats_.draws_failed / n,
-      stats_.copies / n, stats_.clears / n, stats_.render_passes_begun / n, conversions_, stats_.texture_uploads / n,
+      stats_.copies / n, stats_.clears / n, stats_.render_passes_begun / n, stats_.conversions / n, stats_.texture_uploads / n,
       stats_.texture_from_resolve / n, stats_.texture_unsupported / n, stats_.upload_bytes / n / 1048576.0,
       pipelines_.size(), render_targets_.size(), textures_.size(), resolved_.size(), stats_.swaps_presented,
       stats_.swaps);
@@ -3096,7 +3485,39 @@ void NativeCommandProcessor::LogStats() {
   for (uint32_t i = 0; i < 32; ++i) {
     if (stats_.prim_counts[i]) prims += fmt::format(" {}:{:.0f}", i, stats_.prim_counts[i] / n);
   }
-  REXGPU_INFO("[native] primitive types per frame:{}", prims);
+  REXGPU_INFO("[native] primitive types per frame:{} | skipped: no vertex shader {:.1f}, no rasterization {:.1f}, "
+              "no pitch {:.1f}, no target {:.1f}",
+              prims, stats_.skip_no_vs / n, stats_.skip_no_raster / n, stats_.skip_no_pitch / n,
+              stats_.skip_no_target / n);
+  // v54: where the time goes. CPU = command processor thread (draws include textures and pipelines).
+  REXGPU_INFO("[native] cpu ms per frame: frame {:.2f}, waiting for the GPU {:.2f}, draws {:.2f} (textures {:.2f}, "
+              "shaders+pipelines {:.2f}), resolves {:.2f} | {:.2f} texture levels, {:.2f} MB texture data, "
+              "{:.2f} submits per frame | occlusion queries: {:.1f} begun, {:.1f} ended, {:.1f} visible, {:.2f} lost",
+              stats_.us_frame / n / 1000.0, stats_.us_fence_wait / n / 1000.0, stats_.us_draws / n / 1000.0,
+              stats_.us_textures / n / 1000.0, stats_.us_pipelines / n / 1000.0, stats_.us_copies / n / 1000.0,
+              stats_.texture_levels / n, stats_.texture_upload_bytes / n / 1048576.0, stats_.submits / n,
+              stats_.occlusion_begins / n, stats_.occlusion_ends / n, stats_.occlusion_visible / n,
+              stats_.occlusion_lost / n);
+  if (profiling_ && profile_buffers_) {
+    std::vector<ProfileLabel*> order;
+    double sum = 0;
+    for (ProfileLabel& l : profile_labels_) {
+      if (l.count) order.push_back(&l);
+      sum += l.ms;
+    }
+    std::sort(order.begin(), order.end(), [](const ProfileLabel* a, const ProfileLabel* b) { return a->ms > b->ms; });
+    std::string top;
+    for (size_t i = 0; i < order.size() && i < 16; ++i) {
+      top += fmt::format("\n[native gpu]   {:6.2f} ms {:5.1f}%  x{:.1f}  {:.0f} draws  {}", order[i]->ms / n,
+                         sum > 0 ? 100.0 * order[i]->ms / sum : 0.0, order[i]->count / n, order[i]->draws / n,
+                         order[i]->name);
+    }
+    REXGPU_INFO("[native gpu] GPU ms per frame: {:.2f} (command buffers {:.2f} per frame), by pass kind:{}",
+                profile_gpu_ms_ / n, profile_buffers_ / n, top);
+    for (ProfileLabel& l : profile_labels_) l = {l.name};
+    profile_gpu_ms_ = 0;
+    profile_buffers_ = 0;
+  }
   const uint64_t pipelines = stats_.pipelines, swaps = stats_.swaps, presented = stats_.swaps_presented;
   stats_ = Stats();
   stats_.pipelines = pipelines;
