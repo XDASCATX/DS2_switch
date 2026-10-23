@@ -54,6 +54,9 @@ REXCVAR_DEFINE_STRING(ds2_native_dump_dir, "", "GPU",
                       "target, written once at swap ds2_native_dump_swap");
 REXCVAR_DEFINE_INT32(ds2_native_dump_swap, 0, "GPU", "DS2 native renderer (development): dump at this frame counted among frames with more than 200 draws")
     .range(0, 100000000);
+REXCVAR_DEFINE_INT32(ds2_native_texture_keep_frames, 600, "GPU",
+                     "DS2 native renderer: release guest textures not sampled for this many frames")
+    .range(30, 100000);
 REXCVAR_DEFINE_BOOL(ds2_native_gamma_ramp, true, "GPU",
                     "DS2 native renderer: apply the game's 256-entry gamma ramp when presenting (as the emulation)");
 REXCVAR_DEFINE_BOOL(ds2_native_textures, true, "GPU",
@@ -537,6 +540,8 @@ class NativeCommandProcessor final : public CommandProcessor {
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSet shared_memory_set = VK_NULL_HANDLE;
     std::vector<std::pair<VkImage, VkDeviceMemory>> deferred_destroy;
+    std::vector<VkImageView> deferred_views;
+    std::vector<VkFramebuffer> deferred_framebuffers;
   };
   struct PipelineLayoutEntry {
     VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -598,6 +603,7 @@ class NativeCommandProcessor final : public CommandProcessor {
   void AdoptRenderTarget(uint32_t base, uint32_t pitch, uint64_t key, NativeImage& img);
   void LogStats();
   void DumpImages();
+  void EvictTextures();
   uint32_t ReadPixel(NativeImage& img, uint32_t x, uint32_t y, VkImageAspectFlags aspect);
   bool Tracing() const {
     return REXCVAR_GET(ds2_native_dump_swap) > 0 && !dumped_ &&
@@ -623,6 +629,7 @@ class NativeCommandProcessor final : public CommandProcessor {
   std::unordered_map<uint64_t, PipelineLayoutEntry> pipeline_layouts_;
   std::unordered_map<uint64_t, VkRenderPass> render_passes_;
   std::unordered_map<uint64_t, VkFramebuffer> framebuffers_;
+  std::unordered_multimap<VkImageView, uint64_t> fb_by_view_;  // to drop framebuffers of destroyed images
   std::unordered_map<uint64_t, VkPipeline> pipelines_;
   std::unordered_map<uint64_t, VkSampler> samplers_;
   std::unordered_map<uint64_t, NativeImage> render_targets_;
@@ -828,6 +835,8 @@ void NativeCommandProcessor::ShutdownContext() {
   for (auto& [k, l] : pipeline_layouts_) dfn().vkDestroyPipelineLayout(dev, l.layout, nullptr);
   for (auto& [k, l] : texture_set_layouts_) dfn().vkDestroyDescriptorSetLayout(dev, l, nullptr);
   for (FrameSlot& s : slots_) {
+    for (VkFramebuffer fb : s.deferred_framebuffers) dfn().vkDestroyFramebuffer(dev, fb, nullptr);
+    for (VkImageView v : s.deferred_views) dfn().vkDestroyImageView(dev, v, nullptr);
     for (auto& [i, m] : s.deferred_destroy) {
       dfn().vkDestroyImage(dev, i, nullptr);
       dfn().vkFreeMemory(dev, m, nullptr);
@@ -854,6 +863,10 @@ bool NativeCommandProcessor::BeginFrame() {
     dfn().vkResetFences(dev, 1, &s.fence);
     s.submitted = false;
   }
+  for (VkFramebuffer fb : s.deferred_framebuffers) dfn().vkDestroyFramebuffer(dev, fb, nullptr);
+  s.deferred_framebuffers.clear();
+  for (VkImageView v : s.deferred_views) dfn().vkDestroyImageView(dev, v, nullptr);
+  s.deferred_views.clear();
   for (auto& [i, m] : s.deferred_destroy) {
     dfn().vkDestroyImage(dev, i, nullptr);
     dfn().vkFreeMemory(dev, m, nullptr);
@@ -991,9 +1004,30 @@ bool NativeCommandProcessor::CreateImage(NativeImage& img, VkFormat format, uint
 
 void NativeCommandProcessor::DestroyImage(NativeImage& img, bool deferred) {
   const VkDevice dev = vulkan_device_->device();
-  if (img.view) dfn().vkDestroyImageView(dev, img.view, nullptr);
-  if (img.depth_view) dfn().vkDestroyImageView(dev, img.depth_view, nullptr);
-  if (img.stencil_view) dfn().vkDestroyImageView(dev, img.stencil_view, nullptr);
+  // Views of a deferred image may still be referenced by recorded frames: destroyed with it, and so are the
+  // framebuffers made on them (a new view could get the same handle value).
+  for (VkImageView v : {img.view, img.depth_view, img.stencil_view}) {
+    if (!v) continue;
+    auto range = fb_by_view_.equal_range(v);
+    for (auto it = range.first; it != range.second; ++it) {
+      auto fit = framebuffers_.find(it->second);
+      if (fit != framebuffers_.end()) {
+        if (deferred) {
+          slot().deferred_framebuffers.push_back(fit->second);
+        } else {
+          dfn().vkDestroyFramebuffer(dev, fit->second, nullptr);
+        }
+        framebuffers_.erase(fit);
+      }
+    }
+    fb_by_view_.erase(v);
+    if (current_framebuffer_key_ && in_render_pass_ == false) current_framebuffer_key_ = 0;
+    if (deferred) {
+      slot().deferred_views.push_back(v);
+    } else {
+      dfn().vkDestroyImageView(dev, v, nullptr);
+    }
+  }
   if (deferred && img.image) {
     slot().deferred_destroy.emplace_back(img.image, img.memory);
   } else {
@@ -1375,6 +1409,7 @@ bool NativeCommandProcessor::Convert(ConvertMode mode, NativeImage& src, NativeI
     fci.layers = 1;
     if (dfn().vkCreateFramebuffer(dev, &fci, nullptr, &fb) != VK_SUCCESS) return false;
     framebuffers_.emplace(fb_key, fb);
+    fb_by_view_.emplace(dst.view, fb_key);
   }
   EndRenderPass();
   Barrier();
@@ -1676,6 +1711,7 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
   auto rit = resolved_.find(base);
   if (rit != resolved_.end()) {
     resolved_out = true;
+    rit->second.frame = frame_;
     if (Tracing()) {
       REXGPU_INFO("[native trace]   draw {} samples resolve {:08X} as fmt {} {}x{} endian {} swizzle {:03X} signs "
                   "{}{}{}{} exp {}",
@@ -2397,6 +2433,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         return true;
       }
       framebuffers_.emplace(fb_key, fb);
+      for (uint32_t i = 0; i < n; ++i) fb_by_view_.emplace(views[i], fb_key);
     }
     Barrier();
     VkRenderPassBeginInfo bi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -2519,6 +2556,7 @@ bool NativeCommandProcessor::ClearRect(NativeImage& rt, const VkClearValue& valu
     fci.layers = 1;
     if (dfn().vkCreateFramebuffer(vulkan_device_->device(), &fci, nullptr, &fb) != VK_SUCCESS) return false;
     framebuffers_.emplace(fb_key, fb);
+    fb_by_view_.emplace(rt.view, fb_key);
   }
   EndRenderPass();
   Barrier();
@@ -2649,7 +2687,7 @@ bool NativeCommandProcessor::IssueCopy() {
     ResolvedEntry& r = resolved_[entry_base];
     if (r.image.image && !sub_resolve &&
         (r.image.width < dw || r.image.height < dh || r.image.format != resolved_format)) {
-      for (auto& [s, view] : r.swizzle_views) dfn().vkDestroyImageView(vulkan_device_->device(), view, nullptr);
+      for (auto& [s, view] : r.swizzle_views) slot().deferred_views.push_back(view);
       r.swizzle_views.clear();
       DestroyImage(r.image, true);
     }
@@ -2869,6 +2907,7 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   }
   if (frame_open_) SubmitFrame();
   LogStats();
+  EvictTextures();
   // Development dump: at the N-th frame with more than 200 draws (in game, not menus).
   if (draws_this_frame_ > 200) ++heavy_frames_;
   draws_this_frame_ = 0;
@@ -2909,6 +2948,31 @@ uint32_t NativeCommandProcessor::ReadPixel(NativeImage& img, uint32_t x, uint32_
   dfn().vkDestroyBuffer(dev, buf, nullptr);
   dfn().vkFreeMemory(dev, mem, nullptr);
   return v;
+}
+
+void NativeCommandProcessor::EvictTextures() {
+  // Guest textures not used for a while are released (the game streams new ones into new addresses as the player
+  // moves). Resolve targets too, if their address has not been written or sampled for long.
+  if (frame_ % 60) return;
+  const uint64_t keep_frames = uint64_t(std::max<int32_t>(REXCVAR_GET(ds2_native_texture_keep_frames), 30));
+  for (auto it = textures_.begin(); it != textures_.end();) {
+    if (frame_ - it->second.last_use_frame > keep_frames) {
+      for (auto& [sw, v] : it->second.swizzle_views) slot().deferred_views.push_back(v);
+      DestroyImage(it->second.image, true);
+      it = textures_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (auto it = resolved_.begin(); it != resolved_.end();) {
+    if (frame_ - it->second.frame > keep_frames * 4) {
+      for (auto& [sw, v] : it->second.swizzle_views) slot().deferred_views.push_back(v);
+      DestroyImage(it->second.image, true);
+      it = resolved_.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 void NativeCommandProcessor::DumpImages() {
