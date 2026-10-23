@@ -15,93 +15,94 @@
   <img src="https://img.shields.io/badge/renderer-native-5C2D91?style=for-the-badge" alt="Native renderer">
 </p>
 
-Нативный порт Xbox 360-версии (title ID `465307E4`) на Nintendo Switch. Не эмулятор: весь PowerPC-код
-`Default.xex` переведён в C++ и собран под ARM64, кадр рисует собственный Vulkan-рендерер.
+A native Nintendo Switch port of the Xbox 360 version (title ID `465307E4`). Not an emulator: every PowerPC
+function of `Default.xex` is translated to C++ and compiled for ARM64, and frames are drawn by a custom Vulkan
+renderer.
 
 > [!NOTE]
-> Нужна своя копия игры для Xbox 360. Репозиторий не содержит ни ресурсов, ни кода игры.
+> You need your own copy of the Xbox 360 game. This repository contains no game assets or game code.
 
-## Подход
+## Approach
 
 ```mermaid
 flowchart LR
-    XEX["Default.xex<br/>PowerPC"] -->|ReXGlue codegen| CPP["C++<br/>каждая функция xex"]
+    XEX["Default.xex<br/>PowerPC"] -->|ReXGlue codegen| CPP["C++<br/>every xex function"]
     CPP --> NRO["NRO · ARM64"]
-    RT["ReXGlue runtime<br/>ядро · XAM · ФС · XMA · ввод"] --> NRO
-    HZN["слой Horizon<br/>память · потоки · часы · вывод"] --> NRO
-    NRO --> PM4["PM4-кольцо Xenos"]
-    PM4 --> NAT["нативный рендерер<br/>Vulkan"]
-    NAT --> NVK["Mesa NVK<br/>+ патч порта"] --> GPU["Tegra X1"]
+    RT["ReXGlue runtime<br/>kernel · XAM · VFS · XMA · input"] --> NRO
+    HZN["Horizon layer<br/>memory · threads · clocks · present"] --> NRO
+    NRO --> PM4["Xenos PM4 ring"]
+    PM4 --> NAT["Native renderer<br/>Vulkan"]
+    NAT --> NVK["Mesa NVK<br/>+ port patch"] --> GPU["Tegra X1"]
 ```
 
-| Слой | Механизм |
+| Layer | Mechanism |
 |---|---|
-| **Рекомпиляция** | ReXGlue переводит каждую функцию xex в C++; границы функций, таблицы переходов и пропущенные участки дополняются overrides (`config/`) и собственными инструментами анализа |
-| **Рантайм** | ядро Xbox 360, XAM, файловая система, XMA-аудио и ввод — из ReXGlue; поверх — слой Horizon: отображение гостевой памяти, потоки, исключения, часы, презентация |
-| **Рендерер** | читает PM4-кольцо игры и записывает Vulkan напрямую; render target'ы — родные изображения, resolve — родные текстуры, EDRAM не эмулируется |
-| **Шейдеры** | микрокод Xenos → SPIR-V, кеш модулей по хэшу микрокода |
-| **Драйвер** | Mesa NVK для Horizon с патчем под нагрузку игры |
-| **Эталон** | эмуляция GPU Xenos остаётся в том же бинарнике: A/B-сверка кадра одним параметром TOML |
+| **Recompilation** | ReXGlue translates every xex function to C++; function boundaries, jump tables and missed code are completed with overrides (`config/`) and custom analysis tools |
+| **Runtime** | Xbox 360 kernel, XAM, file system, XMA audio and input from ReXGlue, on top of a Horizon layer: guest memory mapping, threads, exceptions, clocks, presentation |
+| **Renderer** | Consumes the game's PM4 ring and records Vulkan directly; render targets are native images, resolves are native textures, no EDRAM emulation |
+| **Shaders** | Xenos microcode → SPIR-V, modules cached by microcode hash |
+| **Driver** | Mesa NVK on Horizon with a patch tuned for the game's workload |
+| **Reference** | Full Xenos GPU emulation stays in the same binary: one TOML switch for A/B frame validation |
 
-## Механизмы рендерера
+## Renderer mechanisms
 
-| Механизм | Что даёт |
+| Mechanism | Effect |
 |---|---|
-| MSAA в пространстве сэмплов | 1x- и 4x-виды одной области EDRAM — одно изображение, без переносов |
-| Resolve в нативную текстуру | выборка без записи в память игры и повторной загрузки |
-| Early-Z для шейдеров без kill / depth-out | скрытые фрагменты не затеняются |
-| Барьеры только на копиях и загрузках | без простоев GPU между проходами |
-| Одна отправка в GPU на кадр | минимум накладных расходов NVK |
-| Асинхронная сборка конвейеров | без зависаний кадра на новых материалах |
-| Вытеснение ресурсов по сроку | текстуры, view'ы и framebuffer'ы освобождаются без нехватки памяти |
+| MSAA in sample space | 1x and 4x views of the same EDRAM region are one image, no transfers |
+| Resolve to native texture | sampled directly, no write-back to guest memory or re-upload |
+| Early-Z for shaders without kill / depth-out | occluded fragments are never shaded |
+| Barriers only on copies and uploads | no GPU idle between passes |
+| Single GPU submit per frame | minimal NVK submission overhead |
+| Async pipeline compilation | no frame stalls on new materials |
+| Age-based resource eviction | textures, views and framebuffers freed before memory runs out |
 
-Патч Mesa NVK: UBO напрямую (без ожиданий GPFIFO), sparse-буфер под гостевую память, вытеснение render target'ов
-при нехватке памяти, настройка компилятора NAK под Switch.
+Mesa NVK patch: direct UBOs (no GPFIFO waits), sparse buffer for guest memory, render-target eviction under memory
+pressure, NAK compiler tuning for Switch.
 
-## Успехи
+## Results
 
 | | |
 |---|---|
-| 🗡️ **Игра проходится** | вступление → редактор персонажа → Маджула → Лес павших гигантов |
-| ⚡ **Нативный рендерер ×2** | **25–30 FPS** в Маджуле против 11–16 на эмуляции Xenos |
-| 🎨 **Точнее эмуляции** | корректные цвета, освещение, небо и HUD |
-| 🧩 **Полный код игры** | восстановлено **370** функций, пропущенных генератором; исправлен разбор 16-битных таблиц переходов |
-| 🔧 **0 ожиданий GPFIFO** | за счёт собственного патча NVK |
-| ⌨️ **Интеграция с Horizon** | системная клавиатура, сохранения, частоты CPU/GPU выставляет сама игра |
+| 🗡️ **Playable** | intro → character creation → Majula → Forest of Fallen Giants |
+| ⚡ **2× from the native renderer** | **25–30 FPS** in Majula vs 11–16 under Xenos emulation |
+| 🎨 **More accurate than emulation** | correct colors, lighting, sky and HUD |
+| 🧩 **Complete game code** | **370** functions missed by the code generator recovered; 16-bit jump table decoding fixed |
+| 🔧 **Zero GPFIFO waits** | via the custom NVK patch |
+| ⌨️ **Horizon integration** | system keyboard, saves, CPU/GPU clocks set by the game itself |
 
-## Инструменты
+## Tooling
 
-| Инструмент | Назначение |
+| Tool | Purpose |
 |---|---|
-| Меню **L + R + →** | все параметры рендера и диагностики на лету |
-| Снимок кадра **L3 + R3** | трасса draw-вызовов и изображения всех целей кадра на SD |
-| Профиль GPU | время по проходам с поправкой таймера Switch (614,4 МГц), журнал рывков |
-| Watchdog | сэмплирование стеков потоков, отчёт о зависаниях с символизацией по ELF |
-| `tools/analysis/` | разбор логов консоли: время кадра, дампы resolve → PNG, параметры, «дыры» codegen |
-| `tools/*.py` | трассировка и поиск пропущенных функций для codegen |
-| `tools/run/run-pc.sh` | та же игра на PC для проверки кадра до консоли |
-| `ds2.toml` | воспроизводимые эксперименты: один параметр — один замер |
-| `audit/` | сверка копии игры по хэшам, без самих файлов |
+| **L + R + →** menu | every renderer and diagnostics setting, live |
+| **L3 + R3** frame capture | draw-call trace and every render target of the frame dumped to SD |
+| GPU profiler | per-pass timings with corrected Switch timer (614.4 MHz), hitch log |
+| Watchdog | thread stack sampling, stall reports symbolized against the ELF |
+| `tools/analysis/` | console log analysis: frame time, resolve dumps → PNG, settings, codegen gaps |
+| `tools/*.py` | tracing and missed-function discovery for codegen |
+| `tools/run/run-pc.sh` | the same game on PC to validate frames before hardware |
+| `ds2.toml` | reproducible experiments: one parameter, one measurement |
+| `audit/` | game copy verification by hashes, no game files |
 
-## Сборка
+## Build
 
-devkitA64 + libnx, CMake, Ninja, Python, [mesa-switch](https://github.com/danfromtico/mesa-switch) + патч порта.
+devkitA64 + libnx, CMake, Ninja, Python, [mesa-switch](https://github.com/danfromtico/mesa-switch) + the port's patch.
 
 ```sh
 . tools/build/env.sh
-tools/build/build-mesa.sh <sdk>     # при изменении Mesa
+tools/build/build-mesa.sh <sdk>     # only when Mesa changes
 tools/build/build-switch.sh         # → out/app-switch/ds2.nro
 ```
 
-| Путь | |
+| Path | |
 |---|---|
-| `app/` | приложение, платформа Switch, профайлер, захват кадров |
-| `sdk/` | ReXGlue SDK с правками порта, нативный рендерер |
-| `config/` | overrides для codegen |
-| `tools/` | сборка, анализ, патч Mesa |
-| `docs/` | [`HANDOFF.md`](https://github.com/XDASCATX/DS2_switch/blob/diag/switch-level-load/docs/HANDOFF.md) · [рендерер](https://github.com/XDASCATX/DS2_switch/blob/diag/switch-level-load/docs/handoff/18-native-renderer.md) · [оптимизация](https://github.com/XDASCATX/DS2_switch/blob/diag/switch-level-load/docs/handoff/16-switch-gpu-optimization.md) |
+| `app/` | application, Switch platform, profiler, frame capture |
+| `sdk/` | ReXGlue SDK with port changes, native renderer |
+| `config/` | codegen overrides |
+| `tools/` | build, analysis, Mesa patch |
+| `docs/` | technical documentation |
 
-## Благодарности
+## Credits
 
 [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) ([Xenia](https://xenia.jp)) ·
 [nfsmw-nx](https://github.com/StevensND/nfsmw-nx) ·
@@ -109,8 +110,8 @@ tools/build/build-switch.sh         # → out/app-switch/ds2.nro
 [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) ·
 [devkitPro](https://devkitpro.org) · [libnx](https://github.com/switchbrew/libnx)
 
-## Правовая информация
+## Legal
 
-Неофициальный фан-проект, не связан с FromSoftware, Bandai Namco, Microsoft и Nintendo. DARK SOULS —
-товарный знак владельцев; изображения — официальные промо-материалы. Homebrew требует кастомной прошивки,
-что нарушает условия Nintendo.
+Unofficial fan project, not affiliated with FromSoftware, Bandai Namco, Microsoft or Nintendo. DARK SOULS is a
+trademark of its owners; images are official promotional art. Running homebrew requires custom firmware, which
+violates Nintendo's terms of service.
