@@ -70,6 +70,11 @@ import re
 import sys
 
 RE_FUNC = re.compile(r'^DEFINE_REX_FUNC\((?:sub_)?([0-9A-Fa-f]{8})\)')
+RE_LOC = re.compile(r'loc_([0-9A-Fa-f]{8})')
+# Highest loc_ label each function uses. A function with an inline jump table has fewer comment lines than
+# instructions (the table words are data), so its measured end is too short; the code after the table is still
+# its own (v49 declared 293 such tails as functions and startup broke: Unresolved branch 0x8269FBFC).
+MAX_LABEL = {}
 
 
 def medir_funciones(gen_dir):
@@ -88,6 +93,10 @@ def medir_funciones(gen_dir):
                         actual = int(m.group(1), 16)
                         n = 0
                 elif actual is not None:
+                    for x in RE_LOC.findall(linea):
+                        v = int(x, 16)
+                        if v > MAX_LABEL.get(actual, 0):
+                            MAX_LABEL[actual] = v
                     if linea.startswith('\t// '):
                         n += 1
                     elif linea.startswith('}'):
@@ -136,7 +145,7 @@ def main():
             continue
         fin = a + 4 * n
         siguiente = inicios[i + 1]
-        if fin < siguiente:
+        if fin < siguiente and MAX_LABEL.get(a, 0) < fin:
             huecos.append((fin, siguiente - fin, a, siguiente))
 
     grandes = [h for h in huecos if h[1] >= args.min]
