@@ -1,13 +1,11 @@
 # 17a. Все параметры (cvar) сборки DS2
 
-Сгенерировано скриптом из исходников (`REXCVAR_DEFINE_*` в `sdk/src`, `sdk/include`, `app`). Значок — как его
-показывает меню настроек (L+R+→). «live» — это только метка: работает ли смена на лету, зависит от того, читает ли
-код значение каждый раз (см. 17-switch-settings-menu.md).
+Сгенерировано из исходников (`REXCVAR_DEFINE_*` в `sdk/src`, `sdk/include`, `app`):
+`tools/analysis/cvars.py` + `tools/analysis/cvars_table.py` (см. [docs/config.md](../config.md)). Обновлено 2026-10-23.
+Значок — как его показывает меню настроек (L+R+→): «live» — только метка; меняется ли значение на лету, зависит от кода.
 
 | Категория | Имя | Тип | По умолчанию | Значок | Описание |
 |---|---|---|---|---|---|
-| - | `my_cmd` | command | `[]() { DoThing(` | [live] |  |
-| - | `name` | command_args | `callback` | [live] |  |
 | Audio | `audio_diag_prioridad_critica` | bool | `false` | [live] | Diagnostico (solo PC): Audio Worker y XMA Decoder a prioridad de tiempo critico, como en la Switch, donde van por encima de los hilos del ju |
 | Audio | `audio_ffmpeg_simd` | bool | `true` | [live] | Diagnostico: false = el decodificador XMA de FFmpeg usa solo codigo C, sin NEON ni SSE (para comparar el audio) |
 | Audio | `audio_maxqframes` | int32 | `8` | [live] |  |
@@ -26,10 +24,8 @@
 | Audio | `audio_volcado_xma_min_s` | int32 | `2` | [live] | Diagnostico: segundos minimos de un sonido XMA que se guardan cuando termina |
 | Audio | `audio_volcado_xma_s` | int32 | `0` | [live] | Diagnostico: segundos de cada contexto XMA que se guardan en xma_<contexto>_tramas/salida_<hz>.wav junto al ejecutable; 0 = nada |
 | Audio | `audio_xma_en_trabajador` | int32 | `REX_XMA_EN_TRABAJADOR_PO` | [live] | Quien descodifica el XMA al llegar un kick (XMAEnableContext): 0 = el hilo que lo pide, como hasta ahora; 1 = el hilo XMA Decoder, que en la |
+| Audio | `audio_xma_estado` | bool | `true` | [live] | Diagnostic: every 10 s log the XMA contexts the game enabled that have produced no audio for 2+ s (one line) |
 | Audio | `ffmpeg_verbose` | bool | `false` | [live] | Verbose FFmpeg output (debug and above) |
-| Category | `my_flag` | bool | `false` | [live] | Description |
-| Category | `my_int` | int32 | `42` | [live] | An integer setting |
-| Category | `my_string` | string | `"default"` | [live] | A string setting |
 | Clock | `clock_no_scaling` | bool | `false` | [live] | Disable clock scaling (inverted: false = scaling enabled) |
 | Clock | `clock_source_raw` | bool | `false` | [live] | Use raw clock source without scaling |
 | Codegen | `backward_scan_limit` | uint32 | `64` | [init-only] (в меню серым) | Max instructions to scan backward for jump table patterns |
@@ -45,23 +41,31 @@
 | Codegen | `max_vtable_iterations` | uint32 | `100` | [init-only] (в меню серым) | Max iterations for vtable discovery |
 | Codegen | `progress_log_frequency` | uint32 | `100` | [init-only] (в меню серым) | Log progress every N functions |
 | Console | `find` | command_args | `ConsoleFind` | [live] | List cvar/command names containing a substring |
-| GPU | `render_target_max_height` | int32 | `0` | [start] | Максимальная высота RT хоста в пикселях гостя (0 = до конца EDRAM); экономит память |
-| GPU/Vulkan | `vulkan_render_target_budget_mb` | int32 | `0` | [live] | Освобождать RT без данных EDRAM, когда кучи Vulkan больше N МБ (0 = только после отказа) |
-| GPU/Vulkan | `render_target_transfer_skip_kinds` | int32 | `0` | [live] | Не копировать старое содержимое EDRAM для видов переносов (биты): 1 глубина 4x→1x, 2 глубина 1x→4x, 4 цвет из глубины, 8 цвет 4x→1x, 16 глубина из цвета |
-| DS2 | `ds2_func_counts` | bool | `false` | [start] | Диагностика: счётчики вызовов каждой функции игры, раз в `ds2_func_counts_every_s` с в `logs/ds2_llamadas.bin` (декодер `tools/analysis/ds2_func_counts.py`) |
-| DS2 | `ds2_func_counts_every_s` | int32 | `10` | [live] | Секунд в окне `ds2_func_counts` |
-| DS2 | `ds2_msr_per_thread` | bool | `false` | [start] | Области `mfmsr/mtmsrd` как состояние потока вместо общего мьютекса SDK (PORTING.md 5.1 порта Dead Space 2) |
-| DS2 | `ds2_fpcr_ftz_fixed` | bool | `false` | [start] | Flush-to-zero FPCR всегда включён (скалярный код тоже); FPCR не переписывается |
 | DS2 | `ds2_capture_dir` | string | `""` | [live] | Diagnostic: folder where guest output frames are saved as PPM (empty = off) |
 | DS2 | `ds2_capture_every_ms` | int32 | `2000` | [live] | Diagnostic: interval between captured frames, ms |
 | DS2 | `ds2_capture_max` | int32 | `60` | [live] | Diagnostic: maximum number of captured frames |
 | DS2 | `ds2_capture_save` | bool | `true` | [live] | Diagnostic: write the PPM files (false = only log size and non-black share of each capture) |
+| DS2 | `ds2_editor_force_free_s` | int32 | `0` | [live] | Experiment: after N s of continuous 'UI busy' (sub_8239A2E8 = 0), answer 'free' (0 = off) |
+| DS2 | `ds2_editor_open_after_s` | int32 | `8` | [live] | Seconds of the black-screen wait (script polling function 130442) before ds2_editor_open_mode acts |
+| DS2 | `ds2_editor_open_mode` | int32 | `0` | [live] | Experiment: on the editor black screen open UI menu type 4 ourselves: 1 = like script command 130459 (sub_8239A2A8), 2 = like 130461 (sub_82 |
+| DS2 | `ds2_editor_wait_log` | bool | `false` | [live] | Log the 'is the UI free' wait that holds the character editor (sub_8239A2E8) every 2 s |
+| DS2 | `ds2_export_stats` | bool | `false` | [live] | DIAGNOSTIC: every heartbeat, log how many times each kernel/XAM export was called since the previous one |
+| DS2 | `ds2_fpcr_ftz_fixed` | bool | `false` | [live] | Keep FPCR flush-to-zero on for scalar code too (read at start; the guest code then never  |
+| DS2 | `ds2_func_counts` | bool | `false` | [live] | Diagnostic: count the calls of every game function and append them to logs/ds2_llamadas.bin every ds2_func_counts_every_s seconds (decoder:  |
+| DS2 | `ds2_func_counts_every_s` | int32 | `10` | [live] | Seconds per ds2_func_counts window |
+| DS2 | `ds2_guest_time_scalar` | double | `1.0` | [init-only] (в меню серым) |  |
+| DS2 | `ds2_guest_time_scalar_at` | int32 | `0` | [init-only] (в меню серым) | Tests: apply ds2_guest_time_scalar only from this many guest seconds on (menus at full speed,  |
 | DS2 | `ds2_input_script` | string | `""` | [init-only] (в меню серым) | Tests: virtual pad script in seconds since start, e.g. \"60:start,70:a,80-82:down\"  |
 | DS2 | `ds2_install_dlc` | string | `""` | [init-only] (в меню серым) | STFS DLC packages to install at startup if missing, separated by ';'  |
 | DS2 | `ds2_mesa_env` | string | `""` | [init-only] (в меню серым) | Mesa/NVK environment variables, 'NAME=value;NAME=value' |
+| DS2 | `ds2_msr_per_thread` | bool | `false` | [live] | mfmsr/mtmsrd regions as per-thread state instead of the process-wide mutex (read at start; PORTING.md 5.1 of the Dead Space 2 Switch port) |
 | DS2 | `ds2_switch_commit_granule_kb` | int32 | `2048` | [live] |  |
+| DS2 | `ds2_switch_cpu_mhz` | int32 | `0` | [init-only] (в меню серым) | Switch: CPU clock for the session in MHz (0 = not touched) |
+| DS2 | `ds2_switch_gpu_mhz` | int32 | `0` | [init-only] (в меню серым) | Switch: GPU clock for the session in MHz (0 = not touched) |
+| DS2 | `ds2_switch_mem_mhz` | int32 | `0` | [init-only] (в меню серым) | Switch: memory clock for the session in MHz (0 = not touched) |
 | DS2 | `ds2_switch_nvmap_mb` | int32 | `0` | [init-only] (в меню серым) |  |
 | DS2 | `ds2_switch_saltynx` | bool | `false` | [init-only] (в меню серым) | Switch: publish FPS/resolution to SaltyNX overlays (Status Monitor) and follow ReverseNX |
+| DS2 | `ds2_switch_stack_sampling` | bool | `false` | [init-only] (в меню серым) | Switch profiler: sample thread stacks into rex_perfil.log (same as logs/rex/perfil_pilas.flag) |
 | DS2 | `ds2_watchdog` | bool | `true` | [init-only] (в меню серым) | Load/hang telemetry in the main log: snapshots of guest threads, open files and memory, file open/close events and stall alarms |
 | DS2 | `ds2_watchdog_heartbeat_s` | int32 | `2` | [init-only] (в меню серым) | Seconds between one-line [ds2 wd] hb heartbeats: vblank counter and the shaders the GPU command processor last bound (0 = off) |
 | DS2 | `ds2_watchdog_probe_pages` | int32 | `0` | [init-only] (в меню серым) | Switch DIAGNOSTIC: every heartbeat, test how many more small kernel mapping changes still  |
@@ -86,7 +90,7 @@
 | Filesystem | `nfsmw_io_trozo_mb` | int32 | `4` | [live] |  |
 | Filesystem | `nfsmw_io_ventana_kb` | int32 | `256` | [live] |  |
 | Filesystem | `nfsmw_io_ventanas_max` | int32 | `16` | [live] | Maximo de ficheros con lectura anticipada a la vez. |
-| GPU | `anisotropic_override` | int32 | `3` | [live] | Forces anisotropic filtering for eligible textures. Higher values keep textures sharper at oblique angles, but increase texture sampling co |
+| GPU | `anisotropic_override` | int32 | `3` | [live] | Forces anisotropic filtering for eligible textures.\nHigher values keep textures sharper at oblique angles, but increase texture sampling co |
 | GPU | `async_shader_compilation` | bool | `true` | [live] | Compile shaders and create pipelines asynchronously in background threads. This reduces stutter but may cause brief visual artifacts while p |
 | GPU | `backend` | string | `"d3d12"` | [live] | Render backendd3d12vulkan |
 | GPU | `clear_memory_page_state` | bool | `true` | [live] | Refresh page-valid state from GPU-written memory at frame end. Disable for minor CPU overhead reduction, but may break memory coherency. |
@@ -96,6 +100,24 @@
 | GPU | `direct_host_resolve` | bool | `true` | [live] | Resolve from host render targets directly to shared memory when possible |
 | GPU | `draw_resolution_scale_x` | int32 | `1` | [restart] | Draw resolution scale X (1 = no scaling) |
 | GPU | `draw_resolution_scale_y` | int32 | `1` | [restart] | Draw resolution scale Y (1 = no scaling) |
+| GPU | `ds2_native_async_pipelines` | bool | `true` | [live] | DS2 native renderer (v55): compile new pipelines on a worker thread; an object whose pipeline is not ready is skipped for those frames inste |
+| GPU | `ds2_native_capture_combo` | bool | `true` | [live] | DS2 native renderer (v55, Switch): holding L3 + R3 (both sticks pressed) for ~1 s traces the next in-game frame into the log and writes its  |
+| GPU | `ds2_native_dump_dir` | string | `""` | [live] | DS2 native renderer (development): directory for PPM dumps of every render target and resolve target, written once at swap ds2_native_dump_s |
+| GPU | `ds2_native_dump_swap` | int32 | `0` | [live] | DS2 native renderer (development): dump at this frame counted among frames with more than 200 draws |
+| GPU | `ds2_native_early_z` | bool | `true` | [live] | DS2 native renderer (v55): early depth test for pixel shaders without kill / depth output / alpha-dependent coverage (the emulation does the |
+| GPU | `ds2_native_fast_pixel_math` | bool | `true` | [live] |  |
+| GPU | `ds2_native_gamma_ramp` | bool | `true` | [live] | DS2 native renderer: apply the game's 256-entry gamma ramp when presenting (as the emulation) |
+| GPU | `ds2_native_gpu_draw_profile_every` | int32 | `0` | [live] | DS2 native renderer (v56): with ds2_native_gpu_profile, one frame in this many gets a GPU timestamp around every draw; the most expensive sh |
+| GPU | `ds2_native_gpu_profile` | bool | `false` | [live] | DS2 native renderer (v54): GPU timestamps around every render pass, resolve, clear and upload; the GPU time per frame and the most expensive |
+| GPU | `ds2_native_hitch_ms` | int32 | `100` | [live] | DS2 native renderer (v55): log what a frame spent its time on when it takes longer than this (0 = never) |
+| GPU | `ds2_native_log_every` | int32 | `300` | [live] | DS2 native renderer: frames between statistics lines in the log (0 = never) |
+| GPU | `ds2_native_max_anisotropy` | int32 | `0` | [live] | DS2 native renderer (v54): anisotropic filtering cap (0/1 = off; the game's request is capped to this) |
+| GPU | `ds2_native_mips` | bool | `true` | [live] | DS2 native renderer (v54): load the mip levels of guest textures (false = base level only, as v51-v53) |
+| GPU | `ds2_native_occlusion_queries` | bool | `false` | [live] | DS2 native renderer (v54): real occlusion queries (Vulkan), the result reaches the game a few frames late. false = a fixed 'visible' result  |
+| GPU | `ds2_native_pass_barriers` | bool | `false` | [live] | DS2 native renderer (v55): full barrier before every render pass (true = as v51-v54; for checking if something renders wrong without it) |
+| GPU | `ds2_native_renderer` | bool | `false` | [restart] | DS2 port (v51, experimental): draw with the native renderer instead of the Xenos emulation  |
+| GPU | `ds2_native_texture_keep_frames` | int32 | `600` | [live] | DS2 native renderer: release guest textures not sampled for this many frames |
+| GPU | `ds2_native_textures` | bool | `true` | [live] | DS2 native renderer: load guest textures (false = a white 1x1 texture everywhere, for checking geometry) |
 | GPU | `dump_shaders` | string | `""` | [live] | Path to dump shaders to |
 | GPU | `execute_unclipped_draw_vs_on_cpu` | bool | `false` | [live] | Execute unclipped draw vertex shader on CPU |
 | GPU | `execute_unclipped_draw_vs_on_cpu_for_psi_render_backend` | bool | `true` | [live] | Execute unclipped draw VS on CPU for PSI render backend |
@@ -119,8 +141,10 @@
 | GPU | `query_occlusion_fake_sample_count` | int32 | `1000` | [live] | Fake sample count for occlusion queries |
 | GPU | `readback_memexport` | bool | `true` | [live] | Enable CPU readback of shader memexport writes for guest memory coherency (can reduce correctness issues, but may add GPU/CPU sync cost) |
 | GPU | `readback_memexport_fast` | bool | `true` | [live] | Use fast double-buffered memexport readback when possible, with automatic fallback to full synchronous readback |
-| GPU | `readback_resolve` | string | `"none"` | [live] | Controls CPU readback of render-to-texture resolve results.  none: Disable readback (default)  fast: Read previous frame (delayed, copy ev |
+| GPU | `readback_resolve` | string | `"none"` | [live] | Controls CPU readback of render-to-texture resolve results.\n none: Disable readback (default)\n fast: Read previous frame (delayed, copy ev |
 | GPU | `readback_resolve_half_pixel_offset` | bool | `false` | [live] | When draw resolution scaling is active, sample from the center of each scaled block during resolve readback downscale |
+| GPU | `render_target_max_height` | int32 | `0` | [live] | DS2 port: maximum height in guest pixels of a host render target (0 = to the end of the EDRAM,  |
+| GPU | `render_target_msaa_alias` | bool | `false` | [live] | DS2 port (v51): 1x and 4xMSAA host render targets at the same EDRAM base, pitch and format share one memory allocation (on NVIDIA a 4xMSAA i |
 | GPU | `resolution_scale` | int32 | `1` | [restart] | Draw resolution scale for both X and Y axes (same as setting draw_resolution_scale_x and draw_resolution_scale_y) |
 | GPU | `resolve_resolution_scale_fill_half_pixel_offset` | bool | `true` | [live] | Fill half pixel offset during resolution scale resolve |
 | GPU | `scale` | int32 | `1` | [live] | Resolution scale |
@@ -147,22 +171,39 @@
 | GPU/Shader | `draw_resolution_scaled_texture_offsets` | bool | `true` | [live] | Scale texture offsets with draw resolution |
 | GPU/Shader | `dxbc_source_map` | bool | `false` | [live] | Generate source maps for DXBC |
 | GPU/Shader | `dxbc_switch` | bool | `true` | [live] | Use switch statements in DXBC |
+| GPU/Vulkan | `gpu_draw_only_every_n_frames` | int32 | `0` | [live] | TESTS on a slow PC (software Vulkan): execute draws and resolves only in one frame of every N  |
 | GPU/Vulkan | `gpu_zone_timing` | bool | `false` | [init-only] (в меню серым) | Switch DIAGNOSTIC: measure GPU time of transfers, resolves, texture loads and output with timestamp queries; reported per frame in rex_perfi |
+| GPU/Vulkan | `gpu_zone_timing_fine` | bool | `false` | [init-only] (в меню серым) | Switch DIAGNOSTIC (with gpu_zone_timing): also time every game draw and every pipeline barrier. Thousands of timestamps per frame, each with |
+| GPU/Vulkan | `gpu_zone_timing_fine_every` | int32 | `0` | [live] | Switch (with gpu_zone_timing): time every game draw and barrier only in one submission of every N (0 = never), reported apart in rex_perfil. |
+| GPU/Vulkan | `readback_resolve_max_bytes` | int32 | `0` | [live] | With readback_resolve: only copy resolves of at most this many bytes back to guest memory  |
 | GPU/Vulkan | `render_target_direct_resolve` | bool | `false` | [live] | Fast 32bpp resolves (the usual render-to-texture copy) straight from the host render targets into guest memory in one compute pass, instead  |
 | GPU/Vulkan | `render_target_direct_resolve_validate` | int32 | `0` | [live] | DEVELOPMENT (with render_target_direct_resolve): also do every direct resolve the usual way and compare the bytes written to guest memory wh |
 | GPU/Vulkan | `render_target_path_vulkan` | string | `""` | [init-only] (в меню серым) | Vulkan render target implementation path |
+| GPU/Vulkan | `render_target_transfer_elide_extended` | bool | `false` | [live] | With render_target_transfer_elide_overwritten: also recognise depth-only draws (EDRAM depth-only mode: depth pre-passes, shadow maps and the |
 | GPU/Vulkan | `render_target_transfer_elide_overwritten` | bool | `false` | [live] | Skip render target ownership transfers into areas that the draw binding the render targets  |
 | GPU/Vulkan | `render_target_transfer_skip` | int32 | `0` | [live] | Leave out render target ownership transfer draws (bitmask): 1 = stencil-bit passes, 2 = depth/stencil transfers, 4 = color transfers. Faster |
+| GPU/Vulkan | `render_target_transfer_skip_kinds` | int32 | `0` | [live] | DS2 port (v49), finer than render_target_transfer_skip - leave out ownership transfer draws of these kinds (bitmask): 1 = depth 4x->1x same  |
+| GPU/Vulkan | `resolve_dump_dir` | string | `""` | [live] | DIAGNOSTIC: folder (relative to the executable) where every resolve of one frame is written as raw guest memory, with index.txt. Empty = off |
+| GPU/Vulkan | `resolve_dump_every_s` | int32 | `30` | [live] | DIAGNOSTIC: seconds between resolve dumps |
+| GPU/Vulkan | `resolve_dump_max` | int32 | `10` | [live] | DIAGNOSTIC: maximum number of resolve dumps |
+| GPU/Vulkan | `resolve_dump_max_mb` | int32 | `96` | [live] | DIAGNOSTIC: host buffer for one resolve dump, MB |
+| GPU/Vulkan | `resolve_dump_start_s` | int32 | `0` | [live] | DIAGNOSTIC: no resolve dump before this many seconds after the first frame |
 | GPU/Vulkan | `rt_transfer_stats` | int32 | `0` | [live] | DEVELOPMENT: log a histogram of render target ownership transfers (destination <- source key) every N render targets receiving transfers (0  |
+| GPU/Vulkan | `rt_transfer_stats_reset` | bool | `false` | [live] | With rt_transfer_stats: start counting again after every printout (per interval, not per session) |
 | GPU/Vulkan | `rt_transfer_trace` | int32 | `0` | [live] | DEVELOPMENT (with rt_transfer_stats): log every transfer of 200 destination updates starting at this update number (0 = off) |
 | GPU/Vulkan | `vulkan_async_skip_incomplete_frames` | bool | `true` | [live] | When async shader compilation is enabled, skip presenting frames that used placeholder pipelines to avoid visible flashing |
+| GPU/Vulkan | `vulkan_barrier_stats` | int32 | `0` | [live] | Development: every N frames log where pipeline barriers come from (call sites) and their stage masks. 0 = off |
 | GPU/Vulkan | `vulkan_dynamic_rendering` | bool | `true` | [live] | Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the device (falls back to render passes otherwise) |
 | GPU/Vulkan | `vulkan_force_convert_quad_lists_to_triangle_lists` | bool | `false` | [init-only] (в меню серым) | Force Vulkan quad list conversion to triangle lists in primitive processing, even when geometry shaders are available |
 | GPU/Vulkan | `vulkan_force_expand_point_sprites_in_vs` | bool | `false` | [init-only] (в меню серым) | Force Vulkan point sprite expansion in the vertex shader, even when geometry shaders are available |
 | GPU/Vulkan | `vulkan_force_expand_rectangle_lists_in_vs` | bool | `false` | [init-only] (в меню серым) | Force Vulkan rectangle list expansion in the vertex shader, even when geometry shaders are available |
+| GPU/Vulkan | `vulkan_max_frames_in_flight` | int32 | `3` | [live] |  |
+| GPU/Vulkan | `vulkan_memory_report_frames` | int32 | `0` | [live] | Every N frames log GPU memory in use (Vulkan heap usage), textures and render targets. 0 = off |
 | GPU/Vulkan | `vulkan_pipeline_creation_threads` | int32 | `-1` | [restart] | Number of pipeline creation threads for Vulkan async pipeline creation (-1 for auto) |
 | GPU/Vulkan | `vulkan_readback_memexport` | bool | `false` | [live] | Read data written by memory export in shaders on the CPU |
 | GPU/Vulkan | `vulkan_readback_resolve` | bool | `false` | [live] | Read render-to-texture results on the CPU |
+| GPU/Vulkan | `vulkan_render_target_budget_mb` | int32 | `0` | [live] | DS2 port: when the Vulkan heaps hold more than this many MB (checked every 30 frames), release the render targets owning no EDRAM data befor |
+| GPU/Vulkan | `vulkan_shared_memory_hoist_uploads` | bool | `false` | [live] | Copy guest memory pages that nothing in the current submission has used yet at the start of the submission, with one pair of barriers, inste |
 | GPU/Vulkan | `vulkan_sparse_shared_memory` | bool | `true` | [restart] | Use sparse shared memory on Vulkan |
 | GPU/Vulkan | `vulkan_submit_on_primary_buffer_end` | bool | `true` | [live] | Submit command buffer when PM4 primary buffer ends |
 | GPU/Vulkan | `vulkan_tessellation_wireframe` | bool | `false` | [live] | Render tessellation as wireframe |
@@ -174,6 +215,31 @@
 | Input | `mnk_mode` | bool | `false` | [live] | Enable keyboard/mouse controller emulation |
 | Input | `mnk_mouse` | bool | `false` | [live] | Use the mouse for the right stick. Off means the right stick comes from the keybind_rstick_* keys only |
 | Input | `mnk_sensitivity` | double | `1.0` | [live] | Mouse sensitivity for right stick |
+| Input/Keybinds/Controller | `keybind_a` | string | `"Semicolon` | [live] | A button |
+| Input/Keybinds/Controller | `keybind_b` | string | `"Quote` | [live] | B button |
+| Input/Keybinds/Controller | `keybind_back` | string | `"Z` | [live] | Back button |
+| Input/Keybinds/Controller | `keybind_dpad_down` | string | `"Shift+Down"` | [live] | D-pad down |
+| Input/Keybinds/Controller | `keybind_dpad_left` | string | `"Shift+Left"` | [live] | D-pad left |
+| Input/Keybinds/Controller | `keybind_dpad_right` | string | `"Shift+Right"` | [live] | D-pad right |
+| Input/Keybinds/Controller | `keybind_dpad_up` | string | `"Shift+Up"` | [live] | D-pad up |
+| Input/Keybinds/Controller | `keybind_guide` | string | `""` | [live] | Guide button |
+| Input/Keybinds/Controller | `keybind_left_shoulder` | string | `"1"` | [live] | Left shoulder |
+| Input/Keybinds/Controller | `keybind_left_trigger` | string | `"Q` | [live] | Left trigger |
+| Input/Keybinds/Controller | `keybind_lstick_down` | string | `"S"` | [live] | Left stick down |
+| Input/Keybinds/Controller | `keybind_lstick_left` | string | `"A"` | [live] | Left stick left |
+| Input/Keybinds/Controller | `keybind_lstick_press` | string | `"F"` | [live] | Left stick press |
+| Input/Keybinds/Controller | `keybind_lstick_right` | string | `"D"` | [live] | Left stick right |
+| Input/Keybinds/Controller | `keybind_lstick_up` | string | `"W"` | [live] | Left stick up |
+| Input/Keybinds/Controller | `keybind_right_shoulder` | string | `"3"` | [live] | Right shoulder |
+| Input/Keybinds/Controller | `keybind_right_trigger` | string | `"E` | [live] | Right trigger |
+| Input/Keybinds/Controller | `keybind_rstick_down` | string | `"Down"` | [live] | Right stick down |
+| Input/Keybinds/Controller | `keybind_rstick_left` | string | `"Left"` | [live] | Right stick left |
+| Input/Keybinds/Controller | `keybind_rstick_press` | string | `"K"` | [live] | Right stick press |
+| Input/Keybinds/Controller | `keybind_rstick_right` | string | `"Right"` | [live] | Right stick right |
+| Input/Keybinds/Controller | `keybind_rstick_up` | string | `"Up"` | [live] | Right stick up |
+| Input/Keybinds/Controller | `keybind_start` | string | `"X` | [live] | Start button |
+| Input/Keybinds/Controller | `keybind_x` | string | `"L"` | [live] | X button |
+| Input/Keybinds/Controller | `keybind_y` | string | `"P"` | [live] | Y button |
 | Kernel | `cl` | string | `""` | [live] | Specify additional command-line provided to guest |
 | Kernel | `content_backup_root` | string | `""` | [live] | Carpeta donde dejar una copia de cada guardado, con una subcarpeta por perfil. Vacia = no se copia nada |
 | Kernel | `headless` | bool | `false` | [live] | Don't display any UI, using defaults for prompts as needed |
@@ -259,5 +325,3 @@
 | crt | `rexcrt_heap_enable` | bool | `false` | [init-only] (в меню серым) | Enable o1heap-backed CRT heap for RtlAllocateHeap/Free/Size/ReAlloc |
 | crt | `rexcrt_heap_size_mb` | uint32 | `256` | [init-only] (в меню серым) | Heap size in megabytes |
 | {} | `echo` | command_args | `[](std::string_view args` | [live] |  |
-
-Раскладка кнопок (`Input/Keybinds/Controller`, 25 шт.) опущена.

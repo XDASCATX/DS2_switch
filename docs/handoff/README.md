@@ -1,5 +1,7 @@
 # DS2 SotFS (Xbox 360) → Nintendo Switch: передача проекта
 
+> **Исторический документ (2026-10-19).** Текущее состояние — [../HANDOFF.md](../HANDOFF.md), индекс — [../README.md](../README.md).
+
 Снимок состояния на 2026-10-19. Цель проекта — нативный порт Dark Souls II: Scholar of the First Sin (только версия Xbox 360, title ID `465307E4`) на Nintendo Switch через статическую рекомпиляцию PowerPC → C++. Техническая база — [NFSMW-NX](https://github.com/StevensND/nfsmw-nx) и её SDK ReXGlue.
 
 ## Где мы сейчас
