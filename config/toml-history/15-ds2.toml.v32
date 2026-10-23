@@ -1,0 +1,27 @@
+# DS2 Switch - v32 (first real GPU optimization), v32 NRO = v30 + two changes below. Compare with v30.
+# v30: level loads, correct colours, ~3-5 FPS. v32: render target transfers that the next draw overwrites
+# completely (the game's clears) are no longer drawn - see docs/handoff/16-switch-gpu-optimization.md.
+log_level = "info"
+ds2_watchdog = true
+ds2_switch_saltynx = false
+ds2_mesa_env = "MESA_SHADER_CACHE_DIR=sdmc:/switch/ds2/mesa_cache_head;NOUVEAU_HORIZON_BO_CACHE_MB=16;NVK_SWITCH_PERF_LOG=1"
+nfsmw_io_rangos_mb = 0
+ds2_switch_nvmap_mb = 64
+# Smaller host texture cache (heap headroom on the console).
+texture_cache_memory_limit_soft = 128
+texture_cache_memory_limit_hard = 256
+texture_cache_memory_limit_soft_lifetime = 5
+ds2_watchdog_probe_tables = 0
+# Guest memory in 2 MB pieces (fewer kernel page tables); 6 MB host stacks are the Switch default.
+ds2_switch_commit_granule_kb = 2048
+occlusion_query_enable = false
+# MODE 7 as a permanent setting: depth transfers skip the 8 stencil-bit passes (NVK has no stencil export).
+render_target_transfer_skip = 1
+edram_diagnostic_mode = 0
+# NEW in v32:
+# Clears and other unclipped screen rectangles: height from their vertices instead of "to the end of EDRAM".
+execute_unclipped_draw_vs_on_cpu = true
+# Do not transfer old EDRAM contents into areas the draw then overwrites completely (same image, less GPU work).
+render_target_transfer_elide_overwritten = true
+# GPU time per kind of work in rex_perfil.log (small overhead); set to false for the cleanest FPS number.
+gpu_zone_timing = true

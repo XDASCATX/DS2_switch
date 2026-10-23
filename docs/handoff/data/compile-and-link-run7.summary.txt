@@ -1,0 +1,10 @@
+# full compile of app/generated/diag-dataonly (run7)
+CONFIGURE_EXIT=0
+BUILD_EXIT=0 SECONDS=788
+errors: 0 warnings: 0
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 13:07.83
+	Maximum resident set size (kbytes): 1402544
+objects: 336
+# link probe (dummy main, --no-undefined, librexruntime.so)
+LINK_EXIT=0
+guest functions in binary (__imp__sub_*): 83610; named (xstart, save/restore helpers): 237; all 83847 registered in ds2_register.cpp

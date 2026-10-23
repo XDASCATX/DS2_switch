@@ -1,0 +1,56 @@
+# DS2 Switch - v56. The only test file: native renderer (no Xenos emulation).
+# v56 (CPU side - v55 was limited by the CPU, not the GPU): mtmsrd regions without the process-wide mutex, constant
+# buffers as dynamic offsets (one descriptor set per frame), texture descriptor sets reused within a frame, constant
+# register writes without per-write lookups, faster texture untiling, sub-resolve search cached; GPU side: pixel
+# shaders may fuse multiply-add; one frame in 900 profiled per draw. See docs/handoff/18-native-renderer.md.
+log_level = "info"
+ds2_watchdog = true
+ds2_switch_saltynx = true
+ds2_mesa_env = "MESA_SHADER_CACHE_DIR=sdmc:/switch/ds2/mesa_cache_v33;NOUVEAU_HORIZON_BO_CACHE_MB=16;NVK_SWITCH_PERF_LOG=1"
+nfsmw_io_rangos_mb = 0
+ds2_switch_nvmap_mb = 64
+ds2_watchdog_probe_tables = 0
+# Guest memory in 2 MB pieces (fewer kernel page tables).
+ds2_switch_commit_granule_kb = 2048
+# Thread stack samples in rex_perfil.log.
+ds2_switch_stack_sampling = true
+audio_xma_estado = false
+ds2_func_counts = false
+ds2_func_counts_every_s = 10
+ds2_editor_wait_log = false
+ds2_editor_force_free_s = 0
+ds2_editor_open_mode = 0
+ds2_editor_open_after_s = 8
+# v56: mfmsr/mtmsrd regions as per-thread state (v41B: same behavior); v55 showed ~25 % of the main thread
+# waiting on the shared mutex.
+ds2_msr_per_thread = true
+ds2_fpcr_ftz_fixed = false
+ds2_export_stats = true
+
+# --- clocks for the session (Horizon OC / sys-clk override; released when the game exits; 0 = not touched) ---
+ds2_switch_cpu_mhz = 1963
+ds2_switch_gpu_mhz = 1267
+ds2_switch_mem_mhz = 0
+
+# --- native renderer ---
+ds2_native_renderer = true
+ds2_native_log_every = 300
+# GPU time per pass kind ("[native gpu]" lines) and command processor CPU time ("[native] cpu ms per frame").
+ds2_native_gpu_profile = true
+# A frame longer than this many ms is explained in the log ("[native] hitch").
+ds2_native_hitch_ms = 100
+ds2_native_mips = true
+ds2_native_max_anisotropy = 0
+ds2_native_early_z = true
+ds2_native_async_pipelines = true
+# true = full barrier before every render pass, as v51-v54 (only to check a rendering error).
+ds2_native_pass_barriers = false
+# true = real occlusion queries (v54: enemies blinked); false = always visible.
+ds2_native_occlusion_queries = false
+# Hold L3 + R3 (both sticks pressed) ~1 s: the next frame is traced into the log and its images are written to
+# sdmc:/switch/ds2/native_dump/capture_NN (a few seconds of freeze, ~50 MB).
+ds2_native_capture_combo = true
+# v56: pixel shaders may fuse multiply-add (vertex shaders stay exact).
+ds2_native_fast_pixel_math = true
+# v56: one frame in this many gets a GPU timestamp per draw ("[native gpu draws]" lines).
+ds2_native_gpu_draw_profile_every = 900

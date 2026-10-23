@@ -1,0 +1,15 @@
+DS2 Switch - diag8, test 12
+===========================
+Test 11: the fix worked for what it targeted - the game's memory mirrors went from 7,214 kernel blocks to 800
+(6,687 merges, 0 failures), the whole process stayed at ~4,400 blocks. But the GPU buffer creation failed with the
+same 2001-0103 anyway, at the same moment (t=48 s, start of the level load). So the block count was a real problem
+but not the one that stops the game.
+
+The next candidate is the memory libnx hands to nvservices (the GPU driver service) to keep track of every GPU
+memory object: 8 MB by default. nfsmw-nx hit the same wall ("the game died with 3,585 cached textures") and made it
+configurable. diag8 adds that setting (ds2_switch_nvmap_mb) and logs the process resource limits every 10 s.
+
+Setup: copy diag8/ds2.nro as sdmc:/switch/ds2/ds2.nro, ds2.toml.test12 as ds2.toml, rename the old logs folder.
+Do not open the overlay. Same steps: Continue -> intro -> loading; if the world appears walk for a minute,
+otherwise wait 3 minutes; exit with HOME -> Close if possible. Send the whole logs folder + notes.
+If the game does not start at all with this setting, write that down and put ds2_switch_nvmap_mb = 32, then 16.

@@ -1,0 +1,13 @@
+DS2 Switch - diag5, tests 8 and 9
+=================================
+What tests 6 and 7 (new driver) showed: no more "GPU does not accept work" warnings. Instead, during the level load
+the driver could not create a 2 MB GPU buffer: nvMapCreate failed with 0xCE01 = kernel 2001-0103 "resource
+exhausted", then "out of device memory", and right after that even writing the log file failed. The system ran out
+of a kernel resource (memory mappings / memory blocks / page tables), not of game memory.
+
+diag5 = diag4 + in every heartbeat (every 2 s, also in ds2_wd_last.txt): number of memory blocks of the process,
+the kernel "system resource" used/total, heap in use. That shows which resource grows until it runs out.
+
+Setup: copy diag5/ds2.nro as sdmc:/switch/ds2/ds2.nro, rename the old logs folder.
+Test 8 (ds2.toml.test8), then test 9 (ds2.toml.test9). Same steps: Continue -> intro -> loading, wait up to
+10 minutes, HOME every ~2 minutes, exit with HOME -> Close if possible. Send the whole logs folder + notes.

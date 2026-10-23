@@ -1,0 +1,21 @@
+DS2 Switch - diag9, tests 15 and 16
+===================================
+Tests 12 and 13: neither 64 MB for nvservices nor a smaller texture cache changed anything. The failure (2001-0103
+when making a GPU upload buffer uncached) always comes 0.1-1 s after the game opens the level's sound bank
+(frpg2_sm1002.fsb), whatever the heap size (2,351 MB in test 13), block count (~4,400) or driver.
+What does happen at that exact moment, in every test, is a storm of GPU write-watch activity: thousands of guest
+memory pages are unprotected and remapped within 2-4 s (merged_runs jumps by ~3,000-4,000; before the fix the block
+count jumped by ~6,000). The working idea now: each such 4 KB remap costs the console kernel an internal object
+(page tables / mapping records shared with the whole system), and the storm exhausts that pool.
+
+diag9:
+  * SDK guest memory: consecutive pages that need the same operation are now mapped/unmapped in ONE kernel call
+    instead of one call per 4 KB page (a lifted watch can cover up to 4 MB = 1,024 calls before).
+  * a DIAGNOSTIC switch diag_disable_gpu_write_watch: no page protection for GPU write watches at all.
+    Textures may then be wrong or stale - that is expected; the question is only whether the load gets through.
+  * ds2_wd_last.txt is no longer left empty when the final write fails.
+
+Setup: copy diag9/ds2.nro as sdmc:/switch/ds2/ds2.nro. Rename the old logs folder before each test.
+Test 15: ds2.toml.test15. Test 16: ds2.toml.test16. Same steps as always (Continue -> intro -> loading; if the world
+appears walk for a minute, else wait 3 min; exit with HOME -> Close if possible). Note for test 16 especially:
+does the picture of the world appear, and what does it look like (photo welcome)?

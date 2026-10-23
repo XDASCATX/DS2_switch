@@ -1,0 +1,54 @@
+# DS2 Switch - v37 (diagnostic of the character creation black screen). Same settings as v36, plus:
+#  1. resolve_dump_dir: every 40 s one whole frame is saved to sdmc:/switch/ds2/dumps37/dump_NN (every
+#     render-to-texture result of that frame + the final image, raw, ~40 MB per dump, 12 dumps max). The game
+#     freezes ~1-3 s while a dump is written: this is expected. Please stay in the black editor screen
+#     for at least 2 minutes so several dumps land there, then send the dumps37 folder with the logs.
+#  2. Log of draws that write memory from shaders (memexport).
+# Variant B (ds2.toml.B): the same + every render-to-texture result copied back to game memory
+# (readback_resolve_max_bytes = 0, slower). Use it only for the second run.
+log_level = "info"
+ds2_watchdog = true
+ds2_switch_saltynx = false
+ds2_mesa_env = "MESA_SHADER_CACHE_DIR=sdmc:/switch/ds2/mesa_cache_v33;NOUVEAU_HORIZON_BO_CACHE_MB=16;NVK_SWITCH_PERF_LOG=1"
+nfsmw_io_rangos_mb = 0
+ds2_switch_nvmap_mb = 64
+# Smaller host texture cache (heap headroom on the console).
+texture_cache_memory_limit_soft = 128
+texture_cache_memory_limit_hard = 256
+texture_cache_memory_limit_soft_lifetime = 5
+ds2_watchdog_probe_tables = 0
+# Guest memory in 2 MB pieces (fewer kernel page tables); 6 MB host stacks are the Switch default.
+ds2_switch_commit_granule_kb = 2048
+# MODE 7 as a permanent setting: depth transfers skip the 8 stencil-bit passes (NVK has no stencil export).
+render_target_transfer_skip = 1
+edram_diagnostic_mode = 0
+# v32: clears and other unclipped screen rectangles: height from their vertices instead of "to the end of EDRAM".
+execute_unclipped_draw_vs_on_cpu = true
+# v32: do not transfer old EDRAM contents into areas the draw then overwrites completely (same image, less GPU work).
+render_target_transfer_elide_overwritten = true
+# NEW in v33: the same for depth-only draws (shadow maps, depth clears) and clipped full-screen passes.
+render_target_transfer_elide_extended = true
+# NEW in v33: one-pass resolves (same bytes in game memory as before - checked byte by byte on PC).
+render_target_direct_resolve = true
+# GPU time per kind of work in rex_perfil.log (same as v32, so the numbers compare).
+gpu_zone_timing = true
+# v34: per-draw/per-barrier GPU timestamps off (were on in v33).
+gpu_zone_timing_fine = false
+# v35: at most 2 frames queued for the GPU (was 3): one frame less of input latency while the GPU is the limit.
+vulkan_max_frames_in_flight = 2
+# v35 statistics (log lines every few seconds, no effect on the image).
+vulkan_barrier_stats = 600
+vulkan_memory_report_frames = 300
+rt_transfer_stats = 4000
+rt_transfer_stats_reset = true
+ds2_switch_stack_sampling = true
+# v36: uploads at the start of the frame (see 1. above).
+vulkan_shared_memory_hoist_uploads = true
+# v36: CPU copies of small resolves (see 2. above).
+readback_resolve = "fast"
+readback_resolve_max_bytes = 65536
+# v37 diagnostic
+resolve_dump_dir = "dumps37"
+resolve_dump_every_s = 40
+resolve_dump_max = 12
+resolve_dump_max_mb = 64

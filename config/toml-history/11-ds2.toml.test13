@@ -1,0 +1,11 @@
+# Test 13 - same diag8 NRO, test 12 settings, plus a much smaller host texture cache (the SDK allows 384 MB soft /
+# 768 MB hard by default). The level load allocated ~250-570 MB in 2 s right before every failure.
+log_level = "info"
+ds2_watchdog = true
+ds2_switch_saltynx = false
+ds2_mesa_env = "MESA_SHADER_CACHE_DIR=sdmc:/switch/ds2/mesa_cache_head;NOUVEAU_HORIZON_BO_CACHE_MB=16"
+nfsmw_io_rangos_mb = 0
+ds2_switch_nvmap_mb = 64
+texture_cache_memory_limit_soft = 128
+texture_cache_memory_limit_hard = 256
+texture_cache_memory_limit_soft_lifetime = 5

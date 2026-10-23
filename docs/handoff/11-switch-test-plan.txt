@@ -1,0 +1,46 @@
+DS2 Switch - diagnostic build diag2 (branch diag/switch-level-load), test plan
+=============================================================================
+
+What this build adds (game code, SDK and Mesa unchanged):
+  * [ds2 wd] lines in the main log: a heartbeat every 2 s (process alive, vblank counter, shaders last bound by the
+    GPU command processor), a snapshot of all game threads / open game files every 10 s, the list of game files
+    opened and closed, and a STALL alarm if nothing moves for 5 s. The log is flushed after each of them.
+  * FPS bridge to SaltyNX / Status-Monitor OFF by default (ds2_switch_saltynx).
+  * DLC folder: macOS "._..." files are skipped; the install time is logged.
+  * ds2_mesa_env setting (Mesa/NVK environment variables) for test 2.
+
+0. Preparation
+  - Keep the current sdmc:/switch/ds2/ds2.nro: rename it to ds2_v1.nro (same folder) - do not delete it.
+  - Copy ds2.nro from this folder to sdmc:/switch/ds2/ds2.nro (sha256 in ds2.nro.sha256).
+  - Move the old logs away: rename sdmc:/switch/ds2/logs to logs_v1 (a new logs folder is created).
+  - Optional: delete sdmc:/switch/ds2/dlc/._D4B91B6B4DA1509C280F56F77B09203DE7D39AE646 (macOS copy, not a DLC).
+  - Overlay off for this test (safe, reversible): in sdmc:/atmosphere/contents/420000000007E51A/flags/ rename
+    boot2.flag to boot2.flag.off (this is ovlloader, the program in the crash report). If SaltyNX is installed,
+    do the same in its folder (usually sdmc:/atmosphere/contents/0000000000534C56/flags/). Reboot the console.
+    To restore later: rename back to boot2.flag and reboot.
+
+1. Test 1 (copy ds2.toml.test1 as sdmc:/switch/ds2/ds2.toml)
+  - Start ds2.nro from the Homebrew Menu holding R (title takeover), as before.
+  - Continue is fine, but New Game reproduces the original path best: New Game -> intro movie -> black screen.
+  - When the black screen appears, note the time and WAIT 5 MINUTES without pressing anything. Then note:
+      a) does the picture ever appear? b) is the sound still going, or looping? c) the blue circle: where exactly,
+      does it move/spin? (a photo of the TV/screen helps a lot)
+      d) press B and the stick once: any reaction? e) press HOME: does the HOME menu open?
+  - Exit the cleanest way that still works and WRITE DOWN which one it was:
+      HOME -> close software  /  hold POWER 12 s (forced off).
+    (A forced power-off can cut the last seconds of the log: then the end of the log is not the moment of the hang.)
+
+2. Only if the screen stays black in test 1: test 2 (ds2.toml.test2), same steps. Then test 3 (ds2.toml.test3).
+   Rename the logs folder between tests (logs_test1, logs_test2, ...) so the files do not mix.
+
+3. What to send back (copy into SW1_ds2/ds2_logs/<test name>/ on the Mac):
+  - sdmc:/switch/ds2/logs/ds2_*.log           main log (one numbered file per start; send all of them)
+  - sdmc:/switch/ds2/logs/rex/rex_perfil.log  CPU per thread, FPS, memory every 10 s (rewritten on every start!
+                                              copy it after the test and before starting the game again)
+  - sdmc:/switch/ds2/logs/rex/rex_stderr.log  Mesa/NVK and SaltyNX messages (also rewritten on every start)
+  - sdmc:/switch/ds2/logs/rex/rex_crash.log and sdmc:/switch/rex_crash.log, if they exist
+  - sdmc:/atmosphere/crash_reports/ - only the files newer than the test (the name starts with the time)
+  - your notes a)-e) and how you exited.
+
+Optional deeper capture (heavier, only if asked): create an empty file sdmc:/switch/ds2/logs/rex/perfil_pilas.flag
+before starting; the profiler then samples the stacks of busy threads (the game runs a bit slower).
