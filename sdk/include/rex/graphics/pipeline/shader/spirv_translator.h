@@ -26,6 +26,10 @@ namespace rex::graphics {
 
 class SpirvShaderTranslator : public ShaderTranslator {
  public:
+  // DS2 v56: pixel shaders without NoContraction (multiply-add fusion allowed). Vertex shaders keep it, so
+  // positions stay bit-identical between passes (depth EQUAL tests).
+  void SetPixelShaderContraction(bool allow) { pixel_shader_contraction_ = allow; }
+
   union Modification {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
@@ -764,6 +768,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool is_depth_only_fragment_shader_ = false;
 
   std::unique_ptr<SpirvBuilder> builder_;
+  bool pixel_shader_contraction_ = false;
 
   std::vector<spv::Id> id_vector_temp_;
   // For helper functions like operand loading, so they don't conflict with

@@ -35,6 +35,9 @@ class SpirvBuilder : public spv::Builder {
                        spv::Id operand3, spv::Id operand4);
 
   spv::Id createNoContractionUnaryOp(spv::Op op_code, spv::Id type_id, spv::Id operand);
+  // DS2 v56: when set, the "NoContraction" ops are emitted without the decoration (the driver may fuse multiply-add
+  // and reassociate). Used for pixel shaders of the native renderer only.
+  bool allow_contraction = false;
   spv::Id createNoContractionBinOp(spv::Op op_code, spv::Id type_id, spv::Id operand1,
                                    spv::Id operand2);
 
