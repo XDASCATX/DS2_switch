@@ -18,7 +18,7 @@
 An experimental port of the **Xbox 360** release (Title ID `465307E4`) using static PowerPC-to-C++ recompilation with ReXGlue and a custom Vulkan renderer on Mesa NVK. This is not a PC-version port or an Xbox 360 emulator.
 
 > [!IMPORTANT]
-> **0.56 (v56) is the first public test build, not a finished or 30 FPS release.** v56 reached the menu and an in-game frame in PC tests; it has **not yet been tested on a Switch**. In the last console-tested build (v55), the game ran at approximately 20 FPS in the tested areas and dropped to 8 FPS during loading. See [known issues](docs/known-issues.md) before installing.
+> **0.56 (v56) is the first test release candidate, not a finished or 30 FPS release.** The GitHub repository is currently **private**, so the release is available only to people with access. v56 reached the menu and an in-game frame in PC tests; it has **not yet been tested on a Switch**. In the last console-tested build (v55), the game ran at approximately 20 FPS in the tested areas and dropped to 8 FPS during loading. See [known issues](docs/known-issues.md) before installing.
 
 ## Download and install
 
