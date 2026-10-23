@@ -77,7 +77,20 @@ The [Mesa NVK patch](tools/switch/toolchain/mesa-switch-ds2-perf.patch) adds dir
 
 ## Release & repository
 
-The [0.56 release](https://github.com/XDASCATX/DS2_switch/releases/tag/v0.56) contains `ds2.nro` and `ds2.toml`, plus an optional NSP that points to `sdmc:/switch/ds2/ds2.nro` (it contains neither the NRO nor game files). The game expects its own files under `sdmc:/switch/ds2/game_root/`; [release notes](RELEASE_0.56.md) describe the required layout. The forwarder is unsigned homebrew and its launch has not been verified on a physical Switch.
+The [0.56 release](https://github.com/XDASCATX/DS2_switch/releases/tag/v0.56) contains `ds2.nro` and `ds2.toml`, plus an optional NSP that points to `sdmc:/switch/ds2/ds2.nro` (it contains neither the NRO nor game files). Keep the original game directory structure inside `game_root/`:
+
+```text
+sdmc:/switch/ds2/
+  ds2.nro
+  ds2.toml
+  game_root/Default.xex
+  game_root/GameData1.bdt, GameData1.bhd, GameData2.bdt, GameData2.bhd, ...
+  dlc/<your Compatibility Pack 4 STFS file>    # needed on first launch
+  user/                                         # created by the port; saves and installed DLC
+  logs/                                         # created by the port
+```
+
+See the [release notes](RELEASE_0.56.md) for installation details. The forwarder is unsigned homebrew and its launch has not been verified on a physical Switch.
 
 > [!WARNING]
 > The supplied v56/0.56 configuration requests **CPU 1963 MHz / GPU 1267 MHz**, leaves the memory clock unchanged and enables detailed logs. These are non-stock clocks and require a suitable clock sysmodule and hardware. A crash may leave the override active until it is cleared or the console is restarted. Stable 30 FPS everywhere is a development goal, not a release claim.
