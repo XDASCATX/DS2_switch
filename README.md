@@ -1,15 +1,11 @@
  <p align="center">
   <img src="https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/335300/logo.png" alt="DARK SOULS II: Scholar of the First Sin" width="620">
 </p>
-
 <h1 align="center">DARK SOULS II: Scholar of the First Sin</h1>
- <h2> align="center">Nintendo Switch</h1>
+<h2 align="center">Nintendo Switch</h2>
 
 <p align="center">
-  <strong>Experimental
-   Xbox 360
-   Native rendering
-  </strong>
+  <sub>EXPERIMENTAL PORT · XBOX 360 · NATIVE RENDERING</sub>
 </p>
 
 <p align="center">
