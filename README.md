@@ -2,8 +2,8 @@
   <img src="https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/335300/logo.png" alt="DARK SOULS II: Scholar of the First Sin" width="620">
 </p>
 
-<h1 align="center">DARK SOULS II: Scholar of the First Sin
- Nintendo Switch</h1>
+<h1 align="center">DARK SOULS II: Scholar of the First Sin</h1>
+ <h1>Nintendo Switch</h1>
 
 <p align="center">
   <strong>Experimental
