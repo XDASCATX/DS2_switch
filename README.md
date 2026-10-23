@@ -15,47 +15,83 @@
   <img src="https://img.shields.io/badge/renderer-native-5C2D91?style=for-the-badge" alt="Native renderer">
 </p>
 
-An experimental port of the **Xbox 360** release (Title ID `465307E4`) using static PowerPC-to-C++ recompilation with ReXGlue and a custom Vulkan renderer on Mesa NVK. This is not a PC-version port or an Xbox 360 emulator.
+An experimental Nintendo Switch port of the **Xbox 360** release (Title ID `465307E4`). It statically recompiles the game's PowerPC executable to ARM64 and renders through a purpose-built Vulkan backend on Mesa NVK. **This is neither an Xbox 360 emulator nor a port of the PC version.**
 
-> [!IMPORTANT]
-> **0.56 (v56) is the first test release candidate, not a finished or 30 FPS release.** The GitHub repository is currently **private**, so the release is available only to people with access. v56 reached the menu and an in-game frame in PC tests; it has **not yet been tested on a Switch**. In the last console-tested build (v55), the game ran at approximately 20 FPS in the tested areas and dropped to 8 FPS during loading. See [known issues](docs/known-issues.md) before installing.
+> [!NOTE]
+> The [0.56 test build](https://github.com/XDASCATX/DS2_switch/releases/tag/v0.56) includes an NRO, its configuration and an optional HOME Menu forwarder. You need your **own Xbox 360 game files** and Compatibility Pack 4; none are distributed here. The repository is currently private, so the release is available only to people with access.
 
-## Download and install
+## Approach
 
-Download `ds2.nro` and `ds2.toml` from the [0.56 release](https://github.com/XDASCATX/DS2_switch/releases/tag/v0.56). Optionally download `ds2-0.56-forwarder.nsp` to start from the HOME Menu **without opening Sphaira**. The NSP is only a shortcut: it does not contain the NRO, the game, or console keys.
-
-You must supply your **own Xbox 360 copy** of *Scholar of the First Sin* with `Default.xex` (the base executable for Title ID `465307E4`), game data and the **Compatibility Pack 4** DLC package. No game files or DLC are included. Copy them to the SD card as follows:
-
-```text
-sdmc:/switch/ds2/
-  ds2.nro
-  ds2.toml
-  game_root/Default.xex
-  game_root/GameData1.bdt, GameData1.bhd, GameData2.bdt, GameData2.bhd, ...
-  dlc/<your Compatibility Pack 4 STFS file>    # needed on first launch
-  user/                                         # created by the port; saves and installed DLC
-  logs/                                         # created by the port
+```mermaid
+flowchart LR
+    XEX["Default.xex<br/>PowerPC"] -->|ReXGlue codegen| CPP["C++<br/>every xex function"]
+    CPP --> NRO["NRO · ARM64"]
+    RT["ReXGlue runtime<br/>kernel · XAM · VFS · XMA · input"] --> NRO
+    HZN["Horizon layer<br/>memory · threads · clocks · present"] --> NRO
+    NRO --> PM4["Xenos PM4 ring"]
+    PM4 --> NAT["Native renderer<br/>Vulkan"]
+    NAT --> NVK["Mesa NVK<br/>+ port patch"] --> GPU["Tegra X1"]
 ```
 
-Keep the game's original directory structure inside `game_root/` (`font/`, `movie/`, `shader/`, `sound/`, etc.). The first launch may take several minutes while the DLC is installed. Start `ds2.nro` with full application memory: Homebrew Menu via title takeover, or install the optional NSP forwarder. **Do not launch in applet/Album mode.** The forwarder is fixed to `sdmc:/switch/ds2/ds2.nro`; moving the NRO breaks it. Its Switch Title ID is `0100D52000560000` (not the Xbox 360 Title ID). Installing an unsigned forwarder requires a compatible homebrew setup and may carry a console-ban risk; the NRO does not require the forwarder.
+The recompiled game still issues its original Direct3D/Xenos commands. A `GPU Commands` thread consumes the PM4 ring and translates its draw calls, resolves and swaps into Vulkan work. The ReXGlue runtime supplies the Xbox 360 environment; the Switch layer supplies its host memory, threads, audio, input and presentation. Full Xenos/EDRAM emulation remains in the binary as a configurable fallback.
+
+| Layer | Implementation |
+|---|---|
+| **Recompilation** | ReXGlue codegen turns `Default.xex` into ~84,000 C++ functions. DS2-specific overrides recover missing entry points; a scanner fix handles 16-bit jump tables. |
+| **Runtime** | ReXGlue SDK implements xboxkrnl, XAM, guest memory, virtual file system, XMA audio and input; DS2's `app/` adds paths, DLC installation, clocks and diagnostics. |
+| **Graphics** | A native `GraphicsSystem`/`CommandProcessor` reads PM4 and records Vulkan commands. Render targets are host images; resolves become textures without an EDRAM round-trip. |
+| **Shaders** | The SDK translates Xenos microcode to SPIR-V during play and caches translations by shader and modification. An offline shader library is **not** part of 0.56. |
+| **Platform** | devkitA64 + libnx produce a single NRO; patched Mesa NVK translates Vulkan to Tegra X1 commands. |
+
+## Engineering highlights
+
+### From executable to game world
+
+- **Codegen correctness:** manually classified missing function entries, added data/code-pointer overrides and recovered 370 genuine gaps missed by the scanner. Fixing its 16-bit jump-table decoding restored the character-creation script without a gameplay bypass.
+- **Switch memory:** aligned guest-memory mappings and commits to 2 MiB boundaries, reduced host-thread stacks and configured nvservices memory. This removed the resource failures that blocked level loading under hbloader.
+- **Integration:** game-file and DLC paths, saves, system keyboard, controller input, XMA audio, cutscenes and per-session clock control sit on top of the ReXGlue/NFSMW-NX Switch foundation.
+
+### Native renderer
+
+| Mechanism | Why it exists |
+|---|---|
+| **MSAA in sample space** | A 4× 640×360 target is represented as a 1280×720 image, allowing DS2's 1× and 4× views of the same EDRAM region to share storage. It preserves the game's reinterpretation trick, at the cost of extra shading. |
+| **Native resolves** | Image copies produce textures the next passes can sample directly; depth and two DS2-specific color reinterpretations have explicit conversion paths. |
+| **GPU-side work reduction** | Conditional early depth testing, one submission per frame and barriers around copies/uploads rather than every render pass. |
+| **CPU-side work reduction** | Dynamic UBO offsets, descriptor-set reuse within a frame, faster register writes and texture untiling, and cached sub-resolve lookups. |
+| **Pipelines and lifetime** | New pipelines compile on a worker thread; frame slots defer destruction until GPU work finishes. Unused textures and resolve targets are evicted by age. |
+
+The [Mesa NVK patch](tools/switch/toolchain/mesa-switch-ds2-perf.patch) adds direct CPU-side UBO descriptor handling on Maxwell, sparse-buffer support and NAK compiler tuning. An earlier EDRAM-emulation renderer is kept as a fallback; ongoing development targets the native path. Implementation details and limitations: [native-renderer reference](docs/reference/native-renderer.md) · [performance measurements](docs/performance.md) · [known issues](docs/known-issues.md).
+
+## Toolchain & observability
+
+| Component | Role |
+|---|---|
+| **ReXGlue codegen + C++23** | Static PowerPC recompilation, configured by manifests and address overrides in `app/` and `config/`. |
+| **devkitA64, libnx, CMake & Ninja** | ARM64 compilation, Horizon integration and NRO packaging. |
+| **Mesa NVK, NAK & SPIR-V translator** | Vulkan driver, Maxwell shader compilation and runtime translation of Xenos shaders. |
+| **FFmpeg** | Decoding the game's XMA audio and WMV cutscenes through the SDK. |
+| **Profiling tools** | Per-thread CPU samples, GPU timestamps corrected for the Switch clock, per-pass/draw timing, hitch logs and optional L3+R3 frame captures. |
+
+[XenosRecomp](https://github.com/hedge-dev/XenosRecomp) and DXC were **evaluated** for a future offline shader library; they are not required by the current rendering pipeline. For reproducible builds and diagnostics, see [build instructions](docs/build.md), [project architecture](docs/architecture.md) and the [documentation index](docs/README.md). Building from source requires a personally supplied copy of the Xbox 360 game; generated game code and release binaries are not tracked in Git.
+
+## Release & repository
+
+The [0.56 release](https://github.com/XDASCATX/DS2_switch/releases/tag/v0.56) contains `ds2.nro` and `ds2.toml`, plus an optional NSP that points to `sdmc:/switch/ds2/ds2.nro` (it contains neither the NRO nor game files). The game expects its own files under `sdmc:/switch/ds2/game_root/`; [release notes](RELEASE_0.56.md) describe the required layout. The forwarder is unsigned homebrew and its launch has not been verified on a physical Switch.
 
 > [!WARNING]
-> The supplied `ds2.toml` is **identical to the v56 test configuration**: it requests **CPU 1963 MHz / GPU 1267 MHz** through a supported clock sysmodule and leaves the memory clock unchanged (`0`). These are high, non-stock clocks; use only on hardware prepared for them. On a crash, the clock override may remain until it is cleared by the console's clock controls or a restart. The configuration also enables detailed logging and profiling; logs are written to `sdmc:/switch/ds2/logs/` and can grow over time.
+> The supplied v56/0.56 configuration requests **CPU 1963 MHz / GPU 1267 MHz**, leaves the memory clock unchanged and enables detailed logs. These are non-stock clocks and require a suitable clock sysmodule and hardware. A crash may leave the override active until it is cleared or the console is restarted. Stable 30 FPS everywhere is a development goal, not a release claim.
 
-## What to test
+| Path | Contents |
+|---|---|
+| `app/` | DS2 integration, codegen manifest and host/Switch app. |
+| `sdk/` | ReXGlue SDK, Switch platform and native Vulkan renderer. |
+| `config/` | Codegen overrides and versioned `ds2.toml` history. |
+| `tools/` | Build, packaging, console-log analysis and shader research. |
+| `docs/` | Architecture, testing history, performance data and code references. |
 
-Please report FPS and image issues in Majula (sea and town views), combat, fog gates and area transitions. If possible, include `logs/ds2_*.log`, `logs/rex/rex_perfil.log` and `logs/rex/rex_stderr.log` with the version number. Press **L3+R3 for about one second** to capture a problematic frame under `native_dump/` (this briefly pauses the game). Do not share saves, game files, your `prod.keys` or private identifiers in public reports.
+## Credits & legal
 
-Known issues from v55 include lighting around the bonfire near the merchant, glowing loot visible through walls, and loading stutters. The console performance and any regressions of **v56/0.56 remain unverified**. Actual 30+ FPS and a lower-clock profile are future goals, not release claims.
+Maintained by **xDASCATx**. Built on [ReXGlue](https://github.com/rexglue/rexglue-sdk) and [Xenia](https://xenia.jp), the [NFSMW-NX](https://github.com/StevensND/nfsmw-nx) Switch work, [mesa-switch](https://github.com/danfromtico/mesa-switch), [devkitPro](https://devkitpro.org) and [libnx](https://github.com/switchbrew/libnx). The optional forwarder uses an [NTON](https://github.com/rlaphoenix/nton) loader. See [third-party notices](THIRD_PARTY_NOTICES.md) and [license](LICENSE).
 
-## How it works
-
-`Default.xex` is translated to approximately 84,000 C++ functions by ReXGlue codegen. ReXGlue's runtime supplies Xbox 360 kernel services, guest memory, audio, input and file access on the Switch. The native renderer reads the game's PM4 command stream, translates Xenos shaders to SPIR-V at runtime and renders with Vulkan/NVK. Xenos/EDRAM emulation remains an optional fallback. The port was built on the [NFSMW-NX](https://github.com/StevensND/nfsmw-nx) Switch layer and SDK.
-
-The source code, configuration and build instructions are in [docs/README.md](docs/README.md). Generating the game code and building your own NRO require your own game copy, devkitA64, libnx and the patched Mesa NVK; see [docs/build.md](docs/build.md). Game files, generated game code, NRO/NSP binaries and console keys are **not committed to this repository**.
-
-## Credits and notices
-
-Project maintainer: **xDASCATx**. Based on [ReXGlue](https://github.com/rexglue/rexglue-sdk), [Xenia](https://xenia.jp), [NFSMW-NX](https://github.com/StevensND/nfsmw-nx), [mesa-switch](https://github.com/danfromtico/mesa-switch), [libnx](https://github.com/switchbrew/libnx) and their contributors. The forwarder uses the [NTON](https://github.com/rlaphoenix/nton) loader based on nx-hbloader. See [third-party notices](THIRD_PARTY_NOTICES.md) and [license](LICENSE).
-
-Unofficial fan project; not affiliated with or endorsed by FromSoftware, Bandai Namco, Microsoft or Nintendo. Game names and the official promotional cover art used for the optional forwarder's icon belong to their respective owners.
+Unofficial fan project; not affiliated with or endorsed by FromSoftware, Bandai Namco, Microsoft or Nintendo. DARK SOULS and the promotional art belong to their respective owners. No game files, generated game code or console keys are committed to this repository.
