@@ -249,7 +249,8 @@ void main() {
   ivec2 c = ivec2(gl_FragCoord.xy) + pc.src_minus_dst;
   float z = texelFetch(d, c, 0).r;
   uint st = texelFetch(s, c, 0).r;
-  uint z24 = pc.float24 != 0 ? F24(z) : uint(clamp(z, 0.0, 1.0) * 16777215.0 + 0.5);
+  // round(), not + 0.5: 16777215.5 is not a float32 and would become 2^24 (overflowing the depth bits).
+  uint z24 = pc.float24 != 0 ? F24(z) : min(uint(round(clamp(z, 0.0, 1.0) * 16777215.0)), 0xFFFFFFu);
   uint v = (z24 << 8) | (st & 0xFFu);
   o = vec4(float(v & 0xFFu), float((v >> 8) & 0xFFu), float((v >> 16) & 0xFFu), float(v >> 24)) / 255.0;
 }
@@ -597,6 +598,7 @@ class NativeCommandProcessor final : public CommandProcessor {
   void AdoptRenderTarget(uint32_t base, uint32_t pitch, uint64_t key, NativeImage& img);
   void LogStats();
   void DumpImages();
+  uint32_t ReadPixel(NativeImage& img, uint32_t x, uint32_t y, VkImageAspectFlags aspect);
   bool Tracing() const {
     return REXCVAR_GET(ds2_native_dump_swap) > 0 && !dumped_ &&
            heavy_frames_ + 1 == uint64_t(REXCVAR_GET(ds2_native_dump_swap));
@@ -1106,8 +1108,18 @@ void NativeCommandProcessor::AdoptRenderTarget(uint32_t base, uint32_t pitch, ui
   }
   if (mode == kConvertModeCount) return;
   const VkRect2D rect = {{0, 0}, {std::min(owner.width, img.width), std::min(owner.height, img.height)}};
+  if (Tracing() && mode == kConvertDepthToRgba8) {
+    REXGPU_INFO("[native trace]   convert depth->8888 at {}: before depth {:08X} stencil {:02X} color {:08X}", base,
+                ReadPixel(owner, 100, 100, VK_IMAGE_ASPECT_DEPTH_BIT),
+                ReadPixel(owner, 100, 100, VK_IMAGE_ASPECT_STENCIL_BIT),
+                ReadPixel(img, 100, 100, VK_IMAGE_ASPECT_COLOR_BIT));
+  }
   Convert(mode, owner, img, 0, 0, rect,
           owner_depth && xenos::DepthRenderTargetFormat(owner_format) == xenos::DepthRenderTargetFormat::kD24FS8);
+  if (Tracing() && mode == kConvertDepthToRgba8) {
+    REXGPU_INFO("[native trace]   convert depth->8888 at {}: after color {:08X}", base,
+                ReadPixel(img, 100, 100, VK_IMAGE_ASPECT_COLOR_BIT));
+  }
 }
 
 bool NativeCommandProcessor::SetupConversions() {
@@ -1673,8 +1685,11 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
     }
     ++stats_.texture_from_resolve;
     // The guest copy had red and blue swapped when copy_dest_swap was set; the native copy did not.
-    uint32_t host = (rit->second.image.depth || !format_known) ? xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA
-                                                               : fi.host_swizzle;
+    // Depth images have one component: every guest component reads it (k_24_8 / k_24_8_FLOAT are RRRR in the
+    // emulation too).
+    uint32_t host = rit->second.image.depth ? uint32_t(xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR)
+                    : !format_known         ? uint32_t(xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA)
+                                            : fi.host_swizzle;
     if (rit->second.rb_swapped && !rit->second.image.depth) {
       const uint32_t h[4] = {host & 7, (host >> 3) & 7, (host >> 6) & 7, (host >> 9) & 7};
       host = h[2] | (h[1] << 3) | (h[0] << 6) | (h[3] << 9);
@@ -2049,9 +2064,18 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     std::memcpy(&vf, &fetch_constants[fc * 2], sizeof(vf));
     const uint32_t address = uint32_t(vf.address) << 2;
     uint32_t size = uint32_t(vf.size) << 2;
-    if (Tracing() && draws_this_frame_ < 64) {
+    if (Tracing()) {
       REXGPU_INFO("[native trace]   draw {} vfetch {} addr {:08X} size {} stride {}", draws_this_frame_, fc, address,
                   size, binding.stride_words * 4);
+      if (prim_type == xenos::PrimitiveType::kRectangleList) {
+        const uint32_t* vtx = memory_->TranslatePhysical<const uint32_t*>(address);
+        float f[12] = {};
+        for (int i = 0; vtx && i < 12 && uint32_t(i * 4) < size; ++i) {
+          f[i] = xenos::GpuSwap(rex::memory::Reinterpret<float>(vtx[i]), vf.endian);
+        }
+        REXGPU_INFO("[native trace]     rect vertices {} {} {} | {} {} {} | {} {} {} | {} {} {}", f[0], f[1], f[2], f[3],
+                    f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11]);
+      }
     }
     if (!size) {
       // No size in the fetch constant: cover the vertices the draw can index.
@@ -2402,15 +2426,28 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     ++stats_.render_passes_begun;
   }
 
-  if (Tracing() && draws_this_frame_ < 64) {
+  if (Tracing() && !REXCVAR_GET(ds2_native_dump_dir).empty()) {
+    // Shader disassembly of the traced frame, one file per shader.
+    for (VulkanShader* sh : {vs, ps}) {
+      if (!sh) continue;
+      const std::string path = fmt::format("{}/shader_{:016X}_{}.txt", REXCVAR_GET(ds2_native_dump_dir),
+                                           sh->ucode_data_hash(), sh->type() == xenos::ShaderType::kVertex ? "vs" : "ps");
+      if (FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(sh->ucode_disassembly().data(), 1, sh->ucode_disassembly().size(), f);
+        std::fclose(f);
+      }
+    }
+  }
+  if (Tracing()) {
     REXGPU_INFO("[native trace]   draw {} prim {} n {} idx {} z(en {} wr {} fn {}) st {} vp {},{} {}x{} z {:.3f}..{:.3f} "
-                "ndcz {:.3f}+{:.3f} cull {} mask {:X} vte {:X} clip {:X}",
+                "ndcz {:.3f}+{:.3f} cull {} mask {:X} vte {:X} clip {:X} blend {:08X} ps {:016X} sref {:08X}",
                 draws_this_frame_, uint32_t(prim_type), index_count, indexed ? 1 : 0, uint32_t(depth_control.z_enable),
                 uint32_t(depth_control.z_write_enable), uint32_t(depth_control.zfunc),
                 uint32_t(depth_control.stencil_enable), viewport.xy_offset[0], viewport.xy_offset[1],
                 viewport.xy_extent[0], viewport.xy_extent[1], viewport.z_min, viewport.z_max, viewport.ndc_scale[2],
                 viewport.ndc_offset[2], key.cull_mode, write_mask, regs[XE_GPU_REG_PA_CL_VTE_CNTL],
-                regs[XE_GPU_REG_PA_CL_CLIP_CNTL]);
+                regs[XE_GPU_REG_PA_CL_CLIP_CNTL], key.blend[0], ps ? ps->ucode_data_hash() : 0,
+                regs[XE_GPU_REG_RB_STENCILREFMASK]);
   }
   dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
   dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout->layout, 0, 4, sets, 0, nullptr);
@@ -2840,6 +2877,38 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     dumped_ = true;
     DumpImages();
   }
+}
+
+uint32_t NativeCommandProcessor::ReadPixel(NativeImage& img, uint32_t x, uint32_t y, VkImageAspectFlags aspect) {
+  // Development only: one texel through a readback buffer (submits and waits).
+  const VkDevice dev = vulkan_device_->device();
+  VkBuffer buf;
+  VkDeviceMemory mem;
+  uint32_t type;
+  VkDeviceSize msize;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(vulkan_device_, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                         ui::vulkan::util::MemoryPurpose::kReadback, buf, mem, &type,
+                                                         &msize)) {
+    return 0xDEADBEEF;
+  }
+  EndRenderPass();
+  Barrier();
+  VkBufferImageCopy r = {};
+  r.imageSubresource = {aspect, 0, 0, 1};
+  r.imageOffset = {int32_t(x), int32_t(y), 0};
+  r.imageExtent = {1, 1, 1};
+  dfn().vkCmdCopyImageToBuffer(slot().cmd, img.image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &r);
+  FrameSlot& sl = slot();
+  SubmitFrame();
+  dfn().vkWaitForFences(dev, 1, &sl.fence, VK_TRUE, UINT64_MAX);
+  void* map = nullptr;
+  uint32_t v = 0;
+  dfn().vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, &map);
+  std::memcpy(&v, map, aspect == VK_IMAGE_ASPECT_STENCIL_BIT ? 1 : 4);
+  dfn().vkUnmapMemory(dev, mem);
+  dfn().vkDestroyBuffer(dev, buf, nullptr);
+  dfn().vkFreeMemory(dev, mem, nullptr);
+  return v;
 }
 
 void NativeCommandProcessor::DumpImages() {
