@@ -87,14 +87,6 @@ REXCVAR_DEFINE_INT32(ds2_native_hitch_ms, 100, "GPU",
                      "DS2 native renderer (v55): log what a frame spent its time on when it takes longer than this "
                      "(0 = never)")
     .range(0, 100000);
-REXCVAR_DEFINE_INT32(ds2_native_gpu_draw_profile_every, 0, "GPU",
-                     "DS2 native renderer (v56): with ds2_native_gpu_profile, one frame in this many gets a GPU "
-                     "timestamp around every draw; the most expensive shader pairs are logged (0 = never)")
-    .range(0, 100000);
-REXCVAR_DEFINE_BOOL(ds2_native_fast_pixel_math, true, "GPU",
-                    "DS2 native renderer (v56): pixel shaders may fuse multiply-add (no NoContraction); vertex shaders "
-                    "stay exact. Read at start")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(ds2_native_capture_combo, true, "GPU",
                     "DS2 native renderer (v55, Switch): holding L3 + R3 (both sticks pressed) for ~1 s traces the "
                     "next in-game frame into the log and writes its render targets as images under "
@@ -129,10 +121,6 @@ using VulkanShader = vulkan::VulkanShader;
 constexpr uint32_t kFrameSlots = 3;
 constexpr VkDeviceSize kUploadBufferSize = VkDeviceSize(48) << 20;
 constexpr uint32_t kMaxSetsPerFrame = 12288;
-// Fixed ranges of the dynamic constant buffer descriptors (v56); the upload buffer has this much slack after its
-// usable size so that offset + range always fits.
-constexpr VkDeviceSize kConstantRanges[5] = {512, 4096, 4096, 256, 1024};
-constexpr VkDeviceSize kConstantRangeSlack = 8192;
 
 // glslang default built-in resource limits (copy of the Vulkan backend's).
 constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
@@ -474,15 +462,6 @@ bool GetTextureFormat(xenos::TextureFormat f, TextureFormatInfo& out) {
   }
 }
 
-// texture_util::GetTiledOffset2D, inlined for the untiling loops (v56). pitch must be 32-aligned.
-inline int32_t TiledOffset2D(int32_t x, int32_t y, uint32_t pitch, uint32_t bpb_log2) {
-  const int32_t macro = ((x >> 5) + (y >> 5) * int32_t(pitch >> 5)) << (bpb_log2 + 7);
-  const int32_t micro = ((x & 7) + ((y & 0xE) << 2)) << bpb_log2;
-  const int32_t offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + ((y & 1) << 4);
-  return ((offset & ~0x1FF) << 3) + ((y & 16) << 7) + ((offset & 0x1C0) << 2) +
-         (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F);
-}
-
 // Endian swap of one element (xenos::Endian), in place.
 void SwapElements(uint8_t* data, size_t bytes, xenos::Endian endian) {
   switch (endian) {
@@ -589,23 +568,6 @@ class NativeCommandProcessor final : public CommandProcessor {
                  bool major_mode_explicit) override;
   bool IssueCopy() override;
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet, uint32_t count) override;
-  // v56: shader constant / fetch / bool / loop registers (0x4000-0x4A7F) have no side effects in the base command
-  // processor: stored directly (the base WriteRegister also looks up register info for a debug message per write).
-  void WriteRegister(uint32_t index, uint32_t value) override {
-    if (index - 0x4000u < 0xA80u) {
-      const_cast<volatile uint32_t&>(register_file_->values[index]) = value;
-      return;
-    }
-    CommandProcessor::WriteRegister(index, value);
-  }
-  void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override {
-    if (start_index >= 0x4000u && start_index + num_registers <= 0x4A80u) {
-      uint32_t* dst = register_file_->values + start_index;
-      for (uint32_t i = 0; i < num_registers; ++i) dst[i] = rex::byte_swap(base[i]);
-      return;
-    }
-    CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);
-  }
 
  private:
   struct FrameSlot {
@@ -621,8 +583,6 @@ class NativeCommandProcessor final : public CommandProcessor {
     VkDeviceSize upload_used = 0;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSet shared_memory_set = VK_NULL_HANDLE;
-    VkDescriptorSet constants_set = VK_NULL_HANDLE;  // dynamic UBOs (v56)
-    std::unordered_map<uint64_t, VkDescriptorSet> texture_sets;  // this frame's texture sets by content (v56)
     std::vector<std::pair<VkImage, VkDeviceMemory>> deferred_destroy;
     std::vector<VkImageView> deferred_views;
     std::vector<VkFramebuffer> deferred_framebuffers;
@@ -631,14 +591,13 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint32_t queries = 0;
     std::vector<uint16_t> query_labels;
     std::vector<uint32_t> seg_draws;
-    std::vector<uint32_t> seg_vertices;
     // Occlusion queries recorded in this buffer: (guest sample count address, query index).
     VkQueryPool occlusion_pool = VK_NULL_HANDLE;
     uint32_t occlusion_used = 0;
     std::vector<std::pair<uint32_t, uint32_t>> occlusion_pending;
   };
   static constexpr uint32_t kMaxOcclusionQueries = 512;
-  static constexpr uint32_t kMaxQueries = 4096;
+  static constexpr uint32_t kMaxQueries = 2048;
   struct PipelineLayoutEntry {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout textures_vertex = VK_NULL_HANDLE;
@@ -669,7 +628,6 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t upload_bytes = 0, pipelines = 0, render_passes_begun = 0;
     uint64_t prim_counts[32] = {};
     uint64_t conversions = 0, texture_levels = 0, texture_upload_bytes = 0, submits = 0;
-    uint64_t texture_sets_new = 0, texture_sets_reused = 0;
     uint64_t early_z_draws = 0, draws_pipeline_pending = 0, pipelines_async = 0;
     uint64_t skip_no_vs = 0, skip_no_raster = 0, skip_no_pitch = 0, skip_no_target = 0;
     uint64_t occlusion_begins = 0, occlusion_ends = 0, occlusion_lost = 0, occlusion_visible = 0;
@@ -679,7 +637,7 @@ class NativeCommandProcessor final : public CommandProcessor {
   struct ProfileLabel {
     std::string name;
     double ms = 0;
-    uint64_t count = 0, draws = 0, vertices = 0;
+    uint64_t count = 0, draws = 0;
   };
 
   const VulkanDevice* device() const { return vulkan_device_; }
@@ -720,8 +678,7 @@ class NativeCommandProcessor final : public CommandProcessor {
   void EvictTextures();
   // GPU profile: a timestamp that ends the current segment and starts one labelled `label`.
   void Mark(const std::string& label);
-  void MarkPass(const VkFormat* color_formats, uint32_t color_count, VkFormat depth_format, uint32_t w, uint32_t h,
-                uint32_t guest_pitch = 0, uint32_t guest_msaa = 1);
+  void MarkPass(const VkFormat* color_formats, uint32_t color_count, VkFormat depth_format, uint32_t w, uint32_t h);
   void CollectProfile(FrameSlot& s);
   uint32_t ReadPixel(NativeImage& img, uint32_t x, uint32_t y, VkImageAspectFlags aspect);
   bool Tracing() const {
@@ -820,16 +777,6 @@ class NativeCommandProcessor final : public CommandProcessor {
   bool occlusion_unmeasured_ = false;
   void EndOcclusionQuery(uint32_t result_address);
 
-  struct SubResolve {
-    uint32_t base;
-    int32_t x, y;
-  };
-  std::unordered_map<uint64_t, SubResolve> sub_resolve_memo_;
-  size_t sub_resolve_memo_size_ = 0;
-  // Per-draw scratch (no heap allocation per draw, v56).
-  std::vector<VkDescriptorImageInfo> scratch_image_infos_;
-  std::vector<VkWriteDescriptorSet> scratch_writes_;
-
   // GPU profile.
   bool profiling_ = false;
   double timestamp_period_ns_ = 1.0;
@@ -839,8 +786,6 @@ class NativeCommandProcessor final : public CommandProcessor {
   double profile_gpu_ms_ = 0;      // sum of command buffer spans
   uint64_t profile_buffers_ = 0;   // command buffers measured
   uint64_t last_swap_us_ = 0;
-  bool draw_profile_frame_ = false;  // this frame has a timestamp around every draw
-  uint64_t draw_profile_frames_ = 0;
 };
 
 uint64_t NowUs() {
@@ -878,7 +823,6 @@ bool NativeCommandProcessor::SetupContext() {
 
   translator_ = std::make_unique<SpirvShaderTranslator>(SpirvShaderTranslator::Features(vulkan_device_), false,
                                                         false, false, 1, 1);
-  translator_->SetPixelShaderContraction(REXCVAR_GET(ds2_native_fast_pixel_math));
   shared_memory_bindings_ =
       uint32_t(1) << SpirvShaderTranslator::GetSharedMemoryStorageBufferCountLog2(props.maxStorageBufferRange);
 
@@ -903,8 +847,7 @@ bool NativeCommandProcessor::SetupContext() {
     VkDescriptorSetLayoutBinding b[SpirvShaderTranslator::kConstantBufferCount] = {};
     for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
       b[i].binding = i;
-      // v56: dynamic offsets into the frame's upload buffer - one set per frame instead of one per draw.
-      b[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+      b[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
       b[i].descriptorCount = 1;
       b[i].stageFlags = guest_stages;
     }
@@ -933,7 +876,7 @@ bool NativeCommandProcessor::SetupContext() {
     VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     if (dfn().vkCreateFence(dev, &fci, nullptr, &s.fence) != VK_SUCCESS) return false;
     if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-            vulkan_device_, kUploadBufferSize + kConstantRangeSlack,
+            vulkan_device_, kUploadBufferSize,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             ui::vulkan::util::MemoryPurpose::kUpload, s.upload, s.upload_memory, &s.upload_memory_type,
@@ -944,16 +887,15 @@ bool NativeCommandProcessor::SetupContext() {
     void* map = nullptr;
     if (dfn().vkMapMemory(dev, s.upload_memory, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) return false;
     s.upload_mapping = static_cast<uint8_t*>(map);
-    VkDescriptorPoolSize sizes[5] = {
+    VkDescriptorPoolSize sizes[4] = {
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 64},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 16},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxSetsPerFrame * 2},
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxSetsPerFrame * 4},
         {VK_DESCRIPTOR_TYPE_SAMPLER, kMaxSetsPerFrame * 4},
     };
     VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets = kMaxSetsPerFrame;
-    dpci.poolSizeCount = 5;
+    dpci.poolSizeCount = 4;
     dpci.pPoolSizes = sizes;
     if (dfn().vkCreateDescriptorPool(dev, &dpci, nullptr, &s.descriptor_pool) != VK_SUCCESS) return false;
   }
@@ -996,7 +938,6 @@ bool NativeCommandProcessor::SetupContext() {
         }
         s.query_labels.reserve(kMaxQueries);
         s.seg_draws.reserve(kMaxQueries);
-        s.seg_vertices.reserve(kMaxQueries);
       }
     }
     REXGPU_INFO("[native] GPU profile {}: timestamp bits {}, period {} ns", profiling_ ? "on" : "unavailable", bits,
@@ -1143,26 +1084,6 @@ bool NativeCommandProcessor::BeginFrame() {
   w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   w.pBufferInfo = infos.data();
   dfn().vkUpdateDescriptorSets(dev, 1, &w, 0, nullptr);
-  s.texture_sets.clear();
-  {
-    VkDescriptorSetAllocateInfo cai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    cai.descriptorPool = s.descriptor_pool;
-    cai.descriptorSetCount = 1;
-    cai.pSetLayouts = &set_layout_constants_;
-    if (dfn().vkAllocateDescriptorSets(dev, &cai, &s.constants_set) != VK_SUCCESS) return false;
-    VkDescriptorBufferInfo cb[SpirvShaderTranslator::kConstantBufferCount];
-    VkWriteDescriptorSet cw[SpirvShaderTranslator::kConstantBufferCount];
-    for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
-      cb[i] = {s.upload, 0, kConstantRanges[i]};
-      cw[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-      cw[i].dstSet = s.constants_set;
-      cw[i].dstBinding = i;
-      cw[i].descriptorCount = 1;
-      cw[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-      cw[i].pBufferInfo = &cb[i];
-    }
-    dfn().vkUpdateDescriptorSets(dev, SpirvShaderTranslator::kConstantBufferCount, cw, 0, nullptr);
-  }
   VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   if (dfn().vkBeginCommandBuffer(s.cmd, &bi) != VK_SUCCESS) return false;
@@ -1170,7 +1091,6 @@ bool NativeCommandProcessor::BeginFrame() {
   s.queries = 0;
   s.query_labels.clear();
   s.seg_draws.clear();
-  s.seg_vertices.clear();
   if (s.occlusion_pool) dfn().vkCmdResetQueryPool(s.cmd, s.occlusion_pool, 0, kMaxOcclusionQueries);
   if (profiling_ && s.query_pool) {
     dfn().vkCmdResetQueryPool(s.cmd, s.query_pool, 0, kMaxQueries);
@@ -1195,7 +1115,6 @@ void NativeCommandProcessor::Mark(const std::string& label) {
   dfn().vkCmdWriteTimestamp(s.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s.query_pool, s.queries++);
   s.query_labels.push_back(id);
   s.seg_draws.push_back(0);
-  s.seg_vertices.push_back(0);
 }
 
 const char* VkFormatShortName(VkFormat f) {
@@ -1220,10 +1139,9 @@ const char* VkFormatShortName(VkFormat f) {
 }
 
 void NativeCommandProcessor::MarkPass(const VkFormat* color_formats, uint32_t color_count, VkFormat depth_format,
-                                      uint32_t w, uint32_t h, uint32_t guest_pitch, uint32_t guest_msaa) {
+                                      uint32_t w, uint32_t h) {
   if (!profiling_) return;
-  std::string l = guest_pitch ? fmt::format("pass {}x{} (pitch {} {}x)", w, h, guest_pitch, guest_msaa)
-                              : fmt::format("pass {}x{}", w, h);
+  std::string l = fmt::format("pass {}x{}", w, h);
   for (uint32_t i = 0; i < color_count; ++i) l += fmt::format(" {}", VkFormatShortName(color_formats[i]));
   if (depth_format != VK_FORMAT_UNDEFINED) l += fmt::format(" +{}", VkFormatShortName(depth_format));
   Mark(l);
@@ -1242,7 +1160,6 @@ void NativeCommandProcessor::CollectProfile(FrameSlot& s) {
     l.ms += ms;
     ++l.count;
     l.draws += s.seg_draws[i];
-    l.vertices += s.seg_vertices[i];
   }
   profile_gpu_ms_ += double((ts[s.queries - 1] - ts[0]) & timestamp_mask_) * timestamp_period_ns_ * 1e-6;
   ++profile_buffers_;
@@ -1262,7 +1179,6 @@ void NativeCommandProcessor::SubmitFrame() {
     dfn().vkCmdWriteTimestamp(s.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s.query_pool, s.queries++);
     s.query_labels.push_back(0);
     s.seg_draws.push_back(0);
-    s.seg_vertices.push_back(0);
   }
   ++stats_.submits;
   dfn().vkEndCommandBuffer(s.cmd);
@@ -2297,29 +2213,14 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
     for (uint32_t y = 0; y < lbh; ++y) {
       uint8_t* row = dst + row_bytes * y;
       if (fetch.tiled) {
-        const uint32_t pitch32 = rex::align<uint32_t>(tiled_pitch_blocks, 32);
-        const uint32_t bpb = fi.bytes_per_block;
-        auto copy_row = [&](auto block_type) {
-          using B = decltype(block_type);
-          B* out = reinterpret_cast<B*>(row);
-          for (uint32_t x = 0; x < lbw; ++x) {
-            const int32_t o = TiledOffset2D(int32_t(x + ox), int32_t(y + oy), pitch32, bpb_log2);
-            if (o < 0 || size_t(o) + sizeof(B) > src_size) {
-              std::memset(&out[x], 0, sizeof(B));
-            } else {
-              std::memcpy(&out[x], src + o, sizeof(B));
-            }
+        for (uint32_t x = 0; x < lbw; ++x) {
+          const int32_t o = texture_util::GetTiledOffset2D(int32_t(x + ox), int32_t(y + oy), tiled_pitch_blocks,
+                                                           bpb_log2);
+          if (o < 0 || size_t(o) + fi.bytes_per_block > src_size) {
+            std::memset(row + size_t(x) * fi.bytes_per_block, 0, fi.bytes_per_block);
+            continue;
           }
-        };
-        struct B16 {
-          uint64_t a, b;
-        };
-        switch (bpb) {
-          case 1: copy_row(uint8_t()); break;
-          case 2: copy_row(uint16_t()); break;
-          case 4: copy_row(uint32_t()); break;
-          case 8: copy_row(uint64_t()); break;
-          default: copy_row(B16()); break;
+          std::memcpy(row + size_t(x) * fi.bytes_per_block, src + o, fi.bytes_per_block);
         }
       } else {
         const size_t so = size_t(y + oy) * linear_row_bytes + size_t(ox) * fi.bytes_per_block;
@@ -2593,8 +2494,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   static const std::vector<VulkanShader::SamplerBinding> kNoSamplers;
   const auto& ps_textures = ps ? ps->GetTextureBindingsAfterTranslation() : kNoTextures;
   const auto& ps_samplers = ps ? ps->GetSamplerBindingsAfterTranslation() : kNoSamplers;
-  std::vector<VkDescriptorImageInfo>& image_infos = scratch_image_infos_;
-  image_infos.clear();
+  std::vector<VkDescriptorImageInfo> image_infos;
+  image_infos.reserve(vs_textures.size() + vs_samplers.size() + ps_textures.size() + ps_samplers.size());
   auto gather = [&](const std::vector<VulkanShader::TextureBinding>& tb,
                     const std::vector<VulkanShader::SamplerBinding>& sb) {
     for (const auto& b : tb) {
@@ -2928,7 +2829,6 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     cbuf[index] = {slot().upload, off, size};
     return true;
   };
-  static_assert(sizeof(SpirvShaderTranslator::SystemConstants) <= 512, "system constants exceed their range");
   bool ok = put(SpirvShaderTranslator::kConstantBufferSystem, &sc, sizeof(sc)) &&
             put_float(SpirvShaderTranslator::kConstantBufferFloatVertex, *vs, XE_GPU_REG_SHADER_CONSTANT_000_X);
   if (ok) {
@@ -2953,34 +2853,30 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   const VkDevice dev = vulkan_device_->device();
   VkDescriptorSet sets[4];
-  sets[0] = slot().shared_memory_set;
-  sets[1] = slot().constants_set;
-  uint32_t dynamic_offsets[SpirvShaderTranslator::kConstantBufferCount];
-  for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
-    dynamic_offsets[i] = uint32_t(cbuf[i].offset);
+  VkDescriptorSetLayout set_layouts[3] = {set_layout_constants_, layout->textures_vertex, layout->textures_pixel};
+  VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  ai.descriptorPool = slot().descriptor_pool;
+  ai.descriptorSetCount = 3;
+  ai.pSetLayouts = set_layouts;
+  if (dfn().vkAllocateDescriptorSets(dev, &ai, sets + 1) != VK_SUCCESS) {
+    ++stats_.draws_failed;
+    return true;
   }
-  // Texture sets: one per distinct (layout, images, samplers) in the frame.
-  std::vector<VkWriteDescriptorSet>& writes = scratch_writes_;
-  writes.clear();
+  sets[0] = slot().shared_memory_set;
+  std::vector<VkWriteDescriptorSet> writes;
+  writes.reserve(8 + image_infos.size());
+  for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = sets[1];
+    w.dstBinding = i;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    w.pBufferInfo = &cbuf[i];
+    writes.push_back(w);
+  }
   size_t img_i = 0;
-  auto texture_set = [&](VkDescriptorSetLayout set_layout, size_t textures, size_t samplers) -> VkDescriptorSet {
-    const size_t count = textures + samplers;
-    uint64_t h = XXH3_64bits_withSeed(image_infos.data() + img_i, count * sizeof(VkDescriptorImageInfo),
-                                      reinterpret_cast<uint64_t>(set_layout));
-    auto& cache = slot().texture_sets;
-    auto it = cache.find(h);
-    if (it != cache.end()) {
-      img_i += count;
-      ++stats_.texture_sets_reused;
-      return it->second;
-    }
-    VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    ai.descriptorPool = slot().descriptor_pool;
-    ai.descriptorSetCount = 1;
-    ai.pSetLayouts = &set_layout;
-    VkDescriptorSet set;
-    if (dfn().vkAllocateDescriptorSets(dev, &ai, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
-    for (size_t i = 0; i < count; ++i) {
+  auto write_images = [&](VkDescriptorSet set, size_t textures, size_t samplers) {
+    for (size_t i = 0; i < textures + samplers; ++i) {
       VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
       w.dstSet = set;
       w.dstBinding = uint32_t(i);
@@ -2989,17 +2885,10 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       w.pImageInfo = &image_infos[img_i++];
       writes.push_back(w);
     }
-    cache.emplace(h, set);
-    ++stats_.texture_sets_new;
-    return set;
   };
-  sets[2] = texture_set(layout->textures_vertex, vs_textures.size(), vs_samplers.size());
-  sets[3] = texture_set(layout->textures_pixel, ps_textures.size(), ps_samplers.size());
-  if (!sets[2] || !sets[3]) {
-    ++stats_.draws_failed;
-    return true;
-  }
-  if (!writes.empty()) dfn().vkUpdateDescriptorSets(dev, uint32_t(writes.size()), writes.data(), 0, nullptr);
+  write_images(sets[2], vs_textures.size(), vs_samplers.size());
+  write_images(sets[3], ps_textures.size(), ps_samplers.size());
+  dfn().vkUpdateDescriptorSets(dev, uint32_t(writes.size()), writes.data(), 0, nullptr);
 
   // Render pass.
   uint64_t fb_key = reinterpret_cast<uint64_t>(pass);
@@ -3040,8 +2929,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (profiling_) {
       VkFormat cf[4];
       for (uint32_t i = 0; i < color_count; ++i) cf[i] = color_rts[i]->format;
-      MarkPass(cf, color_count, depth_rt ? depth_rt->format : VK_FORMAT_UNDEFINED, rt_width, rt_height,
-               uint32_t(surface_info.surface_pitch), 1u << uint32_t(surface_info.msaa_samples));
+      MarkPass(cf, color_count, depth_rt ? depth_rt->format : VK_FORMAT_UNDEFINED, rt_width, rt_height);
     }
     VkRenderPassBeginInfo bi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     bi.renderPass = pass;
@@ -3094,8 +2982,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                 regs[XE_GPU_REG_RB_STENCILREFMASK]);
   }
   dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-  dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout->layout, 0, 4, sets,
-                                SpirvShaderTranslator::kConstantBufferCount, dynamic_offsets);
+  dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout->layout, 0, 4, sets, 0, nullptr);
   VkViewport vp;
   vp.x = float(viewport.xy_offset[0]);
   vp.y = float(viewport.xy_offset[1]);
@@ -3129,10 +3016,6 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   dfn().vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_BACK_BIT, bf ? srm_bf.stencilwritemask : srm.stencilwritemask);
   dfn().vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_BIT, srm.stencilref);
   dfn().vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_BACK_BIT, bf ? srm_bf.stencilref : srm.stencilref);
-  if (draw_profile_frame_) {
-    Mark(fmt::format("draw vs {:016X} ps {:016X} {}x{}{}", vs->ucode_data_hash(), ps ? ps->ucode_data_hash() : 0,
-                     rt_width, rt_height, surface_info.msaa_samples != xenos::MsaaSamples::k1X ? " msaa" : ""));
-  }
   if (use_indices) {
     dfn().vkCmdBindIndexBuffer(cmd, slot().upload, index_offset, index_type);
     dfn().vkCmdDrawIndexed(cmd, draw_count, 1, 0, 0, 0);
@@ -3141,10 +3024,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   ++stats_.draws;
   ++draws_this_frame_;
-  if (profiling_ && !slot().seg_draws.empty()) {
-    ++slot().seg_draws.back();
-    slot().seg_vertices.back() += draw_count;
-  }
+  if (profiling_ && !slot().seg_draws.empty()) ++slot().seg_draws.back();
   return true;
 }
 
@@ -3336,19 +3216,7 @@ bool NativeCommandProcessor::IssueCopy() {
         is_depth ? 2u : rex::log2_floor(std::max<uint32_t>(dest_fi ? dest_fi->bits_per_pixel / 8 : 4, 1));
     uint32_t entry_base = dest_base;
     int32_t sub_x = 0, sub_y = 0;
-    // v56: the containing-texture search below walks every resolve target and its tiles; its answer is kept per
-    // destination (and pitch) until the set of resolve targets changes.
-    if (sub_resolve_memo_size_ != resolved_.size()) {
-      sub_resolve_memo_.clear();
-      sub_resolve_memo_size_ = resolved_.size();
-    }
-    const uint64_t memo_key = (uint64_t(dest_base) << 20) ^ (uint64_t(dest_pitch.copy_dest_pitch) << 4) ^ dest_bpp_log2;
-    auto memo = resolved_.count(dest_base) ? sub_resolve_memo_.end() : sub_resolve_memo_.find(memo_key);
-    if (memo != sub_resolve_memo_.end()) {
-      entry_base = memo->second.base;
-      sub_x = memo->second.x;
-      sub_y = memo->second.y;
-    } else if (!resolved_.count(dest_base)) {
+    if (!resolved_.count(dest_base)) {
       for (auto& [eb, e] : resolved_) {
         if (eb >= dest_base || e.guest_pitch != dest_pitch.copy_dest_pitch || e.bpp_log2 != dest_bpp_log2) continue;
         const uint32_t pitch_aligned = rex::align<uint32_t>(e.guest_pitch, 32);
@@ -3371,7 +3239,6 @@ bool NativeCommandProcessor::IssueCopy() {
           break;
         }
       }
-      sub_resolve_memo_[memo_key] = {entry_base, sub_x, sub_y};
     }
     const bool sub_resolve = entry_base != dest_base;
     ResolvedEntry& r = resolved_[entry_base];
@@ -3624,11 +3491,6 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   // v54: submit only when the present did not (v51-v53 submitted an extra empty command buffer here every frame,
   // so the 3 frame slots held 1.5 guest frames and the command processor waited for the GPU twice per frame).
   if (frame_open_ && !presented_this_swap) SubmitFrame();
-  {
-    const int32_t every = REXCVAR_GET(ds2_native_gpu_draw_profile_every);
-    if (draw_profile_frame_) ++draw_profile_frames_;
-    draw_profile_frame_ = profiling_ && every > 0 && stats_.swaps % uint64_t(every) == 0;
-  }
   LogStats();
   EvictTextures();
   // Development dump: at the N-th frame with more than 200 draws (in game, not menus).
@@ -3900,14 +3762,8 @@ void NativeCommandProcessor::LogStats() {
   if (profiling_ && profile_buffers_) {
     std::vector<ProfileLabel*> order;
     double sum = 0;
-    std::vector<ProfileLabel*> draws_order;
     for (ProfileLabel& l : profile_labels_) {
-      if (!l.count) continue;
-      if (l.name.compare(0, 5, "draw ") == 0) {
-        draws_order.push_back(&l);
-        continue;
-      }
-      order.push_back(&l);
+      if (l.count) order.push_back(&l);
       sum += l.ms;
     }
     std::sort(order.begin(), order.end(), [](const ProfileLabel* a, const ProfileLabel* b) { return a->ms > b->ms; });
@@ -3919,28 +3775,6 @@ void NativeCommandProcessor::LogStats() {
     }
     REXGPU_INFO("[native gpu] GPU ms per frame: {:.2f} (command buffers {:.2f} per frame), by pass kind:{}",
                 profile_gpu_ms_ / n, profile_buffers_ / n, top);
-    if (!draws_order.empty() && draw_profile_frames_) {
-      std::sort(draws_order.begin(), draws_order.end(),
-                [](const ProfileLabel* a, const ProfileLabel* b) { return a->ms > b->ms; });
-      const double f = double(draw_profile_frames_);
-      double dsum = 0;
-      uint64_t dcount = 0, dverts = 0;
-      for (const ProfileLabel* l : draws_order) {
-        dsum += l->ms;
-        dcount += l->draws;
-        dverts += l->vertices;
-      }
-      std::string dtop;
-      for (size_t i = 0; i < draws_order.size() && i < 30; ++i) {
-        const ProfileLabel* l = draws_order[i];
-        dtop += fmt::format("\n[native gpu draws]   {:6.2f} ms {:5.1f}%  {:5.0f} draws {:8.0f} vertices  {}", l->ms / f,
-                            dsum > 0 ? 100.0 * l->ms / dsum : 0.0, l->draws / f, l->vertices / f, l->name);
-      }
-      REXGPU_INFO("[native gpu draws] {} sampled frame(s): {:.2f} ms in {:.0f} draws ({:.0f} vertices) per frame, "
-                  "{} shader pairs; most expensive:{}",
-                  draw_profile_frames_, dsum / f, dcount / f, dverts / f, draws_order.size(), dtop);
-      draw_profile_frames_ = 0;
-    }
     for (ProfileLabel& l : profile_labels_) l = {l.name};
     profile_gpu_ms_ = 0;
     profile_buffers_ = 0;

@@ -1,39 +1,67 @@
 # Third-party notices
 
-This project builds on the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) and the Nintendo Switch porting work of [NFSMW-NX](https://github.com/StevensND/nfsmw-nx). Their respective licenses apply to the components derived from them. The project's own sources are under [GPL-3.0](LICENSE); the SDK has its own [BSD-3-Clause license](sdk/LICENSE). The NRO is linked with additional third-party libraries and Mesa NVK.
+NFSMW-NX is built on the work of other projects. Their licenses apply to their code and to the parts of this
+repository derived from it.
 
-| Project | Use | License |
+## Projects this port is derived from
+
+| Project | Used for | License |
 |---|---|---|
-| [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) (with portions from [Xenia](https://xenia.jp)) | Xbox 360 runtime, code generator, graphics command processing (`sdk/`) | BSD-3-Clause and third-party licenses (`sdk/LICENSE`) |
-| [NFSMW-NX](https://github.com/StevensND/nfsmw-nx) | Switch-specific SDK layer, build approach and tooling | Licenses of its respective components |
-| [mesa-switch](https://github.com/danfromtico/mesa-switch) / [Mesa](https://mesa3d.org) | Vulkan/NVK driver linked into the NRO, with a DS2 patch | Per-file Mesa licenses (principally MIT) |
-| [libnx](https://github.com/switchbrew/libnx) | Horizon integration | ISC |
-| [FFmpeg](https://ffmpeg.org) | WMV3 and XMA decoding in the SDK | LGPL-2.1-or-later (configuration without GPL-only components) |
-| [libmspack](https://www.cabextract.org.uk/libmspack/) | LZX decompression | LGPL-2.1 |
-| [glslang](https://github.com/KhronosGroup/glslang) | Shader compilation | BSD-3-Clause and others |
-| [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools) | SPIR-V processing | Apache-2.0 |
-| [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) | Vulkan memory | MIT |
-| [fmt](https://github.com/fmtlib/fmt), [spdlog](https://github.com/gabime/spdlog) | Formatting and logging | MIT |
-| [xxHash](https://github.com/Cyan4973/xxHash) | Cache keys | BSD-2-Clause |
-| [SIMDe](https://github.com/simd-everywhere/simde) | Portable intrinsics | MIT |
-| [toml++](https://github.com/marzer/tomlplusplus) | Configuration | MIT |
-| [Dear ImGui](https://github.com/ocornut/imgui) | Debug UI | MIT |
-| [o1heap](https://github.com/pavel-kirienko/o1heap) | Allocator | MIT |
+| [NFSMW Recompiled](https://github.com/madelrandel-blip/NFSMW-Recompiled) by madelrandel-blip | The recompilation project this port started from: `app/` (hooks, configuration, codegen setup) and tools | GPL-3.0 |
+| [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) by Tom Clay, with portions from [Xenia](https://xenia.jp) (Ben Vanik and the Xenia contributors) | `sdk/`: code generator, Xbox 360 kernel and runtime, GPU command processing | BSD-3-Clause (`sdk/LICENSE`) |
+| [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) by hedge-dev and contributors | `shaders/XenosRecomp`: Xenos microcode to HLSL translator | MIT (`shaders/LICENSE.md`) |
+| [mesa-switch](https://github.com/danfromtico/mesa-switch) by danfromtico, on top of [Mesa](https://mesa3d.org) | The Vulkan driver (NVK) and shader compiler (NAK) for Horizon, linked into the NRO; `mesa/` holds the changes | MIT (Mesa's licenses per file) |
 
-Additional ReXGlue third-party dependencies and their licenses are supplied by the pinned upstream sources fetched with `tools/fetch_thirdparty.py`. The modified third-party files in this repository are under `sdk/thirdparty/`; the rest are fetched from ReXGlue v0.10.0. The sources, the build configuration and the LGPL components' changes are documented in [docs/build.md](docs/build.md).
+The Horizon (Switch) layer added to `sdk/` is under the SDK's BSD-3-Clause license, and the changes in `shaders/`
+and `mesa/` under the licenses of those projects (MIT), so they can be reused by other ports. The rest of this
+repository is GPL-3.0 (`LICENSE`).
 
-## NSP forwarder
+## Libraries
 
-The optional NSP includes a small homebrew loader, **not** the game's executable. Its prebuilt `main` and `main.npdm` are from [NTON](https://github.com/rlaphoenix/NTON), commit `c5d543a91b7c`, based on [nx-hbloader](https://github.com/switchbrew/nx-hbloader) and Forwarder-Mod. The forwarder loader is distributed under the following ISC notice (also present in NTON's `rom/LICENSE.md`):
+Libraries used by the SDK, the NRO and the code generator, fetched from the submodules of ReXGlue SDK v0.10.0
+(`tools/fetch_thirdparty.py`):
 
-> Copyright 2017-2018 nx-hbloader Authors
->
-> Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted, provided that the above copyright notice and this permission notice appear in all copies.
->
-> THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+| Library | License |
+|---|---|
+| [FFmpeg](https://ffmpeg.org) (libavcodec, libavutil: the WMV3 decoder for the cutscenes), from `wmarti/FFmpeg` at `0604b464c7cb` | LGPL-2.1-or-later (configured without GPL parts) |
+| [libmspack](https://www.cabextract.org.uk/libmspack/) by Stuart Caie (LZX decompression) | LGPL-2.1 |
+| [glslang](https://github.com/KhronosGroup/glslang) | BSD-3-Clause and others (see its LICENSE.txt) |
+| [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools) | Apache-2.0 |
+| [SPIRV-Headers](https://github.com/KhronosGroup/SPIRV-Headers), [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) | MIT, Apache-2.0 |
+| [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) | MIT |
+| [fmt](https://github.com/fmtlib/fmt), [spdlog](https://github.com/gabime/spdlog) | MIT |
+| [xxHash](https://github.com/Cyan4973/xxHash) | BSD-2-Clause |
+| [SIMDe](https://github.com/simd-everywhere/simde) | MIT |
+| [toml++](https://github.com/marzer/tomlplusplus) | MIT |
+| [Dear ImGui](https://github.com/ocornut/imgui) | MIT |
+| [o1heap](https://github.com/pavel-kirienko/o1heap) | MIT |
+| [utfcpp](https://github.com/nemtrif/utfcpp) | BSL-1.0 |
+| [CLI11](https://github.com/CLIUtils/CLI11) | BSD-3-Clause |
+| AES-128 by LuoPeng (`thirdparty/aes_128`) | MIT |
+| [libnx](https://github.com/switchbrew/libnx) and the devkitA64 runtime (newlib, libstdc++) | ISC; newlib and GCC runtime licenses |
 
-The NSP build tool is [hacBrewPack](https://github.com/rlaphoenix/hacBrewPack), commit `745b16ecfc9c` (GPL-2.0); the tool itself is **not** included in the NRO or NSP. Console `prod.keys` are used locally for packaging only and must never be uploaded or committed.
+### FFmpeg and libmspack (LGPL)
 
-## Trademarks and artwork
+This port modifies these files of the SDK's third-party tree; the modified copies are in `sdk/thirdparty`:
 
-DARK SOULS II and its official promotional cover art (the optional forwarder's icon, adapted from [Steam's official store assets](https://store.steampowered.com/app/335300/)) belong to their respective owners. Nintendo Switch, Xbox 360 and other marks belong to their respective owners. This unofficial port is not affiliated with or endorsed by them.
+- `FFmpeg/libavcodec/fft_template.c` and `FFmpeg/libavcodec/mdct_template.c`
+- `FFmpeg/config.h`, plus `FFmpeg/config_switch_aarch64.h` and `FFmpeg/config_nfsmw_wmv3.h` (new): the configuration
+  for AArch64 Horizon and for a build limited to the WMV3 decoder
+- `ffmpeg-overlay/codec_list.c`: registers the WMV3 decoder
+- `CMakeLists.txt`: builds the libraries for the Switch
+
+The rest of FFmpeg and libmspack is the unmodified upstream source at the commits pinned by ReXGlue SDK v0.10.0.
+Everything needed to rebuild and relink the NRO with a modified version of either library is in this repository and
+in [docs/building.md](docs/building.md).
+
+## Installer page
+
+The [installer page](https://github.com/StevensND/nfsmw-nx-installer) runs WebAssembly builds of the shader translator
+and packer from `shaders/`, libmspack (LZX), and [DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler)
+v2025.1 (University of Illinois/NCSA Open Source License, with LLVM's license terms). Its own notices are in that
+repository.
+
+## Trademarks
+
+Need for Speed and Need for Speed: Most Wanted are trademarks of Electronic Arts Inc. Nintendo Switch is a trademark of
+Nintendo. Xbox 360 is a trademark of Microsoft. This project is not affiliated with or endorsed by any of them.

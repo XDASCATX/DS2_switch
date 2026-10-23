@@ -8,7 +8,7 @@
 - Ветка `diag/switch-level-load`, ветка-снимок `switch/ingame-1` (тег `switch-ingame-1` только локально: прокси не пропускает теги); NRO = `releases/diag12` (sha256 `39a08daa…906b`, в GitHub
   не публикуется: производное от игры).
 - Тулчейн и Mesa — `docs/handoff/10-switch-build.md`.
-- Настройки — `config/toml-history/11-ds2.toml.test21` (обязательно `host_thread_stack_mb = 6`).
+- Настройки — `docs/handoff/11-ds2.toml.test21` (обязательно `host_thread_stack_mb = 6`).
 
 ## Что сняло блокеры (подробно — `11-switch-level-load-diag.md`)
 1. 2001-0103 при загрузке уровня: процесс под hbloader без своего системного ресурса берёт таблицы страниц из

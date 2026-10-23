@@ -175,7 +175,6 @@ void SpirvShaderTranslator::StartTranslation() {
   // TODO(Triang3l): Logger.
   builder_ = std::make_unique<SpirvBuilder>(features_.spirv_version, (kSpirvMagicToolId << 16) | 1,
                                             nullptr);
-  builder_->allow_contraction = pixel_shader_contraction_ && is_pixel_shader();
 
   builder_->addCapability(IsSpirvTessEvalShader() ? spv::CapabilityTessellation
                                                   : spv::CapabilityShader);
