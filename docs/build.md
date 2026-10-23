@@ -119,3 +119,31 @@ sdmc:/switch/ds2/native_dump/      снимки кадра по L3+R3 (v55+)
 | ПК-прогон убит (OOM) | остались `/dev/shm/xenia_memory_*` от прошлых запусков — удалить, когда ds2 не запущен |
 | `pkill -f ds2` убивает свой shell | убивать по `pgrep -x ds2` |
 | Игра на ПК не прошла титул | скрипт ввода по секундам: при медленной загрузке (параллельная сборка) `60:start` приходит раньше титула |
+
+## 8. Публичный тестовый выпуск 0.56 (из v56)
+
+Только для подготовки релиза — **не пересобирает код игры и не меняет `switch/v56/`**. На Mac владельца есть
+`switch/v56/ds2.nro` (sha256 `fca3c3be…671f`) и исходный TOML `config/toml-history/15-ds2.toml.v56`.
+`prepare-public-nro.py` заменяет *только* ASET-иконку и NACP-метаданные (автор `xDASCATx`, версия `0.56`),
+проверяет побайтное совпадение исполняемой секции; публичный NRO имеет новый sha256. Иконка — квадратный JPEG
+256×256 из официальной обложки DS2 SotFS; исходник, иконку и бинарники не коммитить.
+
+```sh
+python3 -I tools/build/prepare-public-nro.py switch/v56/ds2.nro /path/to/icon-256.jpg \
+  out/public-0.56/release/ds2.nro
+cp config/toml-history/15-ds2.toml.v56 out/public-0.56/release/ds2.toml
+python3 -I tools/build/make-forwarder.py out/public-0.56/release/ds2.nro \
+  out/public-0.56/release/ds2-0.56-forwarder.nsp \
+  --keys /private/path/prod.keys --packer /path/to/hacbrewpack \
+  --loader-dir /path/to/NTON/nton/assets/exefs
+```
+
+NSP — отдельный shortcut, **не содержит NRO/ключи/файлы игры**, Title ID `0100D52000560000`, путь на SD
+`sdmc:/switch/ds2/ds2.nro`. Загрузчик закреплён на NTON `c5d543a91b7c` (main/npdm проверяются по SHA-256),
+упаковщик hacBrewPack `745b16ecfc9c`; исходники скачиваются каждый в отдельный каталог вне git. `prod.keys`
+читаются только локально упаковщиком, никогда не передавать в git или GitHub Releases. По завершении проверить
+PFS0, NACP (0.56/xDASCATx), структуру, хеши `ds2.nro` и **неизменность** `ds2.toml` относительно v56. Реальный
+запуск NSP и скорость 0.56 возможны только на консоли владельца; PC-проверка кадра в игре была выполнена для v56.
+
+Текст публичного выпуска — [../RELEASE_0.56.md](../RELEASE_0.56.md) (только английский), README `main` — тоже
+только английский. Не выдавать NSP за проверенный, пока владелец не установит его на консоли.

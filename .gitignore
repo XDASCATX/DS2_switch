@@ -18,6 +18,10 @@ generated/
 sdk/out/
 *.log
 *.elf
+*.nro
+*.nsp
+*.nca
+*.keys
 *.o
 *.a
 

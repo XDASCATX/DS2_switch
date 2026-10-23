@@ -11,6 +11,8 @@
 | `build/build-pc.sh` | ПК: `ds2` + `librexgpu-xenos.so` | да |
 | `build/compile-check.sh <файл>` | компиляция одного файла ПК-сборки (~15 с), объект в /tmp | да |
 | `build/package-release.sh NN` | `releases/vNN` + части по 14 МБ для Mac | да |
+| `build/prepare-public-nro.py` | публикация 0.56: заменить только NRO-иконку/NACP (имя, автор, версия), сверить неизменность исполняемой секции | Mac: v56 проверен |
+| `build/make-forwarder.py` | NSP-shortcut → `sdmc:/switch/ds2/ds2.nro` из локальных `prod.keys`, hacBrewPack и закреплённого NTON-загрузчика; ключи в пакет не копируются | ожидает разрешения на сборку hacBrewPack и проверки на консоли |
 | `build/build-mesa.sh <имя>` | пересборка и установка SDK Mesa | в журналах (v34–v35) |
 | `build/patch-generated.py <dir>` | `REX_FUNC_COUNT` в старом сгенерированном коде (вызывают build-скрипты) | да |
 | `run/run-pc.sh <tag> <сек> [--cvar=…]` | ПК-прогон без экрана, логи `out/run/logs/<tag>.*` | да |
