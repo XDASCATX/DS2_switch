@@ -3,7 +3,7 @@
 </p>
 
 <h1 align="center">DARK SOULS II: Scholar of the First Sin</h1>
- <h1>Nintendo Switch</h1>
+ <h2> align="center">Nintendo Switch</h1>
 
 <p align="center">
   <strong>Experimental
