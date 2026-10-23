@@ -1,159 +1,116 @@
-# DARK SOULS II — Nintendo Switch Port
+ <p align="center">
+  <img src="https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/335300/logo.png" alt="DARK SOULS II: Scholar of the First Sin" width="620">
+</p>
+
+<h1 align="center">DARK SOULS II — Nintendo Switch</h1>
 
 <p align="center">
-  <img src="https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/335300/header.jpg" alt="Dark Souls II: Scholar of the First Sin" width="800">
+  <strong>Experimental port · Xbox 360 · Native rendering research</strong>
 </p>
 
 <p align="center">
-  <strong>Experimental graphics port · Nintendo Switch · Native rendering research</strong>
+  <a href="#русский">Русский</a> · <a href="#english">English</a> · <a href="docs/">Documentation</a>
 </p>
 
 <p align="center">
-  <a href="#-русский">Русский</a> ·
-  <a href="#-english">English</a> ·
-  <a href="https://www.bandainamcoent.com/games/dark-souls-ii">Original Game</a>
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/badge/STATUS-EXPERIMENTAL-orange?style=flat-square" alt="Experimental">
-  <img src="https://img.shields.io/badge/PLATFORM-Nintendo%20Switch-red?style=flat-square" alt="Nintendo Switch">
-  <img src="https://img.shields.io/badge/FOCUS-Graphics%20%26%20Performance-6f42c1?style=flat-square" alt="Graphics and performance">
-  <img src="https://img.shields.io/badge/DOCUMENTATION-In%20Progress-blue?style=flat-square" alt="Documentation in progress">
+  <img src="https://img.shields.io/badge/STATUS-EXPERIMENTAL-C58B36?style=flat-square" alt="Experimental status">
+  <img src="https://img.shields.io/badge/TARGET-NINTENDO%20SWITCH-8B1E24?style=flat-square" alt="Nintendo Switch">
+  <img src="https://img.shields.io/badge/FOCUS-RENDERING%20%7C%20PERFORMANCE-343434?style=flat-square" alt="Rendering and performance">
 </p>
 
 ---
 
-## 🇷🇺 Русский
+## Русский
 
-### О проекте
+Экспериментальный порт **Dark Souls II: Scholar of the First Sin** с Xbox 360 на Nintendo Switch. Проект исследует альтернативный графический конвейер, native rendering и оптимизацию выполнения игры на аппаратуре Switch.
 
-Экспериментальный проект по запуску **Dark Souls II: Scholar of the First Sin на Nintendo Switch** с исследованием и развитием альтернативного графического пути.
-
-Основной технический фокус — native rendering, совместимость графических ресурсов, корректность изображения и оптимизация производительности на ограниченном аппаратном бюджете консоли.
-
-Проект находится в активной разработке. Полная совместимость и стабильная производительность пока не заявляются.
+Главная цель — добиться стабильных **30+ FPS**, корректного отображения игровых сцен и полноценного прохождения пути от редактора персонажа до открытого мира.
 
 ### Технические направления
 
-| Подсистема | Направление работы |
+| Компонент | Назначение |
 |---|---|
-| Graphics backend | Исследование и развитие native rendering path |
-| Rendering | Совместимость графических операций и корректность кадра |
-| GPU performance | Снижение стоимости рендеринга и накладных расходов |
-| Resource handling | Текстуры, mipmaps и загрузка графических ресурсов |
-| Frame pacing | Снижение зависаний, рывков и нестабильности кадров |
-| Diagnostics | Логирование, профилирование GPU/CPU и анализ ошибок |
-| Configuration | Контролируемые TOML-конфигурации для воспроизводимых тестов |
+| Game execution | Запуск и совместимость кода оригинальной Xbox 360-версии |
+| Native renderer | Альтернативный путь отрисовки игровых кадров |
+| Graphics resources | Обработка текстур, mipmaps и графических ресурсов |
+| Lighting | Корректность освещения, теней и видимости объектов |
+| Performance | Снижение CPU/GPU frame time и накладных расходов |
+| Diagnostics | Логирование, профилирование и анализ зависаний |
+| Configuration | TOML-конфигурации для воспроизводимых экспериментов |
 
-### Текущий статус
+### Текущее состояние
 
-- Развитие альтернативного графического пути.
-- Исследование производительности на реальном оборудовании.
-- Анализ корректности освещения, ресурсов и отображения объектов.
-- Итеративная оптимизация с использованием диагностических данных.
-- Подготовка воспроизводимого процесса сборки и тестирования.
+- Развивается отдельный native rendering path.
+- Проверяется производительность на физической Nintendo Switch.
+- Исследуются проблемы освещения, загрузки ресурсов и видимости объектов.
+- Оптимизация ведётся итеративно на основе диагностических данных.
+- Полная совместимость и стабильные 30 FPS пока являются целями, а не гарантированными результатами.
 
-**Цель:** добиться максимально корректного изображения и стабильной производительности на Nintendo Switch, постепенно приближаясь к целевым 30 FPS там, где это технически достижимо.
+### Инструменты
 
-### Принципы разработки
+`C++` · `ReXGlue` · `TOML` · `NRO` · CPU/GPU profiling · runtime diagnostics
 
-- Измерения важнее предположений.
-- Результаты ПК не считаются подтверждением работоспособности на консоли.
-- Изменения проверяются по логам и воспроизводимым сценариям.
-- Конфигурации и результаты экспериментов должны сохранять трассируемость.
-- Известные ограничения документируются вместе с результатами.
-- Основной путь разработки не должен распыляться на ненужные альтернативные конфигурации.
-
-### Инструменты и технологии
-
-- **Target:** Nintendo Switch.
-- **Graphics:** native rendering path; графическая инфраструктура существующего проекта.
-- **Configuration:** TOML.
-- **Diagnostics:** CPU/GPU timing, runtime logs, profiling.
-- **Build & deployment:** существующая инфраструктура сборки проекта и упаковка `.nro`.
-
-Конкретные версии инструментов, зависимости, команды сборки и подтверждённые детали реализации должны фиксироваться в технической документации репозитория.
+Конкретные версии инструментов, зависимости и команды сборки следует смотреть в исходниках и технической документации проекта.
 
 ### Документация
 
-- [Project overview](README.md)
-- [Current state and handoff](HANDOFF.md)
-- [Architecture and source reference](docs/)
-- [Build and testing instructions](docs/)
-
-*Ссылки на документы будут уточнены в соответствии с фактической структурой репозитория.*
+- [Исходный код и структура проекта](.)
+- [Техническая документация](docs/)
+- [История экспериментов и диагностика](docs/)
 
 ---
 
-## 🇬🇧 English
+## English
 
-### Overview
+An experimental port of **Dark Souls II: Scholar of the First Sin** from Xbox 360 to Nintendo Switch, focused on alternative graphics execution, native rendering research and performance optimization.
 
-An experimental project focused on running **Dark Souls II: Scholar of the First Sin on Nintendo Switch**, with an emphasis on alternative graphics rendering, compatibility and performance engineering.
-
-The primary technical objectives are native rendering research, graphics-resource compatibility, visual correctness and reducing rendering overhead within the console's hardware constraints.
-
-The project is under active development. Full compatibility and stable performance are not yet claimed.
+The primary goal is stable **30+ FPS**, correct scene rendering and a functional path from character creation into the open world.
 
 ### Technical scope
 
-| Subsystem | Focus |
+| Component | Focus |
 |---|---|
-| Graphics backend | Research and development of a native rendering path |
-| Rendering | Graphics operation compatibility and frame correctness |
-| GPU performance | Reducing rendering cost and submission overhead |
-| Resource handling | Textures, mipmaps and graphics-resource loading |
-| Frame pacing | Reducing stalls, stutter and frame-time instability |
-| Diagnostics | Logging, CPU/GPU profiling and failure analysis |
-| Configuration | Controlled TOML configurations for reproducible testing |
+| Game execution | Compatibility with the original Xbox 360 game code |
+| Native renderer | Alternative rendering path for game frames |
+| Graphics resources | Texture handling, mipmaps and resource compatibility |
+| Lighting | Correct lighting, shadows and object visibility |
+| Performance | Reducing CPU/GPU frame time and submission overhead |
+| Diagnostics | Runtime logs, profiling and stall analysis |
+| Configuration | TOML-based reproducible experiments |
 
-### Development status
+### Current status
 
-- Alternative graphics-path development.
-- Performance investigation on physical hardware.
-- Analysis of lighting, resource handling and object visibility.
-- Iterative optimization guided by diagnostic data.
-- Preparation of a reproducible build and testing workflow.
+- A separate native rendering path is under development.
+- Performance is evaluated on physical Nintendo Switch hardware.
+- Lighting, resource-loading and visibility issues are under investigation.
+- Optimization is driven by diagnostic data and iterative testing.
+- Full compatibility and stable 30 FPS remain development goals, not guaranteed results.
 
-**Goal:** achieve visually correct rendering and the most stable performance possible on Nintendo Switch, progressively approaching a 30 FPS target where technically feasible.
+### Tooling
 
-### Engineering principles
+`C++` · `ReXGlue` · `TOML` · `NRO` · CPU/GPU profiling · runtime diagnostics
 
-- Measurements over assumptions.
-- PC results do not establish console compatibility.
-- Changes should be evaluated using logs and reproducible scenarios.
-- Configurations and experiments should remain traceable.
-- Known limitations must be documented alongside results.
-- Development should focus on the primary rendering path rather than unnecessary configuration branches.
-
-### Tooling and technologies
-
-- **Target platform:** Nintendo Switch.
-- **Graphics:** native rendering path within the existing project infrastructure.
-- **Configuration:** TOML.
-- **Diagnostics:** CPU/GPU timing, runtime logs and profiling.
-- **Build & deployment:** existing build pipeline and `.nro` packaging.
-
-Exact toolchain versions, dependencies, build commands and implementation details belong in the repository's technical documentation.
+Refer to the source tree and technical documentation for verified toolchain versions, dependencies and build instructions.
 
 ### Documentation
 
-- [Project overview](README.md)
-- [Current state and handoff](HANDOFF.md)
-- [Architecture and source reference](docs/)
-- [Build and testing instructions](docs/)
-
-*Documentation links should be aligned with the actual repository structure.*
+- [Source code and project structure](.)
+- [Technical documentation](docs/)
+- [Experiment history and diagnostics](docs/)
 
 ---
 
-## Project philosophy
+## Screenshots
 
 <p align="center">
-  <em>Understand the pipeline. Measure the bottlenecks. Preserve the evidence. Improve one verified step at a time.</em>
+  <img src="https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/2038278/movie_full.jpg" alt="Dark Souls II: Scholar of the First Sin gameplay" width="800">
 </p>
+
+*Original game reference image. Replace or supplement with verified Nintendo Switch captures as testing progresses.*
+
+---
 
 ## Disclaimer
 
-This is an independent, experimental, non-commercial engineering project. It is not affiliated with, endorsed by, or an official port from FromSoftware or Bandai Namco Entertainment. DARK SOULS and related assets are the property of their respective owners.
+This is an independent, experimental project and is not affiliated with or endorsed by FromSoftware, Bandai Namco Entertainment or Nintendo. DARK SOULS and related assets are the property of their respective owners.
 
