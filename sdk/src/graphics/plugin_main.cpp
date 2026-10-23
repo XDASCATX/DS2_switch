@@ -19,6 +19,7 @@
 #endif
 #if REX_HAS_VULKAN
 #include <rex/graphics/vulkan/graphics_system.h>
+#include "native/native_renderer.h"
 #endif
 
 extern "C" REX_GPU_PLUGIN_EXPORT uint32_t rex_gpu_abi_version(void) {
@@ -44,6 +45,10 @@ extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
   }
 #endif
 #if REX_HAS_VULKAN
+  // DS2 port: the experimental native renderer replaces the Xenos emulation when ds2_native_renderer is set.
+  if ((backend == "any" || backend == "vulkan") && rex::graphics::native::NativeRendererRequested()) {
+    return rex::graphics::native::CreateNativeGraphicsSystem();
+  }
   if (backend == "any" || backend == "vulkan") {
     return new rex::graphics::vulkan::VulkanGraphicsSystem();
   }

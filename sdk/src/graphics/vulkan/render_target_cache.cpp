@@ -43,6 +43,8 @@
 #include <string>
 #include <rex/ui/vulkan/util.h>
 
+REXCVAR_DECLARE(bool, render_target_msaa_alias);  // pipeline/render_target/cache.cpp
+REXCVAR_DECLARE(int32_t, render_target_max_height);
 REXCVAR_DEFINE_INT32(render_target_transfer_skip_kinds, 0, "GPU/Vulkan",
                      "DS2 port (v49), finer than render_target_transfer_skip - leave out ownership transfer draws of "
                      "these kinds (bitmask): 1 = depth 4x->1x same format, 2 = depth 1x->4x same format, 4 = color "
@@ -2126,7 +2128,20 @@ VulkanRenderTargetCache::VulkanRenderTarget::~VulkanRenderTarget() {
   }
   dfn.vkDestroyImageView(device, view_depth_color_, nullptr);
   dfn.vkDestroyImage(device, image_, nullptr);
-  dfn.vkFreeMemory(device, memory_, nullptr);
+  render_target_cache_.ReleaseRenderTargetMemory(memory_);
+}
+
+void VulkanRenderTargetCache::ReleaseRenderTargetMemory(VkDeviceMemory memory) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  for (auto it = alias_memory_.begin(); it != alias_memory_.end(); ++it) {
+    if (it->second.memory == memory) {
+      if (it->second.refs && --it->second.refs) return;
+      vulkan_device->functions().vkFreeMemory(vulkan_device->device(), memory, nullptr);
+      alias_memory_.erase(it);
+      return;
+    }
+  }
+  vulkan_device->functions().vkFreeMemory(vulkan_device->device(), memory, nullptr);
 }
 
 uint32_t VulkanRenderTargetCache::GetMaxRenderTargetWidth() const {
@@ -2191,9 +2206,57 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
                  key.is_depth ? "depth" : "color", static_cast<uint32_t>(key.resource_format));
     return nullptr;
   }
-  VkImage image;
-  VkDeviceMemory memory;
-  if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+  VkImage image = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  // DS2 port: render_target_msaa_alias - 1x and 4xMSAA render targets of the same EDRAM base, pitch and format
+  // share memory (not dedicated, so not compressed: compressed kinds differ by sample count).
+  if (REXCVAR_GET(render_target_msaa_alias) && REXCVAR_GET(render_target_max_height) > 0 &&
+      (key.msaa_samples == xenos::MsaaSamples::k1X || key.msaa_samples == xenos::MsaaSamples::k4X)) {
+    RenderTargetKey group_key = key;
+    group_key.msaa_samples = xenos::MsaaSamples::k1X;
+    if (dfn.vkCreateImage(device, &image_create_info, nullptr, &image) == VK_SUCCESS) {
+      VkMemoryRequirements memory_requirements;
+      dfn.vkGetImageMemoryRequirements(device, image, &memory_requirements);
+      AliasMemory& alias = alias_memory_[group_key.key];
+      if (alias.memory == VK_NULL_HANDLE) {
+        const uint32_t memory_type =
+            ui::vulkan::util::ChooseMemoryType(vulkan_device->memory_types(), memory_requirements.memoryTypeBits,
+                                               ui::vulkan::util::MemoryPurpose::kDeviceLocal);
+        if (memory_type != UINT32_MAX) {
+          VkMemoryAllocateInfo memory_allocate_info = {};
+          memory_allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+          memory_allocate_info.allocationSize = memory_requirements.size;
+          memory_allocate_info.memoryTypeIndex = memory_type;
+          if (dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &alias.memory) == VK_SUCCESS) {
+            alias.size = memory_requirements.size;
+            alias.type = memory_type;
+          } else {
+            alias.memory = VK_NULL_HANDLE;
+          }
+        }
+      }
+      if (alias.memory != VK_NULL_HANDLE && memory_requirements.size <= alias.size &&
+          (memory_requirements.memoryTypeBits & (uint32_t(1) << alias.type)) &&
+          dfn.vkBindImageMemory(device, image, alias.memory, 0) == VK_SUCCESS) {
+        memory = alias.memory;
+        ++alias.refs;
+        ++alias_render_targets_total_;
+        REXGPU_INFO("render_target_msaa_alias: {} shares {} bytes ({} users)", key.GetDebugName(), alias.size,
+                    alias.refs);
+      } else {
+        REXGPU_WARN("render_target_msaa_alias: {} not aliased (needs {} bytes, group has {})",
+                    key.GetDebugName(), memory_requirements.size, alias.size);
+        if (alias.refs == 0) {
+          if (alias.memory != VK_NULL_HANDLE) dfn.vkFreeMemory(device, alias.memory, nullptr);
+          alias_memory_.erase(group_key.key);
+        }
+        dfn.vkDestroyImage(device, image, nullptr);
+        image = VK_NULL_HANDLE;
+      }
+    }
+  }
+  if (memory == VK_NULL_HANDLE &&
+      !ui::vulkan::util::CreateDedicatedAllocationImage(
           vulkan_device, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, image,
           memory)) {
     REXGPU_ERROR(
@@ -2228,7 +2291,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
         image_create_info.extent.height, uint32_t(1) << uint32_t(key.msaa_samples),
         key.GetFormatName());
     dfn.vkDestroyImage(device, image, nullptr);
-    dfn.vkFreeMemory(device, memory, nullptr);
+    ReleaseRenderTargetMemory(memory);
     return nullptr;
   }
   VkImageView view_depth_stencil = VK_NULL_HANDLE;
@@ -2248,7 +2311,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
           xenos::GetDepthRenderTargetFormatName(key.GetDepthFormat()));
       dfn.vkDestroyImageView(device, view_depth_color, nullptr);
       dfn.vkDestroyImage(device, image, nullptr);
-      dfn.vkFreeMemory(device, memory, nullptr);
+      ReleaseRenderTargetMemory(memory);
       return nullptr;
     }
     view_create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -2262,7 +2325,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
       dfn.vkDestroyImageView(device, view_depth_stencil, nullptr);
       dfn.vkDestroyImageView(device, view_depth_color, nullptr);
       dfn.vkDestroyImage(device, image, nullptr);
-      dfn.vkFreeMemory(device, memory, nullptr);
+      ReleaseRenderTargetMemory(memory);
       return nullptr;
     }
   } else {
@@ -2277,7 +2340,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
             xenos::GetColorRenderTargetFormatName(key.GetColorFormat()));
         dfn.vkDestroyImageView(device, view_depth_color, nullptr);
         dfn.vkDestroyImage(device, image, nullptr);
-        dfn.vkFreeMemory(device, memory, nullptr);
+        ReleaseRenderTargetMemory(memory);
         return nullptr;
       }
     }
@@ -2295,7 +2358,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
         }
         dfn.vkDestroyImageView(device, view_depth_color, nullptr);
         dfn.vkDestroyImage(device, image, nullptr);
-        dfn.vkFreeMemory(device, memory, nullptr);
+        ReleaseRenderTargetMemory(memory);
         return nullptr;
       }
     }
@@ -2317,7 +2380,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
     }
     dfn.vkDestroyImageView(device, view_depth_color, nullptr);
     dfn.vkDestroyImage(device, image, nullptr);
-    dfn.vkFreeMemory(device, memory, nullptr);
+    ReleaseRenderTargetMemory(memory);
     return nullptr;
   }
   VkDescriptorSet descriptor_set_transfer_source =
@@ -4896,6 +4959,46 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       render_target_transfers = elision_filtered_transfers_;
     }
   }
+  // DS2 port: render_target_msaa_alias - a source sharing memory with the destination already holds the data.
+  if (render_target_transfers && REXCVAR_GET(render_target_msaa_alias)) {
+    bool any_aliased = false;
+    for (uint32_t i = 0; i < render_target_count && i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      std::vector<Transfer>& filtered = alias_filtered_transfers_[i];
+      filtered.clear();
+      const std::vector<Transfer>& in = render_target_transfers[i];
+      if (in.empty() || !render_targets[i]) {
+        filtered = in;
+        continue;
+      }
+      auto& dest_rt = *static_cast<VulkanRenderTarget*>(render_targets[i]);
+      for (const Transfer& transfer : in) {
+        auto* source_rt = static_cast<VulkanRenderTarget*>(transfer.source);
+        if (source_rt && source_rt != &dest_rt && source_rt->memory() == dest_rt.memory()) {
+          any_aliased = true;
+          ++alias_elided_transfers_total_;
+          // Make the source's writes available to the destination's attachment accesses (same memory).
+          const bool source_is_depth = source_rt->key().is_depth != 0;
+          VkPipelineStageFlags draw_stage;
+          VkAccessFlags draw_access;
+          VkImageLayout draw_layout;
+          VulkanRenderTarget::GetDrawUsage(source_is_depth, &draw_stage, &draw_access, &draw_layout);
+          command_processor_.PushImageMemoryBarrier(
+              source_rt->image(),
+              ui::vulkan::util::InitializeSubresourceRange(
+                  source_is_depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                                  : VK_IMAGE_ASPECT_COLOR_BIT),
+              source_rt->current_stage_mask(), draw_stage, source_rt->current_access_mask(), draw_access,
+              source_rt->current_layout(), draw_layout);
+          source_rt->SetUsage(draw_stage, draw_access, draw_layout);
+          continue;
+        }
+        filtered.push_back(transfer);
+      }
+    }
+    if (any_aliased) {
+      render_target_transfers = alias_filtered_transfers_;
+    }
+  }
 #if REX_PLATFORM_SWITCH
   RexSwitchPerfCount(11);
   if (render_target_transfers) {
@@ -5287,9 +5390,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           uint64_t kept_tiles = 0;
           for (const auto& e : v) kept_tiles += e.second.second;
           REXGPU_INFO("rt_transfer_stats after {} destination updates ({} kinds), frame {}: kept {} tiles; "
-                      "elided {} transfers, {} pixels",
+                      "elided {} transfers, {} pixels; msaa alias: {} render targets, {} transfers left out",
                       dest_updates, v.size(), command_processor_.GetCurrentFrame(), kept_tiles,
-                      elided_transfers_total_, elided_pixels_total_);
+                      elided_transfers_total_, elided_pixels_total_, alias_render_targets_total_,
+                      alias_elided_transfers_total_);
           for (size_t i = 0; i < v.size() && i < 25; ++i) {
             REXGPU_INFO("  {:>8} transfers {:>10} tiles  {}", v[i].second.first, v[i].second.second, v[i].first);
           }

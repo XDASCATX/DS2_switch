@@ -320,6 +320,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     ~VulkanRenderTarget();
 
     VkImage image() const { return image_; }
+    VkDeviceMemory memory() const { return memory_; }
 
     VkImageView view_depth_color() const { return view_depth_color_; }
     VkImageView view_depth_stencil() const { return view_depth_stencil_; }
@@ -908,6 +909,19 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint64_t elided_transfers_total_ = 0;
   uint64_t elided_pixels_total_ = 0;
   std::vector<Transfer> elision_filtered_transfers_[1 + xenos::kMaxColorRenderTargets];
+  // DS2 port (render_target_msaa_alias): memory shared by the 1x and 4xMSAA render targets of one EDRAM base,
+  // pitch and format.
+  struct AliasMemory {
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize size = 0;
+    uint32_t type = 0;
+    uint32_t refs = 0;
+  };
+  std::unordered_map<uint64_t, AliasMemory> alias_memory_;
+  void ReleaseRenderTargetMemory(VkDeviceMemory memory);
+  std::vector<Transfer> alias_filtered_transfers_[1 + xenos::kMaxColorRenderTargets];
+  uint64_t alias_elided_transfers_total_ = 0;
+  uint64_t alias_render_targets_total_ = 0;
 
   // Temporary storage for DumpRenderTargets.
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;

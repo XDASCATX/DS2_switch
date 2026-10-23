@@ -43,6 +43,7 @@ set(REXGPU_XENOS_SPIRV_SOURCES
 
 # Vulkan backend
 set(REXGPU_XENOS_VULKAN_SOURCES
+    native/native_renderer.cpp
     vulkan/graphics_system.cpp
     vulkan/deferred_command_buffer.cpp
     vulkan/command_processor.cpp

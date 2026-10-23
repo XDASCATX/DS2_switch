@@ -1,0 +1,2997 @@
+// DS2 port: experimental native renderer (v51). See native_renderer.h and docs/handoff/18-native-renderer.md.
+//
+// Copyright notes: the register/shader plumbing follows the SDK's Vulkan backend (Xenia, BSD-3, see
+// src/graphics/vulkan); the overall approach (own graphics system, render targets as images, resolves as copies)
+// follows nfsmw-nx (GPL-3, docs/native-renderer.md there). This file is new code.
+
+#include "native_renderer.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+#include <xxhash.h>
+
+#include <SPIRV/GlslangToSpv.h>
+#include <glslang/Public/ShaderLang.h>
+
+#include <rex/cvar.h>
+#include <rex/graphics/command_processor.h>
+#include <rex/graphics/graphics_system.h>
+#include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/pipeline/texture/util.h>
+#include <rex/graphics/registers.h>
+#include <rex/graphics/util/draw.h>
+#include <rex/graphics/vulkan/shader.h>
+#include <rex/graphics/xenos.h>
+#include <rex/kernel/xboxkrnl/video.h>
+#include <rex/logging.h>
+#include <rex/math.h>
+#include <rex/memory.h>
+#include <rex/platform.h>
+#include <rex/string/buffer.h>
+#include <rex/system/kernel_state.h>
+#include <rex/ui/vulkan/presenter.h>
+#include <rex/ui/vulkan/provider.h>
+#include <rex/ui/vulkan/util.h>
+
+REXCVAR_DEFINE_BOOL(ds2_native_renderer, false, "GPU",
+                    "DS2 port (v51, experimental): draw with the native renderer instead of the Xenos emulation "
+                    "(no EDRAM, render targets as images, resolves as image copies). Fallback: false")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(ds2_native_log_every, 300, "GPU",
+                     "DS2 native renderer: frames between statistics lines in the log (0 = never)")
+    .range(0, 100000);
+REXCVAR_DEFINE_STRING(ds2_native_dump_dir, "", "GPU",
+                      "DS2 native renderer (development): directory for PPM dumps of every render target and resolve "
+                      "target, written once at swap ds2_native_dump_swap");
+REXCVAR_DEFINE_INT32(ds2_native_dump_swap, 0, "GPU", "DS2 native renderer (development): dump at this frame counted among frames with more than 200 draws")
+    .range(0, 100000000);
+REXCVAR_DEFINE_BOOL(ds2_native_gamma_ramp, true, "GPU",
+                    "DS2 native renderer: apply the game's 256-entry gamma ramp when presenting (as the emulation)");
+REXCVAR_DEFINE_BOOL(ds2_native_textures, true, "GPU",
+                    "DS2 native renderer: load guest textures (false = a white 1x1 texture everywhere, for "
+                    "checking geometry)");
+
+#if REX_PLATFORM_SWITCH
+extern "C" void RexSwitchPerfCount(unsigned id);  // switch_perf.cpp: 0 = swaps (FPS for the overlay / SaltyNX)
+#endif
+
+namespace rex::graphics::native {
+
+bool NativeRendererRequested() { return REXCVAR_GET(ds2_native_renderer); }
+
+namespace {
+
+using ui::vulkan::VulkanDevice;
+using VulkanShader = vulkan::VulkanShader;
+
+constexpr uint32_t kFrameSlots = 3;
+constexpr VkDeviceSize kUploadBufferSize = VkDeviceSize(48) << 20;
+constexpr uint32_t kMaxSetsPerFrame = 12288;
+
+// glslang default built-in resource limits (copy of the Vulkan backend's).
+constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
+    /* .maxLights = */ 32,
+    /* .maxClipPlanes = */ 6,
+    /* .maxTextureUnits = */ 32,
+    /* .maxTextureCoords = */ 32,
+    /* .maxVertexAttribs = */ 64,
+    /* .maxVertexUniformComponents = */ 4096,
+    /* .maxVaryingFloats = */ 64,
+    /* .maxVertexTextureImageUnits = */ 32,
+    /* .maxCombinedTextureImageUnits = */ 80,
+    /* .maxTextureImageUnits = */ 32,
+    /* .maxFragmentUniformComponents = */ 4096,
+    /* .maxDrawBuffers = */ 32,
+    /* .maxVertexUniformVectors = */ 128,
+    /* .maxVaryingVectors = */ 8,
+    /* .maxFragmentUniformVectors = */ 16,
+    /* .maxVertexOutputVectors = */ 16,
+    /* .maxFragmentInputVectors = */ 15,
+    /* .minProgramTexelOffset = */ -8,
+    /* .maxProgramTexelOffset = */ 7,
+    /* .maxClipDistances = */ 8,
+    /* .maxComputeWorkGroupCountX = */ 65535,
+    /* .maxComputeWorkGroupCountY = */ 65535,
+    /* .maxComputeWorkGroupCountZ = */ 65535,
+    /* .maxComputeWorkGroupSizeX = */ 1024,
+    /* .maxComputeWorkGroupSizeY = */ 1024,
+    /* .maxComputeWorkGroupSizeZ = */ 64,
+    /* .maxComputeUniformComponents = */ 1024,
+    /* .maxComputeTextureImageUnits = */ 16,
+    /* .maxComputeImageUniforms = */ 8,
+    /* .maxComputeAtomicCounters = */ 8,
+    /* .maxComputeAtomicCounterBuffers = */ 1,
+    /* .maxVaryingComponents = */ 60,
+    /* .maxVertexOutputComponents = */ 64,
+    /* .maxGeometryInputComponents = */ 64,
+    /* .maxGeometryOutputComponents = */ 128,
+    /* .maxFragmentInputComponents = */ 128,
+    /* .maxImageUnits = */ 8,
+    /* .maxCombinedImageUnitsAndFragmentOutputs = */ 8,
+    /* .maxCombinedShaderOutputResources = */ 8,
+    /* .maxImageSamples = */ 0,
+    /* .maxVertexImageUniforms = */ 0,
+    /* .maxTessControlImageUniforms = */ 0,
+    /* .maxTessEvaluationImageUniforms = */ 0,
+    /* .maxGeometryImageUniforms = */ 0,
+    /* .maxFragmentImageUniforms = */ 8,
+    /* .maxCombinedImageUniforms = */ 8,
+    /* .maxGeometryTextureImageUnits = */ 16,
+    /* .maxGeometryOutputVertices = */ 256,
+    /* .maxGeometryTotalOutputComponents = */ 1024,
+    /* .maxGeometryUniformComponents = */ 1024,
+    /* .maxGeometryVaryingComponents = */ 64,
+    /* .maxTessControlInputComponents = */ 128,
+    /* .maxTessControlOutputComponents = */ 128,
+    /* .maxTessControlTextureImageUnits = */ 16,
+    /* .maxTessControlUniformComponents = */ 1024,
+    /* .maxTessControlTotalOutputComponents = */ 4096,
+    /* .maxTessEvaluationInputComponents = */ 128,
+    /* .maxTessEvaluationOutputComponents = */ 128,
+    /* .maxTessEvaluationTextureImageUnits = */ 16,
+    /* .maxTessEvaluationUniformComponents = */ 1024,
+    /* .maxTessPatchComponents = */ 120,
+    /* .maxPatchVertices = */ 32,
+    /* .maxTessGenLevel = */ 64,
+    /* .maxViewports = */ 16,
+    /* .maxVertexAtomicCounters = */ 0,
+    /* .maxTessControlAtomicCounters = */ 0,
+    /* .maxTessEvaluationAtomicCounters = */ 0,
+    /* .maxGeometryAtomicCounters = */ 0,
+    /* .maxFragmentAtomicCounters = */ 8,
+    /* .maxCombinedAtomicCounters = */ 8,
+    /* .maxAtomicCounterBindings = */ 1,
+    /* .maxVertexAtomicCounterBuffers = */ 0,
+    /* .maxTessControlAtomicCounterBuffers = */ 0,
+    /* .maxTessEvaluationAtomicCounterBuffers = */ 0,
+    /* .maxGeometryAtomicCounterBuffers = */ 0,
+    /* .maxFragmentAtomicCounterBuffers = */ 1,
+    /* .maxCombinedAtomicCounterBuffers = */ 1,
+    /* .maxAtomicCounterBufferSize = */ 16384,
+    /* .maxTransformFeedbackBuffers = */ 4,
+    /* .maxTransformFeedbackInterleavedComponents = */ 64,
+    /* .maxCullDistances = */ 8,
+    /* .maxCombinedClipAndCullDistances = */ 8,
+    /* .maxSamples = */ 4,
+    /* .maxMeshOutputVerticesNV = */ 256,
+    /* .maxMeshOutputPrimitivesNV = */ 512,
+    /* .maxMeshWorkGroupSizeX_NV = */ 32,
+    /* .maxMeshWorkGroupSizeY_NV = */ 1,
+    /* .maxMeshWorkGroupSizeZ_NV = */ 1,
+    /* .maxTaskWorkGroupSizeX_NV = */ 32,
+    /* .maxTaskWorkGroupSizeY_NV = */ 1,
+    /* .maxTaskWorkGroupSizeZ_NV = */ 1,
+    /* .maxMeshViewCountNV = */ 4,
+    /* .maxDualSourceDrawBuffersEXT = */ 1,
+    /* .limits = */
+    {
+        /* .nonInductiveForLoops = */ 1,
+        /* .whileLoops = */ 1,
+        /* .doWhileLoops = */ 1,
+        /* .generalUniformIndexing = */ 1,
+        /* .generalAttributeMatrixVectorIndexing = */ 1,
+        /* .generalVaryingIndexing = */ 1,
+        /* .generalSamplerIndexing = */ 1,
+        /* .generalVariableIndexing = */ 1,
+        /* .generalConstantMatrixVectorIndexing = */ 1,
+    },
+};
+
+
+// Format reinterpretation passes (the few EDRAM reinterpretations DS2 relies on), compiled at startup with glslang.
+enum ConvertMode : uint32_t {
+  kConvertDepthToRgba8,      // D24S8 / D24FS8 -> the 32-bit guest word (depth << 8 | stencil) as RGBA8 bytes
+  kConvertFloat7e3ToUnorm10, // k_2_10_10_10_FLOAT (RGBA16F image) -> its bits as k_2_10_10_10 (A2B10G10R10)
+  kConvertUnorm10ToFloat7e3, // the reverse
+  kConvertModeCount,
+};
+
+constexpr const char* kConvertVertexShader = R"(#version 450
+void main() {
+  vec2 p = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+)";
+
+constexpr const char* kConvertHeader = R"(#version 450
+layout(push_constant) uniform P { ivec2 src_minus_dst; int float24; int pad; } pc;
+layout(location = 0) out vec4 o;
+uint E7(float f) {
+  if (!(f > 0.0)) return 0u;
+  uint u = floatBitsToUint(min(f, 31.875));
+  if (u < 0x3E800000u) {
+    uint sh = min(125u - (u >> 23), 24u);
+    u = (0x800000u | (u & 0x7FFFFFu)) >> sh;
+  } else {
+    u += 0xC2000000u;
+  }
+  return ((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16) & 0x3FFu;
+}
+float D7(uint f) {
+  f &= 0x3FFu;
+  if (f == 0u) return 0.0;
+  uint m = f & 0x7Fu, e = f >> 7;
+  if (e == 0u) {
+    uint lz = 31u - uint(findMSB(m)) - 24u;
+    e = uint(1 - int(lz));
+    m = (m << lz) & 0x7Fu;
+  }
+  return uintBitsToFloat(((e + 124u) << 23) | (m << 16));
+}
+uint F24(float f) {
+  if (!(f > 0.0)) return 0u;
+  uint u = floatBitsToUint(f);
+  if (u >= 0x3FFFFFF8u) return 0xFFFFFFu;
+  if (u < 0x38800000u) {
+    uint sh = min(113u - (u >> 23), 24u);
+    u = (0x800000u | (u & 0x7FFFFFu)) >> sh;
+  } else {
+    u += 0xC8000000u;
+  }
+  u += 3u + ((u >> 3) & 1u);
+  return (u >> 3) & 0xFFFFFFu;
+}
+)";
+
+constexpr const char* kConvertBodies[kConvertModeCount] = {
+    R"(layout(set = 0, binding = 0) uniform sampler2D d;
+layout(set = 0, binding = 1) uniform usampler2D s;
+void main() {
+  ivec2 c = ivec2(gl_FragCoord.xy) + pc.src_minus_dst;
+  float z = texelFetch(d, c, 0).r;
+  uint st = texelFetch(s, c, 0).r;
+  uint z24 = pc.float24 != 0 ? F24(z) : uint(clamp(z, 0.0, 1.0) * 16777215.0 + 0.5);
+  uint v = (z24 << 8) | (st & 0xFFu);
+  o = vec4(float(v & 0xFFu), float((v >> 8) & 0xFFu), float((v >> 16) & 0xFFu), float(v >> 24)) / 255.0;
+}
+)",
+    R"(layout(set = 0, binding = 0) uniform sampler2D t;
+void main() {
+  vec4 c = texelFetch(t, ivec2(gl_FragCoord.xy) + pc.src_minus_dst, 0);
+  o = vec4(float(E7(c.r)) / 1023.0, float(E7(c.g)) / 1023.0, float(E7(c.b)) / 1023.0, clamp(c.a, 0.0, 1.0));
+}
+)",
+    R"(layout(set = 0, binding = 0) uniform sampler2D t;
+void main() {
+  vec4 c = texelFetch(t, ivec2(gl_FragCoord.xy) + pc.src_minus_dst, 0);
+  uvec3 b = uvec3(c.rgb * 1023.0 + 0.5);
+  o = vec4(D7(b.r), D7(b.g), D7(b.b), c.a);
+}
+)",
+};
+
+constexpr const char* kPresentShader = R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D t;
+layout(set = 0, binding = 1) uniform Ramp { uvec4 lut[64]; } ramp;
+layout(push_constant) uniform P { vec2 scale; int use_ramp; int pad; } pc;
+layout(location = 0) out vec4 o;
+void main() {
+  vec4 c = texelFetch(t, ivec2(gl_FragCoord.xy * pc.scale), 0);
+  if (pc.use_ramp != 0) {
+    uvec3 i = uvec3(clamp(c.rgb, 0.0, 1.0) * 255.0 + 0.5);
+    uint r = ramp.lut[i.r >> 2][i.r & 3u];
+    uint g = ramp.lut[i.g >> 2][i.g & 3u];
+    uint b = ramp.lut[i.b >> 2][i.b & 3u];
+    c.rgb = vec3(float((r >> 20) & 1023u), float((g >> 10) & 1023u), float(b & 1023u)) / 1023.0;
+  }
+  o = vec4(c.rgb, 1.0);
+}
+)";
+
+bool CompileGlsl(EShLanguage stage, const std::string& source, std::vector<uint32_t>& spirv, std::string& error) {
+  static std::once_flag once;
+  std::call_once(once, []() { glslang::InitializeProcess(); });
+  const char* src = source.c_str();
+  glslang::TShader shader(stage);
+  shader.setStrings(&src, 1);
+  shader.setEnvInput(glslang::EShSourceGlsl, stage, glslang::EShClientVulkan, 450);
+  shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_0);
+  shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_0);
+  const EShMessages messages = EShMessages(EShMsgSpvRules | EShMsgVulkanRules);
+  if (!shader.parse(&kGlslangDefaultTBuiltInResource, 450, false, messages)) {
+    error = shader.getInfoLog() ? shader.getInfoLog() : "parse failed";
+    return false;
+  }
+  glslang::TProgram program;
+  program.addShader(&shader);
+  if (!program.link(messages)) {
+    error = program.getInfoLog() ? program.getInfoLog() : "link failed";
+    return false;
+  }
+  glslang::SpvOptions options = {};
+  glslang::GlslangToSpv(*program.getIntermediate(stage), spirv, &options);
+  return !spirv.empty();
+}
+
+struct NativeImage {
+  VkImage image = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  VkImageView view = VK_NULL_HANDLE;  // full view (color, or depth + stencil for attachments)
+  VkImageView depth_view = VK_NULL_HANDLE;    // depth aspect only, for sampling
+  VkImageView stencil_view = VK_NULL_HANDLE;  // stencil aspect only, for sampling
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  uint32_t width = 0, height = 0;
+  bool depth = false;
+  bool initialized = false;  // transitioned to GENERAL
+};
+
+VkFormat ColorRtFormat(xenos::ColorRenderTargetFormat f) {
+  using F = xenos::ColorRenderTargetFormat;
+  switch (f) {
+    case F::k_8_8_8_8:
+    case F::k_8_8_8_8_GAMMA:
+      return VK_FORMAT_R8G8B8A8_UNORM;
+    case F::k_2_10_10_10:
+    case F::k_2_10_10_10_AS_10_10_10_10:
+      return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case F::k_2_10_10_10_FLOAT:
+    case F::k_2_10_10_10_FLOAT_AS_16_16_16_16:
+    case F::k_16_16_16_16_FLOAT:
+      return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case F::k_16_16:
+      return VK_FORMAT_R16G16_SNORM;
+    case F::k_16_16_16_16:
+      return VK_FORMAT_R16G16B16A16_SNORM;
+    case F::k_16_16_FLOAT:
+      return VK_FORMAT_R16G16_SFLOAT;
+    case F::k_32_FLOAT:
+      return VK_FORMAT_R32_SFLOAT;
+    case F::k_32_32_FLOAT:
+      return VK_FORMAT_R32G32_SFLOAT;
+    default:
+      return VK_FORMAT_UNDEFINED;
+  }
+}
+
+struct TextureFormatInfo {
+  VkFormat format;
+  uint32_t bytes_per_block;
+  uint32_t block_size;  // texels per block side (1 or 4)
+  uint32_t host_swizzle;  // XE_GPU_TEXTURE_SWIZZLE_* for components missing in the host format
+};
+
+bool GetTextureFormat(xenos::TextureFormat f, TextureFormatInfo& out) {
+  using T = xenos::TextureFormat;
+  switch (f) {
+    case T::k_8:
+    case T::k_8_A:
+      out = {VK_FORMAT_R8_UNORM, 1, 1, xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR};
+      return true;
+    case T::k_8_8:
+      out = {VK_FORMAT_R8G8_UNORM, 2, 1, xenos::XE_GPU_TEXTURE_SWIZZLE_RGGG};
+      return true;
+    case T::k_8_8_8_8:
+    case T::k_8_8_8_8_AS_16_16_16_16:
+      out = {VK_FORMAT_R8G8B8A8_UNORM, 4, 1, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA};
+      return true;
+    case T::k_2_10_10_10:
+    case T::k_2_10_10_10_AS_16_16_16_16:
+      out = {VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4, 1, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA};
+      return true;
+    case T::k_16_16_16_16_FLOAT:
+      out = {VK_FORMAT_R16G16B16A16_SFLOAT, 8, 1, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA};
+      return true;
+    case T::k_16_16_FLOAT:
+      out = {VK_FORMAT_R16G16_SFLOAT, 4, 1, xenos::XE_GPU_TEXTURE_SWIZZLE_RGGG};
+      return true;
+    case T::k_16_FLOAT:
+      out = {VK_FORMAT_R16_SFLOAT, 2, 1, xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR};
+      return true;
+    case T::k_32_FLOAT:
+      out = {VK_FORMAT_R32_SFLOAT, 4, 1, xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR};
+      return true;
+    case T::k_16_16:
+      out = {VK_FORMAT_R16G16_UNORM, 4, 1, xenos::XE_GPU_TEXTURE_SWIZZLE_RGGG};
+      return true;
+    case T::k_16_16_16_16:
+      out = {VK_FORMAT_R16G16B16A16_UNORM, 8, 1, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA};
+      return true;
+    case T::k_DXT1:
+      out = {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 8, 4, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA};
+      return true;
+    case T::k_DXT2_3:
+      out = {VK_FORMAT_BC2_UNORM_BLOCK, 16, 4, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA};
+      return true;
+    case T::k_DXT4_5:
+      out = {VK_FORMAT_BC3_UNORM_BLOCK, 16, 4, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA};
+      return true;
+    case T::k_DXN:
+      out = {VK_FORMAT_BC5_UNORM_BLOCK, 16, 4, xenos::XE_GPU_TEXTURE_SWIZZLE_RGGG};
+      return true;
+    case T::k_DXT5A:
+      out = {VK_FORMAT_BC4_UNORM_BLOCK, 8, 4, xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR};
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Endian swap of one element (xenos::Endian), in place.
+void SwapElements(uint8_t* data, size_t bytes, xenos::Endian endian) {
+  switch (endian) {
+    case xenos::Endian::k8in16:
+      for (size_t i = 0; i + 1 < bytes; i += 2) std::swap(data[i], data[i + 1]);
+      break;
+    case xenos::Endian::k8in32:
+      for (size_t i = 0; i + 3 < bytes; i += 4) {
+        uint32_t v;
+        std::memcpy(&v, data + i, 4);
+        v = rex::byte_swap(v);
+        std::memcpy(data + i, &v, 4);
+      }
+      break;
+    case xenos::Endian::k16in32:
+      for (size_t i = 0; i + 3 < bytes; i += 4) {
+        uint32_t v;
+        std::memcpy(&v, data + i, 4);
+        v = (v >> 16) | (v << 16);
+        std::memcpy(data + i, &v, 4);
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+VkComponentSwizzle SwizzleComponent(uint32_t guest_swizzle, uint32_t host_swizzle, uint32_t c) {
+  uint32_t s = (guest_swizzle >> (3 * c)) & 7;
+  if (s == 4) return VK_COMPONENT_SWIZZLE_ZERO;
+  if (s >= 5) return VK_COMPONENT_SWIZZLE_ONE;
+  uint32_t h = (host_swizzle >> (3 * s)) & 7;
+  switch (h) {
+    case 0:
+      return VK_COMPONENT_SWIZZLE_R;
+    case 1:
+      return VK_COMPONENT_SWIZZLE_G;
+    case 2:
+      return VK_COMPONENT_SWIZZLE_B;
+    case 3:
+      return VK_COMPONENT_SWIZZLE_A;
+    case 4:
+      return VK_COMPONENT_SWIZZLE_ZERO;
+    default:
+      return VK_COMPONENT_SWIZZLE_ONE;
+  }
+}
+
+constexpr VkBlendFactor kBlendFactors[32] = {
+    VK_BLEND_FACTOR_ZERO,           VK_BLEND_FACTOR_ONE,
+    VK_BLEND_FACTOR_ZERO,           VK_BLEND_FACTOR_ZERO,
+    VK_BLEND_FACTOR_SRC_COLOR,      VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR,
+    VK_BLEND_FACTOR_SRC_ALPHA,      VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+    VK_BLEND_FACTOR_DST_COLOR,      VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR,
+    VK_BLEND_FACTOR_DST_ALPHA,      VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA,
+    VK_BLEND_FACTOR_CONSTANT_COLOR, VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR,
+    VK_BLEND_FACTOR_CONSTANT_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA,
+    VK_BLEND_FACTOR_SRC_ALPHA_SATURATE,
+};
+constexpr VkBlendOp kBlendOps[8] = {VK_BLEND_OP_ADD, VK_BLEND_OP_SUBTRACT, VK_BLEND_OP_MIN, VK_BLEND_OP_MAX,
+                                    VK_BLEND_OP_REVERSE_SUBTRACT, VK_BLEND_OP_ADD, VK_BLEND_OP_ADD,
+                                    VK_BLEND_OP_ADD};
+
+// Everything that selects a VkPipeline. No padding: hashed as bytes.
+struct PipelineKey {
+  uint64_t vs_hash;
+  uint64_t vs_modification;
+  uint64_t ps_hash;
+  uint64_t ps_modification;
+  uint64_t render_pass;  // VkRenderPass handle value
+  uint32_t topology;
+  uint32_t primitive_restart;
+  uint32_t cull_mode;
+  uint32_t front_face_cw;
+  uint32_t depth_test, depth_write, depth_func;
+  uint32_t stencil_enable;
+  uint32_t stencil_front;  // fail | pass << 3 | zfail << 6 | func << 9
+  uint32_t stencil_back;
+  uint32_t blend[4];       // RB_BLENDCONTROL & 0x1FFF1FFF, or 0x00010001 for off
+  uint32_t write_mask;     // 4 bits per RT
+  uint32_t color_count;
+  uint32_t has_ps;
+  uint32_t depth_clamp;
+  uint32_t texture_layout;  // texture/sampler counts for the pipeline layout
+};
+static_assert(sizeof(PipelineKey) % 8 == 0, "PipelineKey must have no tail padding");
+
+class NativeGraphicsSystem;
+
+class NativeCommandProcessor final : public CommandProcessor {
+ public:
+  NativeCommandProcessor(GraphicsSystem* graphics_system, system::KernelState* kernel_state)
+      : CommandProcessor(graphics_system, kernel_state) {}
+  ~NativeCommandProcessor() override = default;
+
+  void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width, uint32_t frontbuffer_height) override;
+
+ protected:
+  bool SetupContext() override;
+  void ShutdownContext() override;
+  Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address, const uint32_t* host_address,
+                     uint32_t dword_count) override;
+  bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count, IndexBufferInfo* index_buffer_info,
+                 bool major_mode_explicit) override;
+  bool IssueCopy() override;
+
+ private:
+  struct FrameSlot {
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    bool submitted = false;
+    VkBuffer upload = VK_NULL_HANDLE;
+    VkDeviceMemory upload_memory = VK_NULL_HANDLE;
+    uint32_t upload_memory_type = 0;
+    VkDeviceSize upload_memory_size = 0;
+    uint8_t* upload_mapping = nullptr;
+    VkDeviceSize upload_used = 0;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet shared_memory_set = VK_NULL_HANDLE;
+    std::vector<std::pair<VkImage, VkDeviceMemory>> deferred_destroy;
+  };
+  struct PipelineLayoutEntry {
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout textures_vertex = VK_NULL_HANDLE;
+    VkDescriptorSetLayout textures_pixel = VK_NULL_HANDLE;
+  };
+  struct RenderPassEntry {
+    VkRenderPass pass = VK_NULL_HANDLE;
+  };
+  struct TextureEntry {
+    NativeImage image;
+    uint64_t content_hash = 0;
+    uint64_t last_check_frame = 0;
+    uint64_t last_use_frame = 0;
+    std::unordered_map<uint32_t, VkImageView> swizzle_views;
+  };
+  struct ResolvedEntry {
+    NativeImage image;
+    uint32_t guest_format = 0;
+    bool rb_swapped = false;  // RB_COPY_DEST_INFO.copy_dest_swap: red and blue swapped in the guest copy
+    uint32_t guest_pitch = 0, guest_height = 0, bpp_log2 = 2;  // guest texture layout (tiled), for sub-resolves
+    uint64_t frame = 0;
+    std::unordered_map<uint32_t, VkImageView> swizzle_views;
+  };
+  struct Stats {
+    uint64_t draws = 0, draws_skipped = 0, draws_unsupported_prim = 0, draws_failed = 0;
+    uint64_t copies = 0, clears = 0, swaps = 0, swaps_presented = 0;
+    uint64_t texture_uploads = 0, texture_unsupported = 0, texture_from_resolve = 0;
+    uint64_t upload_bytes = 0, pipelines = 0, render_passes_begun = 0;
+    uint64_t prim_counts[32] = {};
+  };
+
+  const VulkanDevice* device() const { return vulkan_device_; }
+  const VulkanDevice::Functions& dfn() const { return vulkan_device_->functions(); }
+
+  bool BeginFrame();
+  void SubmitFrame();
+  FrameSlot& slot() { return slots_[frame_ % kFrameSlots]; }
+  uint8_t* Upload(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset_out);
+  void Barrier();
+  void EndRenderPass();
+  bool CreateImage(NativeImage& img, VkFormat format, uint32_t w, uint32_t h, bool depth, VkImageUsageFlags usage);
+  void DestroyImage(NativeImage& img, bool deferred);
+  void EnsureGeneral(NativeImage& img);
+  NativeImage* GetRenderTarget(uint32_t base, uint32_t pitch, uint32_t format, bool depth, uint32_t height_hint);
+  VkRenderPass GetRenderPass(const VkFormat* color_formats, uint32_t color_count, VkFormat depth_format);
+  const PipelineLayoutEntry* GetPipelineLayout(uint32_t tv, uint32_t sv, uint32_t tp, uint32_t sp);
+  VkDescriptorSetLayout GetTextureSetLayout(bool vertex, uint32_t textures, uint32_t samplers);
+  VkPipeline GetPipeline(const PipelineKey& key, VulkanShader::VulkanTranslation* vs,
+                         VulkanShader::VulkanTranslation* ps, VkPipelineLayout layout);
+  VkSampler GetSampler(const VulkanShader::SamplerBinding& binding, const xenos::xe_gpu_texture_fetch_t& fetch);
+  VkImageView GetTextureView(uint32_t fetch_index, xenos::FetchOpDimension dimension, bool& resolved_out);
+  VkImageView GetSwizzleView(std::unordered_map<uint32_t, VkImageView>& views, const NativeImage& image,
+                             uint32_t swizzle);
+  bool ClearRect(NativeImage& rt, const VkClearValue& value, const VkRect2D& rect);
+  bool SetupConversions();
+  bool Convert(ConvertMode mode, NativeImage& src, NativeImage& dst, int32_t src_x, int32_t src_y,
+               const VkRect2D& dst_rect, bool src_float24);
+  void AdoptRenderTarget(uint32_t base, uint32_t pitch, uint64_t key, NativeImage& img);
+  void LogStats();
+  void DumpImages();
+  bool Tracing() const {
+    return REXCVAR_GET(ds2_native_dump_swap) > 0 && !dumped_ &&
+           heavy_frames_ + 1 == uint64_t(REXCVAR_GET(ds2_native_dump_swap));
+  }
+
+  const VulkanDevice* vulkan_device_ = nullptr;
+  PFN_vkCmdBlitImage cmd_blit_image_ = nullptr;
+  PFN_vkCmdCopyImage cmd_copy_image_ = nullptr;
+  std::unique_ptr<SpirvShaderTranslator> translator_;
+  string::StringBuffer ucode_disasm_buffer_;
+  std::unordered_map<uint64_t, std::unique_ptr<VulkanShader>> shaders_;
+
+  std::array<FrameSlot, kFrameSlots> slots_;
+  uint64_t frame_ = 0;
+  bool frame_open_ = false;
+
+  VkDescriptorSetLayout set_layout_shared_memory_ = VK_NULL_HANDLE;
+  VkDescriptorSetLayout set_layout_constants_ = VK_NULL_HANDLE;
+  VkDescriptorSetLayout set_layout_empty_ = VK_NULL_HANDLE;
+  uint32_t shared_memory_bindings_ = 1;
+  std::unordered_map<uint32_t, VkDescriptorSetLayout> texture_set_layouts_;
+  std::unordered_map<uint64_t, PipelineLayoutEntry> pipeline_layouts_;
+  std::unordered_map<uint64_t, VkRenderPass> render_passes_;
+  std::unordered_map<uint64_t, VkFramebuffer> framebuffers_;
+  std::unordered_map<uint64_t, VkPipeline> pipelines_;
+  std::unordered_map<uint64_t, VkSampler> samplers_;
+  std::unordered_map<uint64_t, NativeImage> render_targets_;
+  std::unordered_map<uint64_t, TextureEntry> textures_;
+  std::unordered_map<uint32_t, ResolvedEntry> resolved_;
+  NativeImage white_;
+  // Format reinterpretation passes.
+  VkShaderModule convert_vs_ = VK_NULL_HANDLE;
+  VkShaderModule convert_fs_[kConvertModeCount] = {};
+  VkDescriptorSetLayout convert_set_layout_[2] = {};  // 1 and 2 combined samplers
+  VkPipelineLayout convert_layout_[2] = {};
+  VkSampler convert_sampler_ = VK_NULL_HANDLE;
+  std::unordered_map<uint64_t, VkPipeline> convert_pipelines_;
+  VkShaderModule present_fs_ = VK_NULL_HANDLE;
+  VkDescriptorSetLayout present_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout present_layout_ = VK_NULL_HANDLE;
+  VkPipeline present_pipeline_ = VK_NULL_HANDLE;
+  VkRenderPass present_pass_ = VK_NULL_HANDLE;
+  std::unordered_map<uint64_t, VkFramebuffer> present_framebuffers_;
+  // Last image written at an EDRAM base and sample pitch: (base | pitch << 12) -> render target key.
+  std::unordered_map<uint64_t, uint64_t> edram_owner_;
+  uint64_t conversions_ = 0;
+  VkImageView white_view_ = VK_NULL_HANDLE;
+
+  // Current render pass.
+  bool in_render_pass_ = false;
+  uint64_t current_framebuffer_key_ = 0;
+  VkRenderPass current_render_pass_ = VK_NULL_HANDLE;
+  uint32_t current_rt_width_ = 0, current_rt_height_ = 0;
+
+  // Per-frame vertex buffer dedupe: (guest address << 32 | size) -> upload offset.
+  std::unordered_map<uint64_t, VkDeviceSize> frame_vertex_uploads_;
+
+  SpirvShaderTranslator::SystemConstants system_constants_ = {};
+  Stats stats_;
+  uint64_t last_log_frame_ = 0;
+  uint64_t draws_this_frame_ = 0, heavy_frames_ = 0;
+  bool dumped_ = false;
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+
+bool NativeCommandProcessor::SetupContext() {
+  auto* provider = static_cast<ui::vulkan::VulkanProvider*>(graphics_system_->provider());
+  if (!provider) {
+    REXGPU_ERROR("[native] no Vulkan provider");
+    return false;
+  }
+  vulkan_device_ = provider->vulkan_device();
+  const auto& props = vulkan_device_->properties();
+  const VkDevice dev = vulkan_device_->device();
+  const auto& ifn = vulkan_device_->vulkan_instance()->functions();
+  cmd_blit_image_ = reinterpret_cast<PFN_vkCmdBlitImage>(ifn.vkGetDeviceProcAddr(dev, "vkCmdBlitImage"));
+  cmd_copy_image_ = reinterpret_cast<PFN_vkCmdCopyImage>(ifn.vkGetDeviceProcAddr(dev, "vkCmdCopyImage"));
+  if (!cmd_blit_image_ || !cmd_copy_image_) {
+    REXGPU_ERROR("[native] vkCmdBlitImage / vkCmdCopyImage not available");
+    return false;
+  }
+
+  translator_ = std::make_unique<SpirvShaderTranslator>(SpirvShaderTranslator::Features(vulkan_device_), false,
+                                                        false, false, 1, 1);
+  shared_memory_bindings_ =
+      uint32_t(1) << SpirvShaderTranslator::GetSharedMemoryStorageBufferCountLog2(props.maxStorageBufferRange);
+
+  const VkShaderStageFlags guest_stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                                          (props.geometryShader ? VK_SHADER_STAGE_GEOMETRY_BIT : 0);
+  // Set 0: "shared memory" = the frame's upload buffer.
+  {
+    VkDescriptorSetLayoutBinding b = {};
+    b.binding = 0;
+    b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b.descriptorCount = shared_memory_bindings_;
+    b.stageFlags = guest_stages;
+    VkDescriptorSetLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    ci.bindingCount = 1;
+    ci.pBindings = &b;
+    if (dfn().vkCreateDescriptorSetLayout(dev, &ci, nullptr, &set_layout_shared_memory_) != VK_SUCCESS) {
+      return false;
+    }
+  }
+  // Set 1: the five constant buffers.
+  {
+    VkDescriptorSetLayoutBinding b[SpirvShaderTranslator::kConstantBufferCount] = {};
+    for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+      b[i].binding = i;
+      b[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+      b[i].descriptorCount = 1;
+      b[i].stageFlags = guest_stages;
+    }
+    VkDescriptorSetLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    ci.bindingCount = SpirvShaderTranslator::kConstantBufferCount;
+    ci.pBindings = b;
+    if (dfn().vkCreateDescriptorSetLayout(dev, &ci, nullptr, &set_layout_constants_) != VK_SUCCESS) {
+      return false;
+    }
+    VkDescriptorSetLayoutCreateInfo empty = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    if (dfn().vkCreateDescriptorSetLayout(dev, &empty, nullptr, &set_layout_empty_) != VK_SUCCESS) {
+      return false;
+    }
+  }
+
+  for (FrameSlot& s : slots_) {
+    VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    pci.queueFamilyIndex = vulkan_device_->queue_family_graphics_compute();
+    if (dfn().vkCreateCommandPool(dev, &pci, nullptr, &s.pool) != VK_SUCCESS) return false;
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = s.pool;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    if (dfn().vkAllocateCommandBuffers(dev, &ai, &s.cmd) != VK_SUCCESS) return false;
+    VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (dfn().vkCreateFence(dev, &fci, nullptr, &s.fence) != VK_SUCCESS) return false;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device_, kUploadBufferSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            ui::vulkan::util::MemoryPurpose::kUpload, s.upload, s.upload_memory, &s.upload_memory_type,
+            &s.upload_memory_size)) {
+      REXGPU_ERROR("[native] upload buffer creation failed");
+      return false;
+    }
+    void* map = nullptr;
+    if (dfn().vkMapMemory(dev, s.upload_memory, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) return false;
+    s.upload_mapping = static_cast<uint8_t*>(map);
+    VkDescriptorPoolSize sizes[4] = {
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxSetsPerFrame * 2},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxSetsPerFrame * 4},
+        {VK_DESCRIPTOR_TYPE_SAMPLER, kMaxSetsPerFrame * 4},
+    };
+    VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.maxSets = kMaxSetsPerFrame;
+    dpci.poolSizeCount = 4;
+    dpci.pPoolSizes = sizes;
+    if (dfn().vkCreateDescriptorPool(dev, &dpci, nullptr, &s.descriptor_pool) != VK_SUCCESS) return false;
+  }
+
+  if (!BeginFrame()) return false;
+  // 1x1 white texture for fetches that cannot be served.
+  if (!CreateImage(white_, VK_FORMAT_R8G8B8A8_UNORM, 1, 1, false,
+                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+    return false;
+  }
+  EnsureGeneral(white_);
+  {
+    VkClearColorValue c = {};
+    c.float32[0] = c.float32[1] = c.float32[2] = c.float32[3] = 1.0f;
+    VkImageSubresourceRange r = ui::vulkan::util::InitializeSubresourceRange();
+    dfn().vkCmdClearColorImage(slot().cmd, white_.image, VK_IMAGE_LAYOUT_GENERAL, &c, 1, &r);
+    Barrier();
+  }
+  white_view_ = white_.view;
+  if (!SetupConversions()) {
+    REXGPU_WARN("[native] format reinterpretation passes unavailable");
+  }
+  REXGPU_INFO("[native] DS2 native renderer ready: {} shared memory binding(s), geometry shaders {}",
+              shared_memory_bindings_, props.geometryShader ? "yes" : "no");
+  return true;
+}
+
+void NativeCommandProcessor::ShutdownContext() {
+  if (!vulkan_device_) return;
+  const VkDevice dev = vulkan_device_->device();
+  if (frame_open_) {
+    EndRenderPass();
+    dfn().vkEndCommandBuffer(slot().cmd);
+    frame_open_ = false;
+  }
+  for (FrameSlot& s : slots_) {
+    if (s.submitted) dfn().vkWaitForFences(dev, 1, &s.fence, VK_TRUE, UINT64_MAX);
+  }
+  for (auto& [k, img] : render_targets_) DestroyImage(img, false);
+  for (auto& [k, t] : textures_) {
+    for (auto& [s, v] : t.swizzle_views) dfn().vkDestroyImageView(dev, v, nullptr);
+    DestroyImage(t.image, false);
+  }
+  for (auto& [k, r] : resolved_) {
+    for (auto& [s, v] : r.swizzle_views) dfn().vkDestroyImageView(dev, v, nullptr);
+    DestroyImage(r.image, false);
+  }
+  DestroyImage(white_, false);
+  for (auto& [k, p] : convert_pipelines_) dfn().vkDestroyPipeline(dev, p, nullptr);
+  for (uint32_t i = 0; i < 2; ++i) {
+    if (convert_layout_[i]) dfn().vkDestroyPipelineLayout(dev, convert_layout_[i], nullptr);
+    if (convert_set_layout_[i]) dfn().vkDestroyDescriptorSetLayout(dev, convert_set_layout_[i], nullptr);
+  }
+  if (convert_sampler_) dfn().vkDestroySampler(dev, convert_sampler_, nullptr);
+  for (auto& [k, fb] : present_framebuffers_) dfn().vkDestroyFramebuffer(dev, fb, nullptr);
+  if (present_pipeline_) dfn().vkDestroyPipeline(dev, present_pipeline_, nullptr);
+  if (present_pass_) dfn().vkDestroyRenderPass(dev, present_pass_, nullptr);
+  if (present_layout_) dfn().vkDestroyPipelineLayout(dev, present_layout_, nullptr);
+  if (present_set_layout_) dfn().vkDestroyDescriptorSetLayout(dev, present_set_layout_, nullptr);
+  if (present_fs_) dfn().vkDestroyShaderModule(dev, present_fs_, nullptr);
+  if (convert_vs_) dfn().vkDestroyShaderModule(dev, convert_vs_, nullptr);
+  for (auto m : convert_fs_) {
+    if (m) dfn().vkDestroyShaderModule(dev, m, nullptr);
+  }
+  for (auto& [k, p] : pipelines_) dfn().vkDestroyPipeline(dev, p, nullptr);
+  for (auto& [k, f] : framebuffers_) dfn().vkDestroyFramebuffer(dev, f, nullptr);
+  for (auto& [k, p] : render_passes_) dfn().vkDestroyRenderPass(dev, p, nullptr);
+  for (auto& [k, s] : samplers_) dfn().vkDestroySampler(dev, s, nullptr);
+  for (auto& [k, l] : pipeline_layouts_) dfn().vkDestroyPipelineLayout(dev, l.layout, nullptr);
+  for (auto& [k, l] : texture_set_layouts_) dfn().vkDestroyDescriptorSetLayout(dev, l, nullptr);
+  for (FrameSlot& s : slots_) {
+    for (auto& [i, m] : s.deferred_destroy) {
+      dfn().vkDestroyImage(dev, i, nullptr);
+      dfn().vkFreeMemory(dev, m, nullptr);
+    }
+    if (s.descriptor_pool) dfn().vkDestroyDescriptorPool(dev, s.descriptor_pool, nullptr);
+    if (s.upload) dfn().vkDestroyBuffer(dev, s.upload, nullptr);
+    if (s.upload_memory) dfn().vkFreeMemory(dev, s.upload_memory, nullptr);
+    if (s.fence) dfn().vkDestroyFence(dev, s.fence, nullptr);
+    if (s.pool) dfn().vkDestroyCommandPool(dev, s.pool, nullptr);
+  }
+  dfn().vkDestroyDescriptorSetLayout(dev, set_layout_shared_memory_, nullptr);
+  dfn().vkDestroyDescriptorSetLayout(dev, set_layout_constants_, nullptr);
+  dfn().vkDestroyDescriptorSetLayout(dev, set_layout_empty_, nullptr);
+  shaders_.clear();
+}
+
+// --- Frames ----------------------------------------------------------------------------------------------------
+
+bool NativeCommandProcessor::BeginFrame() {
+  FrameSlot& s = slot();
+  const VkDevice dev = vulkan_device_->device();
+  if (s.submitted) {
+    dfn().vkWaitForFences(dev, 1, &s.fence, VK_TRUE, UINT64_MAX);
+    dfn().vkResetFences(dev, 1, &s.fence);
+    s.submitted = false;
+  }
+  for (auto& [i, m] : s.deferred_destroy) {
+    dfn().vkDestroyImage(dev, i, nullptr);
+    dfn().vkFreeMemory(dev, m, nullptr);
+  }
+  s.deferred_destroy.clear();
+  dfn().vkResetCommandPool(dev, s.pool, 0);
+  dfn().vkResetDescriptorPool(dev, s.descriptor_pool, 0);
+  s.upload_used = 0;
+  frame_vertex_uploads_.clear();
+  // The frame's "shared memory" descriptor: every binding is the upload buffer.
+  VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  ai.descriptorPool = s.descriptor_pool;
+  ai.descriptorSetCount = 1;
+  ai.pSetLayouts = &set_layout_shared_memory_;
+  if (dfn().vkAllocateDescriptorSets(dev, &ai, &s.shared_memory_set) != VK_SUCCESS) return false;
+  std::vector<VkDescriptorBufferInfo> infos(shared_memory_bindings_, {s.upload, 0, VK_WHOLE_SIZE});
+  VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  w.dstSet = s.shared_memory_set;
+  w.dstBinding = 0;
+  w.descriptorCount = shared_memory_bindings_;
+  w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  w.pBufferInfo = infos.data();
+  dfn().vkUpdateDescriptorSets(dev, 1, &w, 0, nullptr);
+  VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  if (dfn().vkBeginCommandBuffer(s.cmd, &bi) != VK_SUCCESS) return false;
+  frame_open_ = true;
+  return true;
+}
+
+void NativeCommandProcessor::SubmitFrame() {
+  if (!frame_open_) return;
+  EndRenderPass();
+  FrameSlot& s = slot();
+  dfn().vkEndCommandBuffer(s.cmd);
+  if (s.upload_used) {
+    ui::vulkan::util::FlushMappedMemoryRange(vulkan_device_, s.upload_memory, s.upload_memory_type, 0,
+                                             s.upload_memory_size, s.upload_used);
+  }
+  VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &s.cmd;
+  {
+    auto queue = vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
+    if (dfn().vkQueueSubmit(queue.queue(), 1, &si, s.fence) != VK_SUCCESS) {
+      REXGPU_ERROR("[native] vkQueueSubmit failed");
+    }
+  }
+  s.submitted = true;
+  frame_open_ = false;
+  ++frame_;
+  BeginFrame();
+}
+
+uint8_t* NativeCommandProcessor::Upload(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset_out) {
+  FrameSlot& s = slot();
+  VkDeviceSize offset = (s.upload_used + alignment - 1) & ~(alignment - 1);
+  if (offset + size > kUploadBufferSize) {
+    // Full: submit what is recorded (keeps the render pass state lost - the next draw begins it again).
+    SubmitFrame();
+    FrameSlot& n = slot();
+    offset = 0;
+    if (size > kUploadBufferSize) return nullptr;
+    n.upload_used = size;
+    offset_out = 0;
+    return n.upload_mapping;
+  }
+  s.upload_used = offset + size;
+  offset_out = offset;
+  stats_.upload_bytes += size;
+  return s.upload_mapping + offset;
+}
+
+void NativeCommandProcessor::Barrier() {
+  VkMemoryBarrier b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+  b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  dfn().vkCmdPipelineBarrier(slot().cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                             1, &b, 0, nullptr, 0, nullptr);
+}
+
+void NativeCommandProcessor::EndRenderPass() {
+  if (in_render_pass_) {
+    dfn().vkCmdEndRenderPass(slot().cmd);
+    in_render_pass_ = false;
+    current_framebuffer_key_ = 0;
+  }
+}
+
+bool NativeCommandProcessor::CreateImage(NativeImage& img, VkFormat format, uint32_t w, uint32_t h, bool depth,
+                                         VkImageUsageFlags usage) {
+  VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ci.imageType = VK_IMAGE_TYPE_2D;
+  ci.format = format;
+  ci.extent = {std::max(w, 1u), std::max(h, 1u), 1};
+  ci.mipLevels = 1;
+  ci.arrayLayers = 1;
+  ci.samples = VK_SAMPLE_COUNT_1_BIT;
+  ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ci.usage = usage;
+  ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (!ui::vulkan::util::CreateDedicatedAllocationImage(vulkan_device_, ci,
+                                                         ui::vulkan::util::MemoryPurpose::kDeviceLocal, img.image,
+                                                         img.memory)) {
+    REXGPU_ERROR("[native] image {}x{} format {} creation failed", w, h, uint32_t(format));
+    return false;
+  }
+  VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vci.image = img.image;
+  vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  vci.format = format;
+  vci.subresourceRange = ui::vulkan::util::InitializeSubresourceRange(
+      depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT);
+  if (depth) {
+    // Attachments need both aspects.
+    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+  }
+  if (dfn().vkCreateImageView(vulkan_device_->device(), &vci, nullptr, &img.view) != VK_SUCCESS) {
+    return false;
+  }
+  if (depth) {
+    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    dfn().vkCreateImageView(vulkan_device_->device(), &vci, nullptr, &img.depth_view);
+    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+    dfn().vkCreateImageView(vulkan_device_->device(), &vci, nullptr, &img.stencil_view);
+  }
+  img.format = format;
+  img.width = ci.extent.width;
+  img.height = ci.extent.height;
+  img.depth = depth;
+  img.initialized = false;
+  return true;
+}
+
+void NativeCommandProcessor::DestroyImage(NativeImage& img, bool deferred) {
+  const VkDevice dev = vulkan_device_->device();
+  if (img.view) dfn().vkDestroyImageView(dev, img.view, nullptr);
+  if (img.depth_view) dfn().vkDestroyImageView(dev, img.depth_view, nullptr);
+  if (img.stencil_view) dfn().vkDestroyImageView(dev, img.stencil_view, nullptr);
+  if (deferred && img.image) {
+    slot().deferred_destroy.emplace_back(img.image, img.memory);
+  } else {
+    if (img.image) dfn().vkDestroyImage(dev, img.image, nullptr);
+    if (img.memory) dfn().vkFreeMemory(dev, img.memory, nullptr);
+  }
+  img = NativeImage();
+}
+
+void NativeCommandProcessor::EnsureGeneral(NativeImage& img) {
+  if (img.initialized) return;
+  EndRenderPass();
+  VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  b.srcAccessMask = 0;
+  b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+  b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  b.image = img.image;
+  b.subresourceRange = ui::vulkan::util::InitializeSubresourceRange(
+      img.depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_COLOR_BIT);
+  dfn().vkCmdPipelineBarrier(slot().cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
+                             nullptr, 0, nullptr, 1, &b);
+  img.initialized = true;
+}
+
+NativeImage* NativeCommandProcessor::GetRenderTarget(uint32_t base, uint32_t pitch, uint32_t format, bool depth,
+                                                     uint32_t height_hint) {
+  if (!depth) {
+    // Same EDRAM bits: the blending-precision variants and gamma share one image (the shader converts gamma).
+    auto storage = xenos::GetStorageColorFormat(xenos::ColorRenderTargetFormat(format));
+    if (storage == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) storage = xenos::ColorRenderTargetFormat::k_8_8_8_8;
+    format = uint32_t(storage);
+  }
+  const uint64_t key = uint64_t(base) | (uint64_t(pitch) << 12) | (uint64_t(format) << 28) | (uint64_t(depth) << 36);
+  VkFormat vk_format;
+  if (depth) {
+    vk_format = xenos::DepthRenderTargetFormat(format) == xenos::DepthRenderTargetFormat::kD24S8
+                    ? VK_FORMAT_D24_UNORM_S8_UINT
+                    : VK_FORMAT_D32_SFLOAT_S8_UINT;
+  } else {
+    vk_format = ColorRtFormat(xenos::ColorRenderTargetFormat(format));
+  }
+  if (vk_format == VK_FORMAT_UNDEFINED || !pitch) return nullptr;
+  uint32_t height = std::clamp<uint32_t>(rex::align<uint32_t>(height_hint, 8), 8, 2048);
+  auto it = render_targets_.find(key);
+  if (it != render_targets_.end()) {
+    if (it->second.height >= height) {
+      AdoptRenderTarget(base, pitch, key, it->second);
+      return &it->second;
+    }
+    // Taller than before: recreate (the old contents are lost - logged, rare).
+    REXGPU_WARN("[native] render target {}@{} grows {} -> {} rows", format, base, it->second.height, height);
+    EndRenderPass();
+    DestroyImage(it->second, true);
+    render_targets_.erase(it);
+  }
+  NativeImage img;
+  VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                            VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                            (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+  if (!CreateImage(img, vk_format, pitch, height, depth, usage)) return nullptr;
+  EnsureGeneral(img);
+  // Start from zero like a fresh EDRAM range would look after a clear.
+  VkImageSubresourceRange r = ui::vulkan::util::InitializeSubresourceRange(
+      depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_COLOR_BIT);
+  if (depth) {
+    VkClearDepthStencilValue v = {0.0f, 0};
+    auto clear_ds = reinterpret_cast<PFN_vkCmdClearDepthStencilImage>(
+        vulkan_device_->vulkan_instance()->functions().vkGetDeviceProcAddr(vulkan_device_->device(),
+                                                                            "vkCmdClearDepthStencilImage"));
+    if (clear_ds) clear_ds(slot().cmd, img.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
+  } else {
+    VkClearColorValue v = {};
+    dfn().vkCmdClearColorImage(slot().cmd, img.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
+  }
+  Barrier();
+  REXGPU_INFO("[native] render target {} format {} at {} tiles: {}x{}", depth ? "depth" : "color", format, base,
+              pitch, height);
+  NativeImage& stored = render_targets_[key] = img;
+  AdoptRenderTarget(base, pitch, key, stored);
+  return &stored;
+}
+
+void NativeCommandProcessor::AdoptRenderTarget(uint32_t base, uint32_t pitch, uint64_t key, NativeImage& img) {
+  const uint64_t area = uint64_t(base) | (uint64_t(pitch) << 12);
+  auto it = edram_owner_.find(area);
+  if (it == edram_owner_.end()) {
+    edram_owner_.emplace(area, key);
+    return;
+  }
+  if (it->second == key) return;
+  const uint64_t owner_key = it->second;
+  it->second = key;
+  auto oit = render_targets_.find(owner_key);
+  if (oit == render_targets_.end()) return;
+  NativeImage& owner = oit->second;
+  // The EDRAM bits of the previous owner, seen in this format. Only the reinterpretations DS2 uses.
+  const uint32_t owner_format = uint32_t((owner_key >> 28) & 0xFF);
+  const uint32_t new_format = uint32_t((key >> 28) & 0xFF);
+  const bool owner_depth = (owner_key >> 36) & 1, new_depth = (key >> 36) & 1;
+  using F = xenos::ColorRenderTargetFormat;
+  ConvertMode mode = kConvertModeCount;
+  if (owner_depth && !new_depth && F(new_format) == F::k_8_8_8_8) {
+    mode = kConvertDepthToRgba8;
+  } else if (!owner_depth && !new_depth && F(owner_format) == F::k_2_10_10_10_FLOAT &&
+             F(new_format) == F::k_2_10_10_10) {
+    mode = kConvertFloat7e3ToUnorm10;
+  } else if (!owner_depth && !new_depth && F(owner_format) == F::k_2_10_10_10 &&
+             F(new_format) == F::k_2_10_10_10_FLOAT) {
+    mode = kConvertUnorm10ToFloat7e3;
+  }
+  if (mode == kConvertModeCount) return;
+  const VkRect2D rect = {{0, 0}, {std::min(owner.width, img.width), std::min(owner.height, img.height)}};
+  Convert(mode, owner, img, 0, 0, rect,
+          owner_depth && xenos::DepthRenderTargetFormat(owner_format) == xenos::DepthRenderTargetFormat::kD24FS8);
+}
+
+bool NativeCommandProcessor::SetupConversions() {
+  const VkDevice dev = vulkan_device_->device();
+  std::vector<uint32_t> spirv;
+  std::string error;
+  if (!CompileGlsl(EShLangVertex, kConvertVertexShader, spirv, error)) {
+    REXGPU_ERROR("[native] conversion vertex shader: {}", error);
+    return false;
+  }
+  convert_vs_ = ui::vulkan::util::CreateShaderModule(vulkan_device_, spirv.data(), spirv.size() * 4);
+  for (uint32_t m = 0; m < kConvertModeCount; ++m) {
+    spirv.clear();
+    if (!CompileGlsl(EShLangFragment, std::string(kConvertHeader) + kConvertBodies[m], spirv, error)) {
+      REXGPU_ERROR("[native] conversion shader {}: {}", m, error);
+      return false;
+    }
+    convert_fs_[m] = ui::vulkan::util::CreateShaderModule(vulkan_device_, spirv.data(), spirv.size() * 4);
+  }
+  for (uint32_t n = 0; n < 2; ++n) {
+    VkDescriptorSetLayoutBinding b[2] = {};
+    for (uint32_t i = 0; i <= n; ++i) {
+      b[i].binding = i;
+      b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+      b[i].descriptorCount = 1;
+      b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    ci.bindingCount = n + 1;
+    ci.pBindings = b;
+    if (dfn().vkCreateDescriptorSetLayout(dev, &ci, nullptr, &convert_set_layout_[n]) != VK_SUCCESS) return false;
+    VkPushConstantRange pc = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    lci.setLayoutCount = 1;
+    lci.pSetLayouts = &convert_set_layout_[n];
+    lci.pushConstantRangeCount = 1;
+    lci.pPushConstantRanges = &pc;
+    if (dfn().vkCreatePipelineLayout(dev, &lci, nullptr, &convert_layout_[n]) != VK_SUCCESS) return false;
+  }
+  VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+  sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+  sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  dfn().vkCreateSampler(dev, &sci, nullptr, &convert_sampler_);
+  // Presentation pass: frontbuffer -> presenter image, through the guest gamma ramp (as the emulation does).
+  spirv.clear();
+  if (!CompileGlsl(EShLangFragment, kPresentShader, spirv, error)) {
+    REXGPU_ERROR("[native] present shader: {}", error);
+    return false;
+  }
+  present_fs_ = ui::vulkan::util::CreateShaderModule(vulkan_device_, spirv.data(), spirv.size() * 4);
+  {
+    VkDescriptorSetLayoutBinding b[2] = {};
+    b[0].binding = 0;
+    b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b[0].descriptorCount = 1;
+    b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    b[1].binding = 1;
+    b[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    b[1].descriptorCount = 1;
+    b[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    ci.bindingCount = 2;
+    ci.pBindings = b;
+    if (dfn().vkCreateDescriptorSetLayout(dev, &ci, nullptr, &present_set_layout_) != VK_SUCCESS) return false;
+    VkPushConstantRange pc = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    lci.setLayoutCount = 1;
+    lci.pSetLayouts = &present_set_layout_;
+    lci.pushConstantRangeCount = 1;
+    lci.pPushConstantRanges = &pc;
+    if (dfn().vkCreatePipelineLayout(dev, &lci, nullptr, &present_layout_) != VK_SUCCESS) return false;
+  }
+  {
+    VkAttachmentDescription att = {};
+    att.format = ui::vulkan::VulkanPresenter::kGuestOutputFormat;
+    att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    att.finalLayout = ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout;
+    VkAttachmentReference ref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub = {};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &ref;
+    VkSubpassDependency dep[2] = {};
+    dep[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    dep[0].dstSubpass = 0;
+    dep[0].srcStageMask = ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask |
+                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep[0].srcAccessMask = ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask;
+    dep[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep[1].srcSubpass = 0;
+    dep[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dep[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep[1].dstStageMask = ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask;
+    dep[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep[1].dstAccessMask = ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask;
+    VkRenderPassCreateInfo rci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rci.attachmentCount = 1;
+    rci.pAttachments = &att;
+    rci.subpassCount = 1;
+    rci.pSubpasses = &sub;
+    rci.dependencyCount = 2;
+    rci.pDependencies = dep;
+    if (dfn().vkCreateRenderPass(dev, &rci, nullptr, &present_pass_) != VK_SUCCESS) return false;
+  }
+  {
+    VkPipelineShaderStageCreateInfo stages[2] = {};
+    stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = convert_vs_;
+    stages[0].pName = "main";
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = present_fs_;
+    stages[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState ba = {};
+    ba.colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1;
+    cb.pAttachments = &ba;
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dy.dynamicStateCount = 2;
+    dy.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    ci.stageCount = 2;
+    ci.pStages = stages;
+    ci.pVertexInputState = &vi;
+    ci.pInputAssemblyState = &ia;
+    ci.pViewportState = &vp;
+    ci.pRasterizationState = &rs;
+    ci.pMultisampleState = &ms;
+    ci.pColorBlendState = &cb;
+    ci.pDynamicState = &dy;
+    ci.layout = present_layout_;
+    ci.renderPass = present_pass_;
+    if (dfn().vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &ci, nullptr, &present_pipeline_) != VK_SUCCESS) {
+      return false;
+    }
+  }
+  return convert_vs_ && convert_fs_[0] && convert_fs_[1] && convert_fs_[2];
+}
+
+bool NativeCommandProcessor::Convert(ConvertMode mode, NativeImage& src, NativeImage& dst, int32_t src_x,
+                                     int32_t src_y, const VkRect2D& dst_rect, bool src_float24) {
+  if (!convert_vs_ || !dst_rect.extent.width || !dst_rect.extent.height) return false;
+  const VkDevice dev = vulkan_device_->device();
+  VkFormat dst_format = dst.format;
+  VkRenderPass pass = GetRenderPass(&dst_format, 1, VK_FORMAT_UNDEFINED);
+  if (!pass) return false;
+  const uint32_t layout_index = mode == kConvertDepthToRgba8 ? 1 : 0;
+  const uint64_t pkey = uint64_t(mode) | (uint64_t(dst_format) << 8);
+  VkPipeline pipeline;
+  auto pit = convert_pipelines_.find(pkey);
+  if (pit != convert_pipelines_.end()) {
+    pipeline = pit->second;
+  } else {
+    VkPipelineShaderStageCreateInfo stages[2] = {};
+    stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = convert_vs_;
+    stages[0].pName = "main";
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = convert_fs_[mode];
+    stages[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState ba = {};
+    ba.colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1;
+    cb.pAttachments = &ba;
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dy.dynamicStateCount = 2;
+    dy.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    ci.stageCount = 2;
+    ci.pStages = stages;
+    ci.pVertexInputState = &vi;
+    ci.pInputAssemblyState = &ia;
+    ci.pViewportState = &vp;
+    ci.pRasterizationState = &rs;
+    ci.pMultisampleState = &ms;
+    ci.pColorBlendState = &cb;
+    ci.pDynamicState = &dy;
+    ci.layout = convert_layout_[layout_index];
+    ci.renderPass = pass;
+    if (dfn().vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline) != VK_SUCCESS) {
+      pipeline = VK_NULL_HANDLE;
+    }
+    convert_pipelines_.emplace(pkey, pipeline);
+  }
+  if (!pipeline) return false;
+  // Descriptors.
+  VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  ai.descriptorPool = slot().descriptor_pool;
+  ai.descriptorSetCount = 1;
+  ai.pSetLayouts = &convert_set_layout_[layout_index];
+  VkDescriptorSet set;
+  if (dfn().vkAllocateDescriptorSets(dev, &ai, &set) != VK_SUCCESS) return false;
+  VkDescriptorImageInfo ii[2] = {};
+  ii[0] = {convert_sampler_, src.depth ? src.depth_view : src.view, VK_IMAGE_LAYOUT_GENERAL};
+  ii[1] = {convert_sampler_, src.stencil_view, VK_IMAGE_LAYOUT_GENERAL};
+  VkWriteDescriptorSet w[2] = {};
+  for (uint32_t i = 0; i <= layout_index; ++i) {
+    w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[i].dstSet = set;
+    w[i].dstBinding = i;
+    w[i].descriptorCount = 1;
+    w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[i].pImageInfo = &ii[i];
+  }
+  dfn().vkUpdateDescriptorSets(dev, layout_index + 1, w, 0, nullptr);
+  // Framebuffer on the destination.
+  uint64_t fb_key = (reinterpret_cast<uint64_t>(pass) * 1000003u + reinterpret_cast<uint64_t>(dst.view)) * 31 +
+                    dst.width * 4099 + dst.height;
+  VkFramebuffer fb;
+  auto fit = framebuffers_.find(fb_key);
+  if (fit != framebuffers_.end()) {
+    fb = fit->second;
+  } else {
+    VkFramebufferCreateInfo fci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fci.renderPass = pass;
+    fci.attachmentCount = 1;
+    fci.pAttachments = &dst.view;
+    fci.width = dst.width;
+    fci.height = dst.height;
+    fci.layers = 1;
+    if (dfn().vkCreateFramebuffer(dev, &fci, nullptr, &fb) != VK_SUCCESS) return false;
+    framebuffers_.emplace(fb_key, fb);
+  }
+  EndRenderPass();
+  Barrier();
+  VkCommandBuffer cmd = slot().cmd;
+  VkRenderPassBeginInfo bi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+  bi.renderPass = pass;
+  bi.framebuffer = fb;
+  bi.renderArea = {{0, 0}, {dst.width, dst.height}};
+  dfn().vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
+  dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+  dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, convert_layout_[layout_index], 0, 1, &set, 0,
+                                nullptr);
+  const int32_t pc[4] = {src_x - dst_rect.offset.x, src_y - dst_rect.offset.y, src_float24 ? 1 : 0, 0};
+  dfn().vkCmdPushConstants(cmd, convert_layout_[layout_index], VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), pc);
+  VkViewport vp = {float(dst_rect.offset.x), float(dst_rect.offset.y), float(dst_rect.extent.width),
+                   float(dst_rect.extent.height), 0.0f, 1.0f};
+  dfn().vkCmdSetViewport(cmd, 0, 1, &vp);
+  dfn().vkCmdSetScissor(cmd, 0, 1, &dst_rect);
+  dfn().vkCmdDraw(cmd, 3, 1, 0, 0);
+  dfn().vkCmdEndRenderPass(cmd);
+  Barrier();
+  ++conversions_;
+  return true;
+}
+
+VkRenderPass NativeCommandProcessor::GetRenderPass(const VkFormat* color_formats, uint32_t color_count,
+                                                   VkFormat depth_format) {
+  uint64_t key = uint64_t(depth_format) | (uint64_t(color_count) << 10);
+  for (uint32_t i = 0; i < color_count; ++i) key = key * 1000003u + uint64_t(color_formats[i]);
+  auto it = render_passes_.find(key);
+  if (it != render_passes_.end()) return it->second;
+  VkAttachmentDescription att[5] = {};
+  VkAttachmentReference color_refs[4] = {};
+  VkAttachmentReference depth_ref = {};
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < color_count; ++i) {
+    att[n].format = color_formats[i];
+    att[n].samples = VK_SAMPLE_COUNT_1_BIT;
+    att[n].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    att[n].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att[n].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att[n].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[n].initialLayout = VK_IMAGE_LAYOUT_GENERAL;
+    att[n].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+    color_refs[i] = {n, VK_IMAGE_LAYOUT_GENERAL};
+    ++n;
+  }
+  if (depth_format != VK_FORMAT_UNDEFINED) {
+    att[n].format = depth_format;
+    att[n].samples = VK_SAMPLE_COUNT_1_BIT;
+    att[n].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    att[n].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att[n].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    att[n].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att[n].initialLayout = VK_IMAGE_LAYOUT_GENERAL;
+    att[n].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+    depth_ref = {n, VK_IMAGE_LAYOUT_GENERAL};
+    ++n;
+  }
+  VkSubpassDescription sub = {};
+  sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+  sub.colorAttachmentCount = color_count;
+  sub.pColorAttachments = color_refs;
+  sub.pDepthStencilAttachment = depth_format != VK_FORMAT_UNDEFINED ? &depth_ref : nullptr;
+  VkRenderPassCreateInfo ci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+  ci.attachmentCount = n;
+  ci.pAttachments = att;
+  ci.subpassCount = 1;
+  ci.pSubpasses = &sub;
+  VkRenderPass pass = VK_NULL_HANDLE;
+  if (dfn().vkCreateRenderPass(vulkan_device_->device(), &ci, nullptr, &pass) != VK_SUCCESS) return VK_NULL_HANDLE;
+  render_passes_.emplace(key, pass);
+  return pass;
+}
+
+VkDescriptorSetLayout NativeCommandProcessor::GetTextureSetLayout(bool vertex, uint32_t textures, uint32_t samplers) {
+  if (!textures && !samplers) return set_layout_empty_;
+  const uint32_t key = textures | (samplers << 12) | (uint32_t(vertex) << 24);
+  auto it = texture_set_layouts_.find(key);
+  if (it != texture_set_layouts_.end()) return it->second;
+  std::vector<VkDescriptorSetLayoutBinding> b(textures + samplers);
+  const VkShaderStageFlags stage = vertex ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT;
+  for (uint32_t i = 0; i < textures + samplers; ++i) {
+    b[i].binding = i;
+    b[i].descriptorType = i < textures ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER;
+    b[i].descriptorCount = 1;
+    b[i].stageFlags = stage;
+  }
+  VkDescriptorSetLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  ci.bindingCount = uint32_t(b.size());
+  ci.pBindings = b.data();
+  VkDescriptorSetLayout l = VK_NULL_HANDLE;
+  if (dfn().vkCreateDescriptorSetLayout(vulkan_device_->device(), &ci, nullptr, &l) != VK_SUCCESS) {
+    return VK_NULL_HANDLE;
+  }
+  texture_set_layouts_.emplace(key, l);
+  return l;
+}
+
+const NativeCommandProcessor::PipelineLayoutEntry* NativeCommandProcessor::GetPipelineLayout(uint32_t tv, uint32_t sv,
+                                                                                             uint32_t tp,
+                                                                                             uint32_t sp) {
+  const uint64_t key = uint64_t(tv) | (uint64_t(sv) << 16) | (uint64_t(tp) << 32) | (uint64_t(sp) << 48);
+  auto it = pipeline_layouts_.find(key);
+  if (it != pipeline_layouts_.end()) return &it->second;
+  PipelineLayoutEntry e;
+  e.textures_vertex = GetTextureSetLayout(true, tv, sv);
+  e.textures_pixel = GetTextureSetLayout(false, tp, sp);
+  if (!e.textures_vertex || !e.textures_pixel) return nullptr;
+  VkDescriptorSetLayout sets[SpirvShaderTranslator::kDescriptorSetCount];
+  sets[SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram] = set_layout_shared_memory_;
+  sets[SpirvShaderTranslator::kDescriptorSetConstants] = set_layout_constants_;
+  sets[SpirvShaderTranslator::kDescriptorSetTexturesVertex] = e.textures_vertex;
+  sets[SpirvShaderTranslator::kDescriptorSetTexturesPixel] = e.textures_pixel;
+  VkPipelineLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  ci.setLayoutCount = SpirvShaderTranslator::kDescriptorSetCount;
+  ci.pSetLayouts = sets;
+  if (dfn().vkCreatePipelineLayout(vulkan_device_->device(), &ci, nullptr, &e.layout) != VK_SUCCESS) return nullptr;
+  return &(pipeline_layouts_[key] = e);
+}
+
+VkPipeline NativeCommandProcessor::GetPipeline(const PipelineKey& key, VulkanShader::VulkanTranslation* vs,
+                                               VulkanShader::VulkanTranslation* ps, VkPipelineLayout layout) {
+  const uint64_t hash = XXH3_64bits(&key, sizeof(key));
+  auto it = pipelines_.find(hash);
+  if (it != pipelines_.end()) return it->second;
+
+  VkPipelineShaderStageCreateInfo stages[2] = {};
+  uint32_t stage_count = 0;
+  stages[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stages[stage_count].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  stages[stage_count].module = vs->shader_module();
+  stages[stage_count].pName = "main";
+  ++stage_count;
+  if (ps) {
+    stages[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[stage_count].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[stage_count].module = ps->shader_module();
+    stages[stage_count].pName = "main";
+    ++stage_count;
+  }
+  VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  ia.topology = VkPrimitiveTopology(key.topology);
+  ia.primitiveRestartEnable = key.primitive_restart ? VK_TRUE : VK_FALSE;
+  VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  vp.viewportCount = 1;
+  vp.scissorCount = 1;
+  VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  rs.depthClampEnable = key.depth_clamp ? VK_TRUE : VK_FALSE;
+  rs.polygonMode = VK_POLYGON_MODE_FILL;
+  rs.cullMode = VkCullModeFlags(key.cull_mode);
+  rs.frontFace = key.front_face_cw ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  rs.depthBiasEnable = VK_TRUE;
+  rs.lineWidth = 1.0f;
+  VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+  ds.depthTestEnable = key.depth_test ? VK_TRUE : VK_FALSE;
+  ds.depthWriteEnable = key.depth_write ? VK_TRUE : VK_FALSE;
+  ds.depthCompareOp = VkCompareOp(key.depth_func);
+  ds.stencilTestEnable = key.stencil_enable ? VK_TRUE : VK_FALSE;
+  auto stencil = [](uint32_t packed) {
+    VkStencilOpState s = {};
+    s.failOp = VkStencilOp(packed & 7);
+    s.passOp = VkStencilOp((packed >> 3) & 7);
+    s.depthFailOp = VkStencilOp((packed >> 6) & 7);
+    s.compareOp = VkCompareOp((packed >> 9) & 7);
+    return s;
+  };
+  ds.front = stencil(key.stencil_front);
+  ds.back = stencil(key.stencil_back);
+  VkPipelineColorBlendAttachmentState blend[4] = {};
+  for (uint32_t i = 0; i < key.color_count; ++i) {
+    const uint32_t b = key.blend[i];
+    VkPipelineColorBlendAttachmentState& a = blend[i];
+    a.colorWriteMask = (key.write_mask >> (4 * i)) & 0xF;
+    const uint32_t cs = b & 0x1F, cop = (b >> 5) & 7, cd = (b >> 8) & 0x1F;
+    const uint32_t as = (b >> 16) & 0x1F, aop = (b >> 21) & 7, ad = (b >> 24) & 0x1F;
+    a.blendEnable = (b == 0x00010001u) ? VK_FALSE : VK_TRUE;
+    a.srcColorBlendFactor = kBlendFactors[cs];
+    a.dstColorBlendFactor = kBlendFactors[cd];
+    a.colorBlendOp = kBlendOps[cop];
+    a.srcAlphaBlendFactor = kBlendFactors[as];
+    a.dstAlphaBlendFactor = kBlendFactors[ad];
+    a.alphaBlendOp = kBlendOps[aop];
+  }
+  VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  cb.attachmentCount = key.color_count;
+  cb.pAttachments = blend;
+  VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT,           VK_DYNAMIC_STATE_SCISSOR,
+                          VK_DYNAMIC_STATE_DEPTH_BIAS,         VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+                          VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+                          VK_DYNAMIC_STATE_STENCIL_REFERENCE};
+  VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+  dy.dynamicStateCount = uint32_t(rex::countof(dyn));
+  dy.pDynamicStates = dyn;
+  VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  ci.stageCount = stage_count;
+  ci.pStages = stages;
+  ci.pVertexInputState = &vi;
+  ci.pInputAssemblyState = &ia;
+  ci.pViewportState = &vp;
+  ci.pRasterizationState = &rs;
+  ci.pMultisampleState = &ms;
+  ci.pDepthStencilState = &ds;
+  ci.pColorBlendState = &cb;
+  ci.pDynamicState = &dy;
+  ci.layout = layout;
+  ci.renderPass = reinterpret_cast<VkRenderPass>(key.render_pass);
+  ci.subpass = 0;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  if (dfn().vkCreateGraphicsPipelines(vulkan_device_->device(), VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline) !=
+      VK_SUCCESS) {
+    REXGPU_ERROR("[native] pipeline creation failed (vs {:016X} ps {:016X})", key.vs_hash, key.ps_hash);
+    pipeline = VK_NULL_HANDLE;
+  }
+  ++stats_.pipelines;
+  pipelines_.emplace(hash, pipeline);
+  return pipeline;
+}
+
+VkSampler NativeCommandProcessor::GetSampler(const VulkanShader::SamplerBinding& binding,
+                                             const xenos::xe_gpu_texture_fetch_t& fetch) {
+  auto filter = [](xenos::TextureFilter instr, xenos::TextureFilter from_fetch) {
+    xenos::TextureFilter f = instr == xenos::TextureFilter::kUseFetchConst ? from_fetch : instr;
+    return f == xenos::TextureFilter::kPoint ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+  };
+  const VkFilter mag = filter(binding.mag_filter, fetch.mag_filter);
+  const VkFilter min = filter(binding.min_filter, fetch.min_filter);
+  auto clamp = [](xenos::ClampMode c) {
+    switch (c) {
+      case xenos::ClampMode::kRepeat:
+        return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+      case xenos::ClampMode::kMirroredRepeat:
+        return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+      case xenos::ClampMode::kClampToBorder:
+        return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+      default:
+        return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    }
+  };
+  const VkSamplerAddressMode u = clamp(fetch.clamp_x), v = clamp(fetch.clamp_y), w = clamp(fetch.clamp_z);
+  const uint64_t key = uint64_t(mag) | (uint64_t(min) << 2) | (uint64_t(u) << 4) | (uint64_t(v) << 8) |
+                       (uint64_t(w) << 12);
+  auto it = samplers_.find(key);
+  if (it != samplers_.end()) return it->second;
+  VkSamplerCreateInfo ci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+  ci.magFilter = mag;
+  ci.minFilter = min;
+  ci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  ci.addressModeU = u;
+  ci.addressModeV = v;
+  ci.addressModeW = w;
+  ci.maxLod = 0.0f;
+  ci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+  VkSampler s = VK_NULL_HANDLE;
+  dfn().vkCreateSampler(vulkan_device_->device(), &ci, nullptr, &s);
+  samplers_.emplace(key, s);
+  return s;
+}
+
+VkImageView NativeCommandProcessor::GetSwizzleView(std::unordered_map<uint32_t, VkImageView>& views,
+                                                   const NativeImage& image, uint32_t swizzle) {
+  auto it = views.find(swizzle);
+  if (it != views.end()) return it->second;
+  // swizzle: bits 0-11 guest swizzle, 12-23 host swizzle.
+  VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vci.image = image.image;
+  vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  vci.format = image.format;
+  const uint32_t guest = swizzle & 0xFFF, host = swizzle >> 12;
+  vci.components.r = SwizzleComponent(guest, host, 0);
+  vci.components.g = SwizzleComponent(guest, host, 1);
+  vci.components.b = SwizzleComponent(guest, host, 2);
+  vci.components.a = SwizzleComponent(guest, host, 3);
+  vci.subresourceRange = ui::vulkan::util::InitializeSubresourceRange(
+      image.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT);
+  VkImageView view = VK_NULL_HANDLE;
+  if (dfn().vkCreateImageView(vulkan_device_->device(), &vci, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
+  views.emplace(swizzle, view);
+  return view;
+}
+
+VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::FetchOpDimension dimension,
+                                                   bool& resolved_out) {
+  resolved_out = false;
+  const RegisterFile& regs = *register_file_;
+  const xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(fetch_index);
+  if (fetch.type != xenos::FetchConstantType::kTexture || dimension != xenos::FetchOpDimension::k2D ||
+      fetch.dimension != xenos::DataDimension::k2DOrStacked) {
+    return white_view_;
+  }
+  const uint32_t base = uint32_t(fetch.base_address) << 12;
+  const uint32_t width = fetch.size_2d.width + 1, height = fetch.size_2d.height + 1;
+  TextureFormatInfo fi;
+  const bool format_known = GetTextureFormat(fetch.format, fi);
+  // A resolve target at this address: sample the native image directly.
+  auto rit = resolved_.find(base);
+  if (rit != resolved_.end()) {
+    resolved_out = true;
+    if (Tracing()) {
+      REXGPU_INFO("[native trace]   draw {} samples resolve {:08X} as fmt {} {}x{} endian {} swizzle {:03X} signs "
+                  "{}{}{}{} exp {}",
+                  draws_this_frame_, base, uint32_t(fetch.format), width, height, uint32_t(fetch.endianness),
+                  uint32_t(fetch.swizzle), uint32_t(fetch.sign_x), uint32_t(fetch.sign_y), uint32_t(fetch.sign_z),
+                  uint32_t(fetch.sign_w), int32_t(fetch.exp_adjust));
+    }
+    ++stats_.texture_from_resolve;
+    // The guest copy had red and blue swapped when copy_dest_swap was set; the native copy did not.
+    uint32_t host = (rit->second.image.depth || !format_known) ? xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA
+                                                               : fi.host_swizzle;
+    if (rit->second.rb_swapped && !rit->second.image.depth) {
+      const uint32_t h[4] = {host & 7, (host >> 3) & 7, (host >> 6) & 7, (host >> 9) & 7};
+      host = h[2] | (h[1] << 3) | (h[0] << 6) | (h[3] << 9);
+    }
+    return GetSwizzleView(rit->second.swizzle_views, rit->second.image, fetch.swizzle | (host << 12));
+  }
+  if (!REXCVAR_GET(ds2_native_textures)) return white_view_;
+  if (!format_known) {
+    ++stats_.texture_unsupported;
+    return white_view_;
+  }
+  const uint64_t key = XXH3_64bits(&fetch.dword_0, 3 * sizeof(uint32_t)) ^ (uint64_t(fetch.endianness) << 60);
+  TextureEntry& t = textures_[key];
+  t.last_use_frame = frame_;
+  // Guest layout of the base level.
+  const uint32_t bw = (width + fi.block_size - 1) / fi.block_size;
+  const uint32_t bh = (height + fi.block_size - 1) / fi.block_size;
+  const uint32_t pitch_blocks = (uint32_t(fetch.pitch) << 5) / fi.block_size;
+  const uint32_t pitch_aligned = rex::align<uint32_t>(std::max(pitch_blocks, bw), 32);
+  const uint32_t height_aligned = rex::align<uint32_t>(bh, 32);
+  uint32_t off_x = 0, off_y = 0, off_z = 0;
+  if (fetch.packed_mips) {
+    texture_util::GetPackedMipOffset(width, height, 1, fetch.format, 0, off_x, off_y, off_z);
+  }
+  const uint32_t bpb_log2 = rex::log2_floor(fi.bytes_per_block);
+  const size_t guest_size = size_t(pitch_aligned) * height_aligned * fi.bytes_per_block;
+  const uint8_t* guest = memory_->TranslatePhysical<const uint8_t*>(base);
+  if (!guest) return white_view_;
+  const bool need_check = !t.image.image || frame_ - t.last_check_frame >= 30;
+  if (!need_check) {
+    return GetSwizzleView(t.swizzle_views, t.image, fetch.swizzle | (fi.host_swizzle << 12));
+  }
+  t.last_check_frame = frame_;
+  const uint64_t content = XXH3_64bits(guest, std::min<size_t>(guest_size, 64 << 20));
+  if (t.image.image && content == t.content_hash) {
+    return GetSwizzleView(t.swizzle_views, t.image, fetch.swizzle | (fi.host_swizzle << 12));
+  }
+  if (!t.image.image) {
+    if (!CreateImage(t.image, fi.format, width, height, false,
+                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+      textures_.erase(key);
+      return white_view_;
+    }
+  }
+  t.content_hash = content;
+  // Untile / copy the base level into the upload buffer, swapping the byte order.
+  const VkDeviceSize row_bytes = VkDeviceSize(bw) * fi.bytes_per_block;
+  VkDeviceSize offset;
+  uint8_t* dst = Upload(row_bytes * bh, 16, offset);
+  if (!dst) return white_view_;
+  for (uint32_t y = 0; y < bh; ++y) {
+    uint8_t* row = dst + row_bytes * y;
+    if (fetch.tiled) {
+      for (uint32_t x = 0; x < bw; ++x) {
+        const int32_t o = texture_util::GetTiledOffset2D(int32_t(x + off_x), int32_t(y + off_y), pitch_aligned,
+                                                         bpb_log2);
+        if (o < 0 || size_t(o) + fi.bytes_per_block > guest_size) {
+          std::memset(row + size_t(x) * fi.bytes_per_block, 0, fi.bytes_per_block);
+          continue;
+        }
+        std::memcpy(row + size_t(x) * fi.bytes_per_block, guest + o, fi.bytes_per_block);
+      }
+    } else {
+      const size_t src = (size_t(y + off_y) * pitch_aligned + off_x) * fi.bytes_per_block;
+      if (src + row_bytes <= guest_size) {
+        std::memcpy(row, guest + src, row_bytes);
+      } else {
+        std::memset(row, 0, row_bytes);
+      }
+    }
+    SwapElements(row, row_bytes, fetch.endianness);
+  }
+  EndRenderPass();
+  EnsureGeneral(t.image);
+  Barrier();
+  VkBufferImageCopy r = {};
+  r.bufferOffset = offset;
+  r.bufferRowLength = bw * fi.block_size;
+  r.bufferImageHeight = bh * fi.block_size;
+  r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  r.imageExtent = {width, height, 1};
+  dfn().vkCmdCopyBufferToImage(slot().cmd, slot().upload, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+  Barrier();
+  ++stats_.texture_uploads;
+  return GetSwizzleView(t.swizzle_views, t.image, fetch.swizzle | (fi.host_swizzle << 12));
+}
+
+// --- Shaders ----------------------------------------------------------------------------------------------------
+
+Shader* NativeCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
+                                           const uint32_t* host_address, uint32_t dword_count) {
+  (void)guest_address;
+  const uint64_t hash = XXH3_64bits(host_address, dword_count * sizeof(uint32_t));
+  auto it = shaders_.find(hash);
+  if (it != shaders_.end()) return it->second.get();
+  auto shader = std::make_unique<VulkanShader>(vulkan_device_, shader_type, hash, host_address, dword_count);
+  Shader* raw = shader.get();
+  shaders_.emplace(hash, std::move(shader));
+  return raw;
+}
+
+// --- Draws -----------------------------------------------------------------------------------------------------
+
+bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+                                       IndexBufferInfo* index_buffer_info, bool major_mode_explicit) {
+  (void)major_mode_explicit;
+  const RegisterFile& regs = *register_file_;
+  const xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
+  if (edram_mode == xenos::EdramMode::kCopy) return IssueCopy();
+  ++stats_.prim_counts[uint32_t(prim_type) & 31];
+  if (!frame_open_ && !BeginFrame()) return false;
+
+  auto* vs = static_cast<VulkanShader*>(active_vertex_shader());
+  if (!vs) {
+    ++stats_.draws_skipped;
+    return true;
+  }
+  if (!vs->is_ucode_analyzed()) vs->AnalyzeUcode(ucode_disasm_buffer_);
+  const bool polygonal = draw_util::IsPrimitivePolygonal(regs);
+  const bool rasterization = draw_util::IsRasterizationPotentiallyDone(regs, polygonal);
+  if (!rasterization || regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0) {
+    ++stats_.draws_skipped;
+    return true;
+  }
+  VulkanShader* ps = nullptr;
+  if (edram_mode == xenos::EdramMode::kColorDepth) {
+    ps = static_cast<VulkanShader*>(active_pixel_shader());
+    if (ps) {
+      if (!ps->is_ucode_analyzed()) ps->AnalyzeUcode(ucode_disasm_buffer_);
+      if (!draw_util::IsPixelShaderNeededWithRasterization(*ps, regs)) ps = nullptr;
+    }
+  }
+
+  VkPrimitiveTopology topology;
+  switch (prim_type) {
+    case xenos::PrimitiveType::kLineList:
+      topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+      break;
+    case xenos::PrimitiveType::kLineStrip:
+      topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+      break;
+    case xenos::PrimitiveType::kTriangleList:
+      topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+      break;
+    case xenos::PrimitiveType::kTriangleStrip:
+      topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+      break;
+    case xenos::PrimitiveType::kTriangleFan:
+      topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+      break;
+    case xenos::PrimitiveType::kPointList:
+      // The translator's point sprite mode: 4 host vertices per point in a strip.
+      topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+      break;
+    case xenos::PrimitiveType::kRectangleList:
+      // The translator's rectangle mode: 4 host vertices per rectangle in a strip, the vertex shader runs the guest
+      // shader for the 3 guest vertices and makes the 4th corner.
+      topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+      break;
+    case xenos::PrimitiveType::kQuadList:
+      // Expanded on the CPU into a triangle list of indices below (guest vertices are still fetched by index).
+      topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+      break;
+    default:
+      ++stats_.draws_unsupported_prim;
+      return true;
+  }
+  if (prim_type == xenos::PrimitiveType::kPointList && index_count > 65535 * 4) {
+    ++stats_.draws_unsupported_prim;
+    return true;
+  }
+
+  // Shader translations.
+  const reg::RB_DEPTHCONTROL depth_control = draw_util::GetNormalizedDepthControl(regs);
+  uint32_t ps_param_gen_pos = UINT32_MAX;
+  const uint32_t interpolator_mask =
+      ps ? (vs->writes_interpolators() &
+            ps->GetInterpolatorInputMask(regs.Get<reg::SQ_PROGRAM_CNTL>(), regs.Get<reg::SQ_CONTEXT_MISC>(),
+                                         ps_param_gen_pos))
+         : 0;
+  SpirvShaderTranslator::Modification vs_mod(translator_->GetDefaultVertexShaderModification(
+      vs->GetDynamicAddressableRegisterCount(regs.Get<reg::SQ_PROGRAM_CNTL>().vs_num_reg),
+      prim_type == xenos::PrimitiveType::kRectangleList ? Shader::HostVertexShaderType::kRectangleListAsTriangleStrip
+      : prim_type == xenos::PrimitiveType::kPointList   ? Shader::HostVertexShaderType::kPointListAsTriangleStrip
+                                                        : Shader::HostVertexShaderType::kVertex));
+  vs_mod.vertex.interpolator_mask = interpolator_mask;
+  vs_mod.vertex.user_clip_plane_count = 0;
+  vs_mod.vertex.user_clip_plane_cull = 0;
+  vs_mod.vertex.output_point_parameters =
+      prim_type == xenos::PrimitiveType::kPointList && ps_param_gen_pos != UINT32_MAX ? 1 : 0;
+  vs_mod.vertex.vertex_kill_and = 0;
+  SpirvShaderTranslator::Modification ps_mod(0);
+  if (ps) {
+    ps_mod = SpirvShaderTranslator::Modification(translator_->GetDefaultPixelShaderModification(
+        ps->GetDynamicAddressableRegisterCount(regs.Get<reg::SQ_PROGRAM_CNTL>().ps_num_reg)));
+    ps_mod.pixel.interpolator_mask = interpolator_mask;
+    ps_mod.pixel.interpolators_centroid = 0;
+    if (ps_param_gen_pos < xenos::kMaxInterpolators) {
+      ps_mod.pixel.param_gen_enable = 1;
+      ps_mod.pixel.param_gen_interpolator = ps_param_gen_pos;
+      ps_mod.pixel.param_gen_point = prim_type == xenos::PrimitiveType::kPointList ? 1 : 0;
+    }
+    ps_mod.pixel.depth_stencil_mode = SpirvShaderTranslator::Modification::DepthStencilMode::kNoModifiers;
+  }
+  auto* vst = static_cast<VulkanShader::VulkanTranslation*>(vs->GetOrCreateTranslation(vs_mod.value));
+  auto* pst = ps ? static_cast<VulkanShader::VulkanTranslation*>(ps->GetOrCreateTranslation(ps_mod.value)) : nullptr;
+  if (!vst->is_translated()) {
+    if (!translator_->TranslateAnalyzedShader(*vst) || !vst->GetOrCreateShaderModule()) {
+      REXGPU_ERROR("[native] vertex shader {:016X} translation failed", vs->ucode_data_hash());
+    }
+  }
+  if (pst && !pst->is_translated()) {
+    if (!translator_->TranslateAnalyzedShader(*pst) || !pst->GetOrCreateShaderModule()) {
+      REXGPU_ERROR("[native] pixel shader {:016X} translation failed", ps->ucode_data_hash());
+    }
+  }
+  if (!vst->is_valid() || !vst->shader_module() || (pst && (!pst->is_valid() || !pst->shader_module()))) {
+    ++stats_.draws_failed;
+    return true;
+  }
+
+  // Render targets.
+  const auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+  const uint32_t color_mask = draw_util::GetNormalizedColorMask(regs, ps ? ps->writes_color_targets() : 0);
+  // MSAA render targets live in sample space: a 4x 640x360 target is a 1280x720 image, so the 1x and 4x views of the
+  // same EDRAM range (DS2 renders shadow maps and half-resolution passes that way) are the same image. Draws into
+  // them are rasterized at the sample resolution (like a 2x2 resolution scale).
+  const uint32_t sx = surface_info.msaa_samples >= xenos::MsaaSamples::k4X ? 2 : 1;
+  const uint32_t sy = surface_info.msaa_samples >= xenos::MsaaSamples::k2X ? 2 : 1;
+  const uint32_t sample_pitch = surface_info.surface_pitch * sx;
+  draw_util::Scissor scissor;
+  draw_util::GetScissor(regs, scissor);
+  scissor.offset[0] *= sx;
+  scissor.extent[0] *= sx;
+  scissor.offset[1] *= sy;
+  scissor.extent[1] *= sy;
+  const uint32_t height_hint = std::max<uint32_t>(scissor.offset[1] + scissor.extent[1], 8);
+  NativeImage* color_rts[4] = {};
+  VkFormat color_formats[4] = {};
+  uint32_t color_count = 0;
+  uint32_t write_mask = 0;
+  uint32_t blend[4] = {};
+  uint32_t rt_width = UINT32_MAX, rt_height = UINT32_MAX;
+  uint32_t last_used_rt = 0;
+  for (uint32_t i = 0; i < 4; ++i) {
+    if ((color_mask >> (4 * i)) & 0xF) last_used_rt = i + 1;
+  }
+  for (uint32_t i = 0; i < last_used_rt; ++i) {
+    const auto ci = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
+    NativeImage* rt = GetRenderTarget(ci.color_base, sample_pitch, uint32_t(ci.color_format), false, height_hint);
+    if (!rt) {
+      ++stats_.draws_failed;
+      return true;
+    }
+    color_rts[color_count] = rt;
+    color_formats[color_count] = rt->format;
+    write_mask |= ((color_mask >> (4 * i)) & 0xF) << (4 * color_count);
+    const uint32_t bc = regs[reg::RB_BLENDCONTROL::rt_register_indices[i]] & 0x1FFF1FFF;
+    blend[color_count] = bc;
+    rt_width = std::min(rt_width, rt->width);
+    rt_height = std::min(rt_height, rt->height);
+    ++color_count;
+  }
+  NativeImage* depth_rt = nullptr;
+  if (depth_control.z_enable || depth_control.stencil_enable) {
+    const auto di = regs.Get<reg::RB_DEPTH_INFO>();
+    depth_rt = GetRenderTarget(di.depth_base, sample_pitch, uint32_t(di.depth_format), true, height_hint);
+    if (depth_rt) {
+      rt_width = std::min(rt_width, depth_rt->width);
+      rt_height = std::min(rt_height, depth_rt->height);
+    }
+  }
+  if (!color_count && !depth_rt) {
+    ++stats_.draws_skipped;
+    return true;
+  }
+  VkRenderPass pass = GetRenderPass(color_formats, color_count, depth_rt ? depth_rt->format : VK_FORMAT_UNDEFINED);
+  if (!pass) {
+    ++stats_.draws_failed;
+    return true;
+  }
+
+  // Textures (may record uploads, so before the render pass begins).
+  const auto& vs_textures = vs->GetTextureBindingsAfterTranslation();
+  const auto& vs_samplers = vs->GetSamplerBindingsAfterTranslation();
+  static const std::vector<VulkanShader::TextureBinding> kNoTextures;
+  static const std::vector<VulkanShader::SamplerBinding> kNoSamplers;
+  const auto& ps_textures = ps ? ps->GetTextureBindingsAfterTranslation() : kNoTextures;
+  const auto& ps_samplers = ps ? ps->GetSamplerBindingsAfterTranslation() : kNoSamplers;
+  std::vector<VkDescriptorImageInfo> image_infos;
+  image_infos.reserve(vs_textures.size() + vs_samplers.size() + ps_textures.size() + ps_samplers.size());
+  auto gather = [&](const std::vector<VulkanShader::TextureBinding>& tb,
+                    const std::vector<VulkanShader::SamplerBinding>& sb) {
+    for (const auto& b : tb) {
+      bool resolved;
+      VkImageView view = GetTextureView(b.fetch_constant, b.dimension, resolved);
+      image_infos.push_back({VK_NULL_HANDLE, view ? view : white_view_, VK_IMAGE_LAYOUT_GENERAL});
+    }
+    for (const auto& s : sb) {
+      image_infos.push_back(
+          {GetSampler(s, regs.GetTextureFetch(s.fetch_constant)), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
+    }
+  };
+  gather(vs_textures, vs_samplers);
+  gather(ps_textures, ps_samplers);
+
+  const PipelineLayoutEntry* layout = GetPipelineLayout(uint32_t(vs_textures.size()), uint32_t(vs_samplers.size()),
+                                                        uint32_t(ps_textures.size()), uint32_t(ps_samplers.size()));
+  if (!layout) {
+    ++stats_.draws_failed;
+    return true;
+  }
+
+  // Pipeline.
+  PipelineKey key;
+  std::memset(&key, 0, sizeof(key));
+  key.vs_hash = vs->ucode_data_hash();
+  key.vs_modification = vs_mod.value;
+  key.ps_hash = ps ? ps->ucode_data_hash() : 0;
+  key.ps_modification = ps_mod.value;
+  key.render_pass = reinterpret_cast<uint64_t>(pass);
+  key.topology = uint32_t(topology);
+  const bool indexed = index_buffer_info && index_buffer_info->guest_base;
+  key.primitive_restart =
+      prim_type == xenos::PrimitiveType::kRectangleList || prim_type == xenos::PrimitiveType::kPointList ||
+              (indexed && regs.Get<reg::PA_SU_SC_MODE_CNTL>().multi_prim_ib_ena &&
+       (topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP ||
+        topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN))
+          ? 1
+          : 0;
+  const auto sc_mode = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  if (polygonal) {
+    key.cull_mode = (sc_mode.cull_front ? VK_CULL_MODE_FRONT_BIT : 0) | (sc_mode.cull_back ? VK_CULL_MODE_BACK_BIT : 0);
+    key.front_face_cw = sc_mode.face ? 1 : 0;
+  }
+  if (depth_rt) {
+    key.depth_test = depth_control.z_enable;
+    key.depth_write = depth_control.z_enable && depth_control.z_write_enable;
+    key.depth_func = depth_control.z_enable ? uint32_t(depth_control.zfunc) : uint32_t(VK_COMPARE_OP_ALWAYS);
+    key.stencil_enable = depth_control.stencil_enable;
+    if (depth_control.stencil_enable) {
+      key.stencil_front = uint32_t(depth_control.stencilfail) | (uint32_t(depth_control.stencilzpass) << 3) |
+                          (uint32_t(depth_control.stencilzfail) << 6) | (uint32_t(depth_control.stencilfunc) << 9);
+      key.stencil_back = (polygonal && depth_control.backface_enable)
+                             ? uint32_t(depth_control.stencilfail_bf) |
+                                   (uint32_t(depth_control.stencilzpass_bf) << 3) |
+                                   (uint32_t(depth_control.stencilzfail_bf) << 6) |
+                                   (uint32_t(depth_control.stencilfunc_bf) << 9)
+                             : key.stencil_front;
+    }
+  }
+  for (uint32_t i = 0; i < color_count; ++i) key.blend[i] = blend[i];
+  key.write_mask = write_mask;
+  key.color_count = color_count;
+  key.has_ps = ps ? 1 : 0;
+  key.depth_clamp = regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable ? 1 : 0;
+  key.texture_layout = uint32_t(vs_textures.size()) | (uint32_t(vs_samplers.size()) << 8) |
+                       (uint32_t(ps_textures.size()) << 16) | (uint32_t(ps_samplers.size()) << 24);
+  VkPipeline pipeline = GetPipeline(key, vst, pst, layout->layout);
+  if (!pipeline) {
+    ++stats_.draws_failed;
+    return true;
+  }
+
+  const uint64_t draw_frame = frame_;
+  // Vertex data: copy every vertex buffer the shader fetches into the upload buffer, patch its fetch constant.
+  uint32_t fetch_constants[6 * 32];
+  std::memcpy(fetch_constants, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(fetch_constants));
+  for (const auto& binding : vs->vertex_bindings()) {
+    const uint32_t fc = binding.fetch_constant;
+    xenos::xe_gpu_vertex_fetch_t vf;
+    std::memcpy(&vf, &fetch_constants[fc * 2], sizeof(vf));
+    const uint32_t address = uint32_t(vf.address) << 2;
+    uint32_t size = uint32_t(vf.size) << 2;
+    if (Tracing() && draws_this_frame_ < 64) {
+      REXGPU_INFO("[native trace]   draw {} vfetch {} addr {:08X} size {} stride {}", draws_this_frame_, fc, address,
+                  size, binding.stride_words * 4);
+    }
+    if (!size) {
+      // No size in the fetch constant: cover the vertices the draw can index.
+      const uint32_t max_index = std::min<uint32_t>(regs.Get<uint32_t>(XE_GPU_REG_VGT_MAX_VTX_INDX), 0xFFFFF);
+      size = std::min<uint32_t>((max_index + 1) * binding.stride_words * 4, 16u << 20);
+      if (!size) continue;
+    }
+    const uint64_t vkey = (uint64_t(address) << 32) | size;
+    VkDeviceSize offset;
+    auto vit = frame_vertex_uploads_.find(vkey);
+    if (vit != frame_vertex_uploads_.end()) {
+      offset = vit->second;
+    } else {
+      const uint8_t* src = memory_->TranslatePhysical<const uint8_t*>(address);
+      uint8_t* dst = src ? Upload(size, 256, offset) : nullptr;
+      if (!dst) {
+        ++stats_.draws_failed;
+        return true;
+      }
+      std::memcpy(dst, src, size);
+      frame_vertex_uploads_.emplace(vkey, offset);
+    }
+    vf.address = uint32_t(offset >> 2);
+    std::memcpy(&fetch_constants[fc * 2], &vf, sizeof(vf));
+  }
+
+  // Indices: guest indices (still in the guest byte order - the vertex shader swaps them, vertex_index_endian), or
+  // generated for rectangle / quad lists.
+  VkDeviceSize index_offset = 0;
+  VkIndexType index_type = VK_INDEX_TYPE_UINT16;
+  uint32_t draw_count = index_count;
+  bool use_indices = indexed;
+  xenos::Endian index_endian = xenos::Endian::kNone;
+  if (indexed) {
+    const bool is32 = index_buffer_info->format == xenos::IndexFormat::kInt32;
+    index_type = is32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+    index_endian = index_buffer_info->endianness;
+    if (is32 && index_endian == xenos::Endian::k8in16) index_endian = xenos::Endian::kNone;  // as in the emulation
+    if (!is32 && index_endian != xenos::Endian::kNone && index_endian != xenos::Endian::k8in16) {
+      index_endian = index_endian == xenos::Endian::k8in32 ? xenos::Endian::k8in16 : xenos::Endian::kNone;
+    }
+  }
+  uint32_t index_load_flags = 0;
+  uint32_t index_load_address = 0;
+  if (prim_type == xenos::PrimitiveType::kRectangleList || prim_type == xenos::PrimitiveType::kPointList) {
+    const uint32_t rects = index_count / (prim_type == xenos::PrimitiveType::kPointList ? 1 : 3);
+    if (!rects) {
+      ++stats_.draws_skipped;
+      return true;
+    }
+    if (indexed) {
+      // The vertex shader loads the guest indices itself from the "shared memory" (upload buffer).
+      const bool is32 = index_type == VK_INDEX_TYPE_UINT32;
+      const VkDeviceSize bytes = VkDeviceSize(index_count) * (is32 ? 4 : 2);
+      const uint8_t* src = memory_->TranslatePhysical<const uint8_t*>(index_buffer_info->guest_base);
+      VkDeviceSize guest_offset;
+      uint8_t* dst = src ? Upload(bytes, 16, guest_offset) : nullptr;
+      if (!dst) {
+        ++stats_.draws_failed;
+        return true;
+      }
+      std::memcpy(dst, src, bytes);
+      index_load_flags = SpirvShaderTranslator::kSysFlag_ComputeOrPrimitiveVertexIndexLoad |
+                         (is32 ? SpirvShaderTranslator::kSysFlag_ComputeOrPrimitiveVertexIndexLoad32Bit : 0);
+      index_load_address = uint32_t(guest_offset);
+    }
+    const uint32_t out_count = 4 * rects + (rects - 1);
+    uint32_t* out = reinterpret_cast<uint32_t*>(Upload(VkDeviceSize(out_count) * 4, 16, index_offset));
+    if (!out) {
+      ++stats_.draws_failed;
+      return true;
+    }
+    for (uint32_t r = 0, o = 0; r < rects; ++r) {
+      if (r) out[o++] = UINT32_MAX;
+      for (uint32_t j = 0; j < 4; ++j) out[o++] = (r << 2) + j;
+    }
+    index_type = VK_INDEX_TYPE_UINT32;
+    use_indices = true;
+    draw_count = out_count;
+    if (!index_load_flags) index_endian = xenos::Endian::kNone;
+  } else if (prim_type == xenos::PrimitiveType::kQuadList) {
+    const uint32_t per = 4;
+    const uint32_t prims = index_count / per;
+    const uint32_t out_count = prims * 6;
+    if (!prims) {
+      ++stats_.draws_skipped;
+      return true;
+    }
+    std::vector<uint32_t> guest_idx(index_count);
+    if (indexed) {
+      const uint8_t* src = memory_->TranslatePhysical<const uint8_t*>(index_buffer_info->guest_base);
+      for (uint32_t i = 0; i < index_count; ++i) {
+        if (index_type == VK_INDEX_TYPE_UINT32) {
+          uint32_t v;
+          std::memcpy(&v, src + 4 * i, 4);
+          guest_idx[i] = v;  // kept in guest order, the shader swaps
+        } else {
+          uint16_t v;
+          std::memcpy(&v, src + 2 * i, 2);
+          guest_idx[i] = v;
+        }
+      }
+    } else {
+      for (uint32_t i = 0; i < index_count; ++i) guest_idx[i] = i;
+    }
+    uint32_t* out = reinterpret_cast<uint32_t*>(Upload(VkDeviceSize(out_count) * 4, 16, index_offset));
+    if (!out) {
+      ++stats_.draws_failed;
+      return true;
+    }
+    for (uint32_t p = 0; p < prims; ++p) {
+      const uint32_t* q = &guest_idx[p * per];
+      const uint32_t tri[6] = {q[0], q[1], q[2], q[0], q[2], q[3]};
+      std::memcpy(out + 6 * p, tri, sizeof(tri));
+    }
+    index_type = VK_INDEX_TYPE_UINT32;
+    if (!indexed) index_endian = xenos::Endian::kNone;
+    // 16-bit guest indices widened to 32 bits keep their 16-bit swap.
+    use_indices = true;
+    draw_count = out_count;
+  } else if (indexed) {
+    const VkDeviceSize bytes = index_buffer_info->length
+                                   ? VkDeviceSize(index_buffer_info->length)
+                                   : VkDeviceSize(index_count) * (index_type == VK_INDEX_TYPE_UINT32 ? 4 : 2);
+    const uint8_t* src = memory_->TranslatePhysical<const uint8_t*>(index_buffer_info->guest_base);
+    uint8_t* dst = src ? Upload(bytes, 16, index_offset) : nullptr;
+    if (!dst) {
+      ++stats_.draws_failed;
+      return true;
+    }
+    std::memcpy(dst, src, bytes);
+  }
+
+  // System constants.
+  SpirvShaderTranslator::SystemConstants& sc = system_constants_;
+  std::memset(&sc, 0, sizeof(sc));
+  const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
+  uint32_t flags = 0;
+  if (vte.vtx_xy_fmt) flags |= SpirvShaderTranslator::kSysFlag_XYDividedByW;
+  if (vte.vtx_z_fmt) flags |= SpirvShaderTranslator::kSysFlag_ZDividedByW;
+  if (vte.vtx_w0_fmt) flags |= SpirvShaderTranslator::kSysFlag_WNotReciprocal;
+  if (polygonal) flags |= SpirvShaderTranslator::kSysFlag_PrimitivePolygonal;
+  if (draw_util::IsPrimitiveLine(regs)) flags |= SpirvShaderTranslator::kSysFlag_PrimitiveLine;
+  const auto color_control = regs.Get<reg::RB_COLORCONTROL>();
+  const xenos::CompareFunction alpha_func =
+      color_control.alpha_test_enable ? color_control.alpha_func : xenos::CompareFunction::kAlways;
+  flags |= uint32_t(alpha_func) << SpirvShaderTranslator::kSysFlag_AlphaPassIfLess_Shift;
+  for (uint32_t i = 0; i < last_used_rt; ++i) {
+    const auto ci = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
+    if (ci.color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
+      flags |= SpirvShaderTranslator::kSysFlag_ConvertColor0ToGamma << i;
+    }
+  }
+  flags |= index_load_flags;
+  sc.flags = flags;
+  sc.vertex_index_load_address = index_load_address;
+  sc.vertex_index_endian = index_endian;
+  sc.vertex_base_index = regs.Get<int32_t>(XE_GPU_REG_VGT_INDX_OFFSET);
+  sc.vertex_index_min = regs.Get<uint32_t>(XE_GPU_REG_VGT_MIN_VTX_INDX);
+  sc.vertex_index_max = regs.Get<uint32_t>(XE_GPU_REG_VGT_MAX_VTX_INDX);
+  draw_util::ViewportInfo viewport;
+  // As the emulation: host viewport limits, reverse depth allowed (Vulkan accepts minDepth > maxDepth).
+  draw_util::GetHostViewportInfo(regs, sx, sy, false, device()->properties().maxViewportDimensions[0],
+                                 device()->properties().maxViewportDimensions[1], true, depth_control, false, true,
+                                 ps && ps->writes_depth(), viewport);
+  for (uint32_t i = 0; i < 3; ++i) {
+    sc.ndc_scale[i] = viewport.ndc_scale[i];
+    sc.ndc_offset[i] = viewport.ndc_offset[i];
+  }
+  sc.alpha_test_reference = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
+  if (prim_type == xenos::PrimitiveType::kPointList) {
+    const auto minmax = regs.Get<reg::PA_SU_POINT_MINMAX>();
+    const auto size = regs.Get<reg::PA_SU_POINT_SIZE>();
+    sc.point_vertex_diameter_min = float(minmax.min_size) * (2.0f / 16.0f);
+    sc.point_vertex_diameter_max = float(minmax.max_size) * (2.0f / 16.0f);
+    sc.point_constant_diameter[0] = float(size.width) * (2.0f / 16.0f);
+    sc.point_constant_diameter[1] = float(size.height) * (2.0f / 16.0f);
+    sc.point_screen_diameter_to_ndc_radius[0] = float(sx) / float(std::max(viewport.xy_extent[0], 1u));
+    sc.point_screen_diameter_to_ndc_radius[1] = float(sy) / float(std::max(viewport.xy_extent[1], 1u));
+  }
+  for (uint32_t i = 0; i < 4; ++i) {
+    const auto ci = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
+    int32_t bias = ci.color_exp_bias;
+    if (ci.color_format == xenos::ColorRenderTargetFormat::k_16_16 ||
+        ci.color_format == xenos::ColorRenderTargetFormat::k_16_16_16_16) {
+      bias -= 5;
+    }
+    const uint32_t bits = UINT32_C(0x3F800000) + uint32_t(bias << 23);
+    std::memcpy(&sc.color_exp_bias[i], &bits, sizeof(float));
+  }
+  auto signs_of = [&](const std::vector<VulkanShader::TextureBinding>& tb) {
+    for (const auto& b : tb) {
+      const uint32_t i = b.fetch_constant;
+      const uint8_t signs = texture_util::SwizzleSigns(regs.GetTextureFetch(i));
+      sc.texture_swizzled_signs[i >> 2] |= uint32_t(signs) << (8 * (i & 3));
+    }
+  };
+  signs_of(vs_textures);
+  signs_of(ps_textures);
+
+  // Constant buffers.
+  const VkDeviceSize ub_align = std::max<VkDeviceSize>(device()->properties().minUniformBufferOffsetAlignment, 16);
+  VkDescriptorBufferInfo cbuf[SpirvShaderTranslator::kConstantBufferCount];
+  auto put = [&](uint32_t index, const void* data, size_t size) -> bool {
+    VkDeviceSize off;
+    uint8_t* p = Upload(size, ub_align, off);
+    if (!p) return false;
+    std::memcpy(p, data, size);
+    cbuf[index] = {slot().upload, off, size};
+    return true;
+  };
+  auto put_float = [&](uint32_t index, const Shader& shader, uint32_t first_register) -> bool {
+    const auto& map = shader.constant_register_map();
+    const size_t size = sizeof(float) * 4 * std::max(map.float_count, 1u);
+    VkDeviceSize off;
+    uint8_t* p = Upload(size, ub_align, off);
+    if (!p) return false;
+    uint8_t* w = p;
+    for (uint32_t i = 0; i < 4; ++i) {
+      uint64_t bits = map.float_bitmap[i];
+      uint32_t c;
+      while (rex::bit_scan_forward(bits, &c)) {
+        bits &= ~(uint64_t(1) << c);
+        std::memcpy(w, &regs[first_register + (i << 8) + (c << 2)], sizeof(float) * 4);
+        w += sizeof(float) * 4;
+      }
+    }
+    if (w == p) std::memset(p, 0, 16);
+    cbuf[index] = {slot().upload, off, size};
+    return true;
+  };
+  bool ok = put(SpirvShaderTranslator::kConstantBufferSystem, &sc, sizeof(sc)) &&
+            put_float(SpirvShaderTranslator::kConstantBufferFloatVertex, *vs, XE_GPU_REG_SHADER_CONSTANT_000_X);
+  if (ok) {
+    if (ps) {
+      ok = put_float(SpirvShaderTranslator::kConstantBufferFloatPixel, *ps, XE_GPU_REG_SHADER_CONSTANT_256_X);
+    } else {
+      static const float zero[4] = {};
+      ok = put(SpirvShaderTranslator::kConstantBufferFloatPixel, zero, sizeof(zero));
+    }
+  }
+  ok = ok && put(SpirvShaderTranslator::kConstantBufferBoolLoop, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
+                 sizeof(uint32_t) * (8 + 32));
+  ok = ok && put(SpirvShaderTranslator::kConstantBufferFetch, fetch_constants, sizeof(fetch_constants));
+  if (!ok) {
+    ++stats_.draws_failed;
+    return true;
+  }
+  // An upload that filled the buffer submitted the frame: the offsets above would mix two buffers. Drop the draw.
+  if (frame_ != draw_frame) {
+    ++stats_.draws_failed;
+    return true;
+  }
+  const VkDevice dev = vulkan_device_->device();
+  VkDescriptorSet sets[4];
+  VkDescriptorSetLayout set_layouts[3] = {set_layout_constants_, layout->textures_vertex, layout->textures_pixel};
+  VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  ai.descriptorPool = slot().descriptor_pool;
+  ai.descriptorSetCount = 3;
+  ai.pSetLayouts = set_layouts;
+  if (dfn().vkAllocateDescriptorSets(dev, &ai, sets + 1) != VK_SUCCESS) {
+    ++stats_.draws_failed;
+    return true;
+  }
+  sets[0] = slot().shared_memory_set;
+  std::vector<VkWriteDescriptorSet> writes;
+  writes.reserve(8 + image_infos.size());
+  for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = sets[1];
+    w.dstBinding = i;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    w.pBufferInfo = &cbuf[i];
+    writes.push_back(w);
+  }
+  size_t img_i = 0;
+  auto write_images = [&](VkDescriptorSet set, size_t textures, size_t samplers) {
+    for (size_t i = 0; i < textures + samplers; ++i) {
+      VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+      w.dstSet = set;
+      w.dstBinding = uint32_t(i);
+      w.descriptorCount = 1;
+      w.descriptorType = i < textures ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER;
+      w.pImageInfo = &image_infos[img_i++];
+      writes.push_back(w);
+    }
+  };
+  write_images(sets[2], vs_textures.size(), vs_samplers.size());
+  write_images(sets[3], ps_textures.size(), ps_samplers.size());
+  dfn().vkUpdateDescriptorSets(dev, uint32_t(writes.size()), writes.data(), 0, nullptr);
+
+  // Render pass.
+  uint64_t fb_key = reinterpret_cast<uint64_t>(pass);
+  for (uint32_t i = 0; i < color_count; ++i) fb_key = fb_key * 1000003u + reinterpret_cast<uint64_t>(color_rts[i]->view);
+  if (depth_rt) fb_key = fb_key * 1000003u + reinterpret_cast<uint64_t>(depth_rt->view);
+  fb_key = fb_key * 31 + rt_width * 4099 + rt_height;
+  VkCommandBuffer cmd = slot().cmd;
+  if (!in_render_pass_ || current_framebuffer_key_ != fb_key) {
+    EndRenderPass();
+    VkFramebuffer fb;
+    auto fit = framebuffers_.find(fb_key);
+    if (fit != framebuffers_.end()) {
+      fb = fit->second;
+    } else {
+      VkImageView views[5];
+      uint32_t n = 0;
+      for (uint32_t i = 0; i < color_count; ++i) views[n++] = color_rts[i]->view;
+      if (depth_rt) views[n++] = depth_rt->view;
+      VkFramebufferCreateInfo fci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+      fci.renderPass = pass;
+      fci.attachmentCount = n;
+      fci.pAttachments = views;
+      fci.width = rt_width;
+      fci.height = rt_height;
+      fci.layers = 1;
+      if (dfn().vkCreateFramebuffer(dev, &fci, nullptr, &fb) != VK_SUCCESS) {
+        ++stats_.draws_failed;
+        return true;
+      }
+      framebuffers_.emplace(fb_key, fb);
+    }
+    Barrier();
+    VkRenderPassBeginInfo bi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    bi.renderPass = pass;
+    bi.framebuffer = fb;
+    bi.renderArea = {{0, 0}, {rt_width, rt_height}};
+    dfn().vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
+    in_render_pass_ = true;
+    if (Tracing()) {
+      std::string rts;
+      for (uint32_t i = 0; i < color_count; ++i) {
+        const auto ci = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
+        rts += fmt::format(" C{}@{}", uint32_t(ci.color_format), ci.color_base);
+      }
+      if (depth_rt) {
+        const auto di = regs.Get<reg::RB_DEPTH_INFO>();
+        rts += fmt::format(" D{}@{}", uint32_t(di.depth_format), di.depth_base);
+      }
+      REXGPU_INFO("[native trace] draw {} pass{} pitch {} msaa {} {}x{} vs {:016X} ps {:016X}", draws_this_frame_, rts,
+                  surface_info.surface_pitch, uint32_t(surface_info.msaa_samples), rt_width, rt_height,
+                  vs->ucode_data_hash(), ps ? ps->ucode_data_hash() : 0);
+    }
+    current_framebuffer_key_ = fb_key;
+    current_render_pass_ = pass;
+    current_rt_width_ = rt_width;
+    current_rt_height_ = rt_height;
+    ++stats_.render_passes_begun;
+  }
+
+  if (Tracing() && draws_this_frame_ < 64) {
+    REXGPU_INFO("[native trace]   draw {} prim {} n {} idx {} z(en {} wr {} fn {}) st {} vp {},{} {}x{} z {:.3f}..{:.3f} "
+                "ndcz {:.3f}+{:.3f} cull {} mask {:X} vte {:X} clip {:X}",
+                draws_this_frame_, uint32_t(prim_type), index_count, indexed ? 1 : 0, uint32_t(depth_control.z_enable),
+                uint32_t(depth_control.z_write_enable), uint32_t(depth_control.zfunc),
+                uint32_t(depth_control.stencil_enable), viewport.xy_offset[0], viewport.xy_offset[1],
+                viewport.xy_extent[0], viewport.xy_extent[1], viewport.z_min, viewport.z_max, viewport.ndc_scale[2],
+                viewport.ndc_offset[2], key.cull_mode, write_mask, regs[XE_GPU_REG_PA_CL_VTE_CNTL],
+                regs[XE_GPU_REG_PA_CL_CLIP_CNTL]);
+  }
+  dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+  dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout->layout, 0, 4, sets, 0, nullptr);
+  VkViewport vp;
+  vp.x = float(viewport.xy_offset[0]);
+  vp.y = float(viewport.xy_offset[1]);
+  vp.width = float(std::max(viewport.xy_extent[0], 1u));
+  vp.height = float(std::max(viewport.xy_extent[1], 1u));
+  vp.minDepth = viewport.z_min;
+  vp.maxDepth = viewport.z_max;
+  dfn().vkCmdSetViewport(cmd, 0, 1, &vp);
+  VkRect2D sr;
+  sr.offset.x = int32_t(std::min(scissor.offset[0], rt_width));
+  sr.offset.y = int32_t(std::min(scissor.offset[1], rt_height));
+  sr.extent.width = std::min(scissor.extent[0], rt_width - uint32_t(sr.offset.x));
+  sr.extent.height = std::min(scissor.extent[1], rt_height - uint32_t(sr.offset.y));
+  dfn().vkCmdSetScissor(cmd, 0, 1, &sr);
+  float bias_const = 0.0f, bias_slope = 0.0f;
+  if (polygonal && (sc_mode.poly_offset_front_enable || sc_mode.poly_offset_back_enable)) {
+    bias_slope = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE) * xenos::kPolygonOffsetScaleSubpixelUnit;
+    bias_const = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET) * float(1 << 24);
+  }
+  dfn().vkCmdSetDepthBias(cmd, bias_const, 0.0f, bias_slope);
+  const float blend_constants[4] = {regs.Get<float>(XE_GPU_REG_RB_BLEND_RED), regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
+                                    regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE),
+                                    regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA)};
+  dfn().vkCmdSetBlendConstants(cmd, blend_constants);
+  const auto srm = regs.Get<reg::RB_STENCILREFMASK>();
+  const auto srm_bf = regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF);
+  const bool bf = polygonal && depth_control.backface_enable;
+  dfn().vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_BIT, srm.stencilmask);
+  dfn().vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_BACK_BIT, bf ? srm_bf.stencilmask : srm.stencilmask);
+  dfn().vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_BIT, srm.stencilwritemask);
+  dfn().vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_BACK_BIT, bf ? srm_bf.stencilwritemask : srm.stencilwritemask);
+  dfn().vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_BIT, srm.stencilref);
+  dfn().vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_BACK_BIT, bf ? srm_bf.stencilref : srm.stencilref);
+  if (use_indices) {
+    dfn().vkCmdBindIndexBuffer(cmd, slot().upload, index_offset, index_type);
+    dfn().vkCmdDrawIndexed(cmd, draw_count, 1, 0, 0, 0);
+  } else {
+    dfn().vkCmdDraw(cmd, draw_count, 1, 0, 0);
+  }
+  ++stats_.draws;
+  ++draws_this_frame_;
+  return true;
+}
+
+// --- Resolves ---------------------------------------------------------------------------------------------------
+
+bool NativeCommandProcessor::ClearRect(NativeImage& rt, const VkClearValue& value, const VkRect2D& rect) {
+  // A one-attachment render pass on the target and vkCmdClearAttachments for the rectangle.
+  VkFormat color_format = rt.format;
+  VkRenderPass pass = rt.depth ? GetRenderPass(nullptr, 0, rt.format) : GetRenderPass(&color_format, 1,
+                                                                                       VK_FORMAT_UNDEFINED);
+  if (!pass) return false;
+  uint64_t fb_key = (reinterpret_cast<uint64_t>(pass) * 1000003u + reinterpret_cast<uint64_t>(rt.view)) * 31 +
+                    rt.width * 4099 + rt.height;
+  VkFramebuffer fb;
+  auto fit = framebuffers_.find(fb_key);
+  if (fit != framebuffers_.end()) {
+    fb = fit->second;
+  } else {
+    VkFramebufferCreateInfo fci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fci.renderPass = pass;
+    fci.attachmentCount = 1;
+    fci.pAttachments = &rt.view;
+    fci.width = rt.width;
+    fci.height = rt.height;
+    fci.layers = 1;
+    if (dfn().vkCreateFramebuffer(vulkan_device_->device(), &fci, nullptr, &fb) != VK_SUCCESS) return false;
+    framebuffers_.emplace(fb_key, fb);
+  }
+  EndRenderPass();
+  Barrier();
+  VkRenderPassBeginInfo bi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+  bi.renderPass = pass;
+  bi.framebuffer = fb;
+  bi.renderArea = {{0, 0}, {rt.width, rt.height}};
+  VkCommandBuffer cmd = slot().cmd;
+  dfn().vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
+  VkClearAttachment ca = {};
+  ca.aspectMask = rt.depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
+  ca.colorAttachment = 0;
+  ca.clearValue = value;
+  VkClearRect cr = {};
+  cr.rect = rect;
+  cr.layerCount = 1;
+  dfn().vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
+  dfn().vkCmdEndRenderPass(cmd);
+  Barrier();
+  ++stats_.clears;
+  return true;
+}
+
+bool NativeCommandProcessor::IssueCopy() {
+  const RegisterFile& regs = *register_file_;
+  if (!frame_open_ && !BeginFrame()) return false;
+  ++stats_.copies;
+  draw_util::ResolveInfo info;
+  if (!draw_util::GetResolveInfo(regs, *memory_, 1, 1, false, false, info)) return true;
+  // The rectangle in render target pixels (same computation as GetResolveInfo).
+  const xenos::xe_gpu_vertex_fetch_t vfetch = regs.GetVertexFetch(0);
+  const float* vertices = memory_->TranslatePhysical<const float*>(uint32_t(vfetch.address) << 2);
+  if (!vertices) return true;
+  float v[6];
+  for (int i = 0; i < 6; ++i) v[i] = xenos::GpuSwap(vertices[i], vfetch.endian);
+  int32_t x0 = int32_t(std::min({v[0], v[2], v[4]}) + 0.5f), y0 = int32_t(std::min({v[1], v[3], v[5]}) + 0.5f);
+  int32_t x1 = int32_t(std::max({v[0], v[2], v[4]}) + 0.5f), y1 = int32_t(std::max({v[1], v[3], v[5]}) + 0.5f);
+  if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
+    const auto wo = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    x0 += wo.window_x_offset;
+    x1 += wo.window_x_offset;
+    y0 += wo.window_y_offset;
+    y1 += wo.window_y_offset;
+  }
+  draw_util::Scissor scissor;
+  draw_util::GetScissor(regs, scissor, false);
+  x0 = std::clamp<int32_t>(x0, scissor.offset[0], scissor.offset[0] + scissor.extent[0]);
+  x1 = std::clamp<int32_t>(x1, scissor.offset[0], scissor.offset[0] + scissor.extent[0]);
+  y0 = std::clamp<int32_t>(y0, scissor.offset[1], scissor.offset[1] + scissor.extent[1]);
+  y1 = std::clamp<int32_t>(y1, scissor.offset[1], scissor.offset[1] + scissor.extent[1]);
+  if (x1 <= x0 || y1 <= y0) return true;
+
+  const auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+  const int32_t sx = surface_info.msaa_samples >= xenos::MsaaSamples::k4X ? 2 : 1;
+  const int32_t sy = surface_info.msaa_samples >= xenos::MsaaSamples::k2X ? 2 : 1;
+  const uint32_t sample_pitch = surface_info.surface_pitch * uint32_t(sx);
+  // Guest pixels -> sample space.
+  x0 *= sx;
+  x1 *= sx;
+  y0 *= sy;
+  y1 *= sy;
+  const bool is_depth = info.IsCopyingDepth();
+  NativeImage* src = nullptr;
+  if (is_depth) {
+    const auto di = regs.Get<reg::RB_DEPTH_INFO>();
+    src = GetRenderTarget(di.depth_base, sample_pitch, uint32_t(di.depth_format), true, uint32_t(y1));
+  } else {
+    const auto ci =
+        regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[info.rb_copy_control.copy_src_select]);
+    src = GetRenderTarget(ci.color_base, sample_pitch, uint32_t(ci.color_format), false, uint32_t(y1));
+  }
+  if (!src) return true;
+  x1 = std::min<int32_t>(x1, int32_t(src->width));
+  y1 = std::min<int32_t>(y1, int32_t(src->height));
+  if (x1 <= x0 || y1 <= y0) return true;
+  EndRenderPass();
+
+  // Copy into the native texture of the destination address.
+  const uint32_t dest_base = regs[XE_GPU_REG_RB_COPY_DEST_BASE];
+  const auto dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>();
+  const auto dest_info = regs.Get<reg::RB_COPY_DEST_INFO>();
+  if (dest_base && info.rb_copy_control.copy_command != xenos::CopyCommand::kNull) {
+    // The resolved texture keeps the sample resolution of the source (sampled with normalized coordinates); a
+    // resolve writes source pixel (x, y) to texel (x, y) of the destination.
+    const uint32_t dw = std::max<uint32_t>(dest_pitch.copy_dest_pitch * uint32_t(sx), uint32_t(x1));
+    const uint32_t dh = std::max<uint32_t>(dest_pitch.copy_dest_height * uint32_t(sy), uint32_t(y1));
+    // Depth resolved into a color texture (DS2 reads its depth buffers as k_8_8_8_8 and rebuilds depth in the
+    // shader): the resolved image holds the guest 32-bit words as RGBA8.
+    const xenos::TextureFormat dest_tex_format = xenos::TextureFormat(dest_info.copy_dest_format);
+    // Measured in DS2: depth is resolved with a k_8_8_8_8 destination format but sampled as k_24_8 /
+    // k_24_8_FLOAT, so the resolved image stays a depth image (sampled through its depth aspect).
+    (void)dest_tex_format;
+    const bool depth_as_color = false;
+    const VkFormat resolved_format = depth_as_color ? VK_FORMAT_R8G8B8A8_UNORM : src->format;
+    // A resolve into a part of a bigger texture (DS2 packs 4 shadow cascades into one 1600x1600 atlas): Direct3D
+    // moves the destination base to the 32x32 tile of the destination point. Find the texture that contains the
+    // address and the tile it starts at.
+    const FormatInfo* dest_fi = FormatInfo::Get(dest_tex_format);
+    const uint32_t dest_bpp_log2 =
+        is_depth ? 2u : rex::log2_floor(std::max<uint32_t>(dest_fi ? dest_fi->bits_per_pixel / 8 : 4, 1));
+    uint32_t entry_base = dest_base;
+    int32_t sub_x = 0, sub_y = 0;
+    if (!resolved_.count(dest_base)) {
+      for (auto& [eb, e] : resolved_) {
+        if (eb >= dest_base || e.guest_pitch != dest_pitch.copy_dest_pitch || e.bpp_log2 != dest_bpp_log2) continue;
+        const uint32_t pitch_aligned = rex::align<uint32_t>(e.guest_pitch, 32);
+        const uint32_t height_aligned = rex::align<uint32_t>(e.guest_height, 32);
+        if (dest_base - eb >= (pitch_aligned * height_aligned) << e.bpp_log2) continue;
+        const int32_t delta = int32_t(dest_base - eb);
+        bool found = false;
+        for (uint32_t ty = 0; ty < height_aligned && !found; ty += 32) {
+          for (uint32_t tx = 0; tx < pitch_aligned; tx += 32) {
+            if (texture_util::GetTiledOffset2D(int32_t(tx), int32_t(ty), pitch_aligned, e.bpp_log2) == delta) {
+              sub_x = int32_t(tx);
+              sub_y = int32_t(ty);
+              found = true;
+              break;
+            }
+          }
+        }
+        if (found) {
+          entry_base = eb;
+          break;
+        }
+      }
+    }
+    const bool sub_resolve = entry_base != dest_base;
+    ResolvedEntry& r = resolved_[entry_base];
+    if (r.image.image && !sub_resolve &&
+        (r.image.width < dw || r.image.height < dh || r.image.format != resolved_format)) {
+      for (auto& [s, view] : r.swizzle_views) dfn().vkDestroyImageView(vulkan_device_->device(), view, nullptr);
+      r.swizzle_views.clear();
+      DestroyImage(r.image, true);
+    }
+    if (!r.image.image) {
+      VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | (depth_as_color ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0);
+      if (!CreateImage(r.image, resolved_format, dw, dh, src->depth && !depth_as_color, usage)) {
+        resolved_.erase(dest_base);
+        return true;
+      }
+      EnsureGeneral(r.image);
+    }
+    if (!sub_resolve) {
+      r.guest_format = uint32_t(dest_info.copy_dest_format);
+      r.rb_swapped = !is_depth && dest_info.copy_dest_swap;
+      r.guest_pitch = dest_pitch.copy_dest_pitch;
+      r.guest_height = dest_pitch.copy_dest_height;
+      r.bpp_log2 = dest_bpp_log2;
+    }
+    // Destination offset: the source position plus the sub-texture tile (in the source's sample space).
+    const int32_t dst_x0 = x0 + sub_x * sx, dst_y0 = y0 + sub_y * sy;
+    if (r.image.format != resolved_format || dst_x0 + (x1 - x0) > int32_t(r.image.width) ||
+        dst_y0 + (y1 - y0) > int32_t(r.image.height)) {
+      return true;  // does not fit the containing texture: leave it (logged in the trace)
+    }
+    if (Tracing()) {
+      REXGPU_INFO("[native trace] resolve {} {}@{} fmt {} msaa {} rect {},{}-{},{} -> {:08X} fmt {} {}x{} clear c{} d{} "
+                  "endian {} swap {} number {} bias {}",
+                  draws_this_frame_, is_depth ? "D" : "C",
+                  is_depth ? uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_base)
+                           : uint32_t(regs.Get<reg::RB_COLOR_INFO>(
+                                          reg::RB_COLOR_INFO::rt_register_indices[info.rb_copy_control.copy_src_select])
+                                          .color_base),
+                  uint32_t(src->format), uint32_t(surface_info.msaa_samples), x0, y0, x1, y1, dest_base,
+                  uint32_t(dest_info.copy_dest_format), dest_pitch.copy_dest_pitch, dest_pitch.copy_dest_height,
+                  uint32_t(info.IsClearingColor()), uint32_t(info.IsClearingDepth()),
+                  uint32_t(dest_info.copy_dest_endian), uint32_t(dest_info.copy_dest_swap),
+                  uint32_t(dest_info.copy_dest_number), int32_t(dest_info.copy_dest_exp_bias));
+    }
+    r.frame = frame_;
+    if (depth_as_color) {
+      const bool float24 =
+          xenos::DepthRenderTargetFormat(regs.Get<reg::RB_DEPTH_INFO>().depth_format) ==
+          xenos::DepthRenderTargetFormat::kD24FS8;
+      Convert(kConvertDepthToRgba8, *src, r.image, x0, y0,
+              {{dst_x0, dst_y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}}, float24);
+    } else {
+    Barrier();
+    VkImageCopy c = {};
+    c.srcSubresource = {VkImageAspectFlags(is_depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                                                    : VK_IMAGE_ASPECT_COLOR_BIT),
+                        0, 0, 1};
+    c.dstSubresource = c.srcSubresource;
+    c.srcOffset = {x0, y0, 0};
+    c.dstOffset = {dst_x0, dst_y0, 0};
+    c.extent = {uint32_t(x1 - x0), uint32_t(y1 - y0), 1};
+    cmd_copy_image_(slot().cmd, src->image, VK_IMAGE_LAYOUT_GENERAL, r.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    Barrier();
+    }
+  }
+
+  // Clears.
+  const VkRect2D rect = {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
+  if (info.IsClearingDepth()) {
+    const auto di = regs.Get<reg::RB_DEPTH_INFO>();
+    NativeImage* d = GetRenderTarget(di.depth_base, sample_pitch, uint32_t(di.depth_format), true, uint32_t(y1));
+    if (d) {
+      VkClearValue cv = {};
+      const uint32_t raw = info.rb_depth_clear;
+      if (di.depth_format == xenos::DepthRenderTargetFormat::kD24S8) {
+        cv.depthStencil.depth = float(raw >> 8) / float(0xFFFFFF);
+      } else {
+        cv.depthStencil.depth = xenos::Float20e4To32(raw >> 8);
+      }
+      cv.depthStencil.stencil = raw & 0xFF;
+      ClearRect(*d, cv, rect);
+    }
+  }
+  if (info.IsClearingColor()) {
+    const auto ci =
+        regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[info.rb_copy_control.copy_src_select]);
+    VkClearValue cv = {};
+    const uint32_t c32 = info.rb_color_clear;
+    switch (ci.color_format) {
+      case xenos::ColorRenderTargetFormat::k_8_8_8_8:
+      case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
+        for (int i = 0; i < 4; ++i) cv.color.float32[i] = float((c32 >> (8 * i)) & 0xFF) / 255.0f;
+        break;
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10:
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
+        for (int i = 0; i < 3; ++i) cv.color.float32[i] = float((c32 >> (10 * i)) & 0x3FF) / 1023.0f;
+        cv.color.float32[3] = float(c32 >> 30) / 3.0f;
+        break;
+      case xenos::ColorRenderTargetFormat::k_32_FLOAT:
+        std::memcpy(&cv.color.float32[0], &c32, 4);
+        break;
+      default:
+        // 64bpp and float formats: zero/one are what games clear to in practice.
+        cv.color.float32[0] = cv.color.float32[1] = cv.color.float32[2] = cv.color.float32[3] = c32 ? 1.0f : 0.0f;
+        break;
+    }
+    ClearRect(*src, cv, rect);
+  }
+  return true;
+}
+
+// --- Swap -------------------------------------------------------------------------------------------------------
+
+void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                       uint32_t frontbuffer_height) {
+  ++stats_.swaps;
+#if REX_PLATFORM_SWITCH
+  RexSwitchPerfCount(0);
+#endif
+  if (!frame_open_ && !BeginFrame()) return;
+  EndRenderPass();
+  ui::Presenter* presenter = graphics_system_->presenter();
+  // The swap source is texture fetch constant 0 (as in the emulation's RequestSwapTexture).
+  const xenos::xe_gpu_texture_fetch_t swap_fetch = register_file_->GetTextureFetch(0);
+  const uint32_t base = uint32_t(swap_fetch.base_address) << 12;
+  if (Tracing()) {
+    REXGPU_INFO("[native trace] swap fetch0 {:08X} fmt {} ptr {:08X} found {}", base, uint32_t(swap_fetch.format),
+                frontbuffer_ptr, resolved_.count(base));
+  }
+  auto rit = resolved_.find(base);
+  if (rit == resolved_.end()) rit = resolved_.find(frontbuffer_ptr & 0x1FFFFFFF);
+  if (presenter && rit != resolved_.end()) {
+    NativeImage& src = rit->second.image;
+    const uint32_t w = frontbuffer_width ? std::min(frontbuffer_width, src.width) : src.width;
+    const uint32_t h = frontbuffer_height ? std::min(frontbuffer_height, src.height) : src.height;
+    system::X_VIDEO_MODE video_mode;
+    kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
+    presenter->RefreshGuestOutput(
+        w, h, std::max<uint32_t>(video_mode.display_width, 1), std::max<uint32_t>(video_mode.display_height, 1),
+        [&](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+          auto& vc = static_cast<ui::vulkan::VulkanPresenter::VulkanGuestOutputRefreshContext&>(context);
+          VkCommandBuffer cmd = slot().cmd;
+          const VkDevice dev = vulkan_device_->device();
+          if (!present_pipeline_) return false;
+          const uint64_t fb_key = reinterpret_cast<uint64_t>(vc.image_view()) ^ (vc.image_version() << 48) ^
+                                  (uint64_t(w) << 16) ^ h;
+          VkFramebuffer fb;
+          auto fit = present_framebuffers_.find(fb_key);
+          if (fit != present_framebuffers_.end()) {
+            fb = fit->second;
+          } else {
+            VkImageView view = vc.image_view();
+            VkFramebufferCreateInfo fci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            fci.renderPass = present_pass_;
+            fci.attachmentCount = 1;
+            fci.pAttachments = &view;
+            fci.width = w;
+            fci.height = h;
+            fci.layers = 1;
+            if (dfn().vkCreateFramebuffer(dev, &fci, nullptr, &fb) != VK_SUCCESS) return false;
+            present_framebuffers_.emplace(fb_key, fb);
+          }
+          // Gamma ramp (256-entry table, as set by the game) in the upload buffer.
+          VkDeviceSize ramp_offset;
+          uint8_t* ramp = Upload(256 * 4, std::max<VkDeviceSize>(device()->properties().minUniformBufferOffsetAlignment,
+                                                                   16),
+                                 ramp_offset);
+          if (!ramp) return false;
+          std::memcpy(ramp, gamma_ramp_256_entry_table(), 256 * 4);
+          VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+          ai.descriptorPool = slot().descriptor_pool;
+          ai.descriptorSetCount = 1;
+          ai.pSetLayouts = &present_set_layout_;
+          VkDescriptorSet set;
+          if (dfn().vkAllocateDescriptorSets(dev, &ai, &set) != VK_SUCCESS) return false;
+          VkImageView present_view = src.view;
+          {
+            uint32_t host = xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
+            if (rit->second.rb_swapped) host = 2 | (1 << 3) | (0 << 6) | (3 << 9);
+            VkImageView v = GetSwizzleView(rit->second.swizzle_views, src, swap_fetch.swizzle | (host << 12));
+            if (v) present_view = v;
+          }
+          VkDescriptorImageInfo ii = {convert_sampler_, present_view, VK_IMAGE_LAYOUT_GENERAL};
+          VkDescriptorBufferInfo bi = {slot().upload, ramp_offset, 256 * 4};
+          VkWriteDescriptorSet wr[2] = {};
+          wr[0].sType = wr[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+          wr[0].dstSet = wr[1].dstSet = set;
+          wr[0].dstBinding = 0;
+          wr[0].descriptorCount = 1;
+          wr[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+          wr[0].pImageInfo = &ii;
+          wr[1].dstBinding = 1;
+          wr[1].descriptorCount = 1;
+          wr[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+          wr[1].pBufferInfo = &bi;
+          dfn().vkUpdateDescriptorSets(dev, 2, wr, 0, nullptr);
+          Barrier();
+          VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+          rbi.renderPass = present_pass_;
+          rbi.framebuffer = fb;
+          rbi.renderArea = {{0, 0}, {w, h}};
+          dfn().vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+          dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, present_pipeline_);
+          dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, present_layout_, 0, 1, &set, 0,
+                                        nullptr);
+          struct {
+            float scale[2];
+            int32_t use_ramp;
+            int32_t pad;
+          } pc = {{1.0f, 1.0f}, REXCVAR_GET(ds2_native_gamma_ramp) ? 1 : 0, 0};
+          dfn().vkCmdPushConstants(cmd, present_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+          VkViewport vpp = {0.0f, 0.0f, float(w), float(h), 0.0f, 1.0f};
+          VkRect2D sr = {{0, 0}, {w, h}};
+          dfn().vkCmdSetViewport(cmd, 0, 1, &vpp);
+          dfn().vkCmdSetScissor(cmd, 0, 1, &sr);
+          dfn().vkCmdDraw(cmd, 3, 1, 0, 0);
+          dfn().vkCmdEndRenderPass(cmd);
+          SubmitFrame();
+          ++stats_.swaps_presented;
+          return true;
+        });
+  }
+  if (frame_open_) SubmitFrame();
+  LogStats();
+  // Development dump: at the N-th frame with more than 200 draws (in game, not menus).
+  if (draws_this_frame_ > 200) ++heavy_frames_;
+  draws_this_frame_ = 0;
+  if (REXCVAR_GET(ds2_native_dump_swap) > 0 && heavy_frames_ == uint64_t(REXCVAR_GET(ds2_native_dump_swap)) &&
+      !dumped_ && !REXCVAR_GET(ds2_native_dump_dir).empty()) {
+    dumped_ = true;
+    DumpImages();
+  }
+}
+
+void NativeCommandProcessor::DumpImages() {
+  const VkDevice dev = vulkan_device_->device();
+  std::vector<std::pair<std::string, NativeImage*>> list;
+  for (auto& [k, img] : render_targets_) {
+    list.emplace_back(fmt::format("rt_{:04}_{}_f{}_{}x{}", uint32_t(k & 0xFFF), img.depth ? "d" : "c",
+                                  uint32_t((k >> 28) & 0xFF), img.width, img.height),
+                      &img);
+  }
+  for (auto& [a, r] : resolved_) {
+    list.emplace_back(fmt::format("res_{:08X}_g{}_{}x{}", a, r.guest_format, r.image.width, r.image.height),
+                      &r.image);
+  }
+  for (auto& [name, img] : list) {
+    if (!img->image) continue;
+    const VkDeviceSize bytes = VkDeviceSize(img->width) * img->height * 8;
+    VkBuffer buf;
+    VkDeviceMemory mem;
+    uint32_t type;
+    VkDeviceSize msize;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(vulkan_device_, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                           ui::vulkan::util::MemoryPurpose::kReadback, buf, mem,
+                                                           &type, &msize)) {
+      continue;
+    }
+    if (!frame_open_) BeginFrame();
+    VkBufferImageCopy r = {};
+    r.imageSubresource = {VkImageAspectFlags(img->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 0,
+                          1};
+    r.imageExtent = {img->width, img->height, 1};
+    Barrier();
+    dfn().vkCmdCopyImageToBuffer(slot().cmd, img->image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &r);
+    FrameSlot& sl = slot();
+    SubmitFrame();
+    dfn().vkWaitForFences(dev, 1, &sl.fence, VK_TRUE, UINT64_MAX);
+    void* map = nullptr;
+    dfn().vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, &map);
+    std::vector<uint8_t> rgb(size_t(img->width) * img->height * 3);
+    const uint8_t* p = static_cast<const uint8_t*>(map);
+    auto half = [](uint16_t h) {
+      const uint32_t e = (h >> 10) & 31, m = h & 1023;
+      float v = e ? std::ldexp(float(m | 1024), int(e) - 25) : std::ldexp(float(m), -24);
+      return (h & 0x8000) ? -v : v;
+    };
+    for (size_t i = 0; i < size_t(img->width) * img->height; ++i) {
+      float c[3] = {};
+      switch (img->format) {
+        case VK_FORMAT_R8G8B8A8_UNORM:
+          for (int j = 0; j < 3; ++j) c[j] = p[i * 4 + j] / 255.0f;
+          break;
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32: {
+          uint32_t v;
+          std::memcpy(&v, p + i * 4, 4);
+          for (int j = 0; j < 3; ++j) c[j] = float((v >> (10 * j)) & 1023) / 1023.0f;
+          break;
+        }
+        case VK_FORMAT_R16G16B16A16_SFLOAT: {
+          uint16_t v[4];
+          std::memcpy(v, p + i * 8, 8);
+          for (int j = 0; j < 3; ++j) c[j] = half(v[j]);
+          break;
+        }
+        case VK_FORMAT_R16G16_SFLOAT: {
+          uint16_t v[2];
+          std::memcpy(v, p + i * 4, 4);
+          c[0] = half(v[0]);
+          c[1] = half(v[1]);
+          break;
+        }
+        case VK_FORMAT_R32_SFLOAT:
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:
+          std::memcpy(&c[0], p + i * 4, 4);
+          c[1] = c[2] = c[0];
+          break;
+        case VK_FORMAT_D24_UNORM_S8_UINT: {
+          uint32_t v;
+          std::memcpy(&v, p + i * 4, 4);
+          c[0] = c[1] = c[2] = float(v & 0xFFFFFF) / float(0xFFFFFF);
+          break;
+        }
+        default: {
+          uint32_t v;
+          std::memcpy(&v, p + i * 4, 4);
+          c[0] = float(v & 0xFF) / 255.0f;
+          c[1] = float((v >> 8) & 0xFF) / 255.0f;
+          c[2] = float((v >> 16) & 0xFF) / 255.0f;
+          break;
+        }
+      }
+      for (int j = 0; j < 3; ++j) rgb[i * 3 + j] = uint8_t(std::clamp(c[j], 0.0f, 1.0f) * 255.0f + 0.5f);
+    }
+    dfn().vkUnmapMemory(dev, mem);
+    dfn().vkDestroyBuffer(dev, buf, nullptr);
+    dfn().vkFreeMemory(dev, mem, nullptr);
+    const std::string path = REXCVAR_GET(ds2_native_dump_dir) + "/" + name + ".ppm";
+    if (FILE* f = std::fopen(path.c_str(), "wb")) {
+      std::fprintf(f, "P6\n%u %u\n255\n", img->width, img->height);
+      std::fwrite(rgb.data(), 1, rgb.size(), f);
+      std::fclose(f);
+    }
+  }
+  REXGPU_INFO("[native] dumped {} images to {}", list.size(), REXCVAR_GET(ds2_native_dump_dir));
+}
+
+void NativeCommandProcessor::LogStats() {
+  const int32_t every = REXCVAR_GET(ds2_native_log_every);
+  if (every <= 0 || stats_.swaps - last_log_frame_ < uint64_t(every)) return;
+  const double n = double(stats_.swaps - last_log_frame_);
+  last_log_frame_ = stats_.swaps;
+  REXGPU_INFO(
+      "[native] per frame: {:.0f} draws ({:.1f} skipped, {:.1f} unsupported prim, {:.1f} failed), {:.1f} resolves, "
+      "{:.1f} clears, {:.1f} passes, {} conversions, {:.1f} texture uploads ({:.1f} from resolves, {:.1f} unsupported), {:.2f} MB "
+      "uploaded | totals: {} pipelines, {} render targets, {} textures, {} resolve targets, presented {}/{} swaps",
+      stats_.draws / n, stats_.draws_skipped / n, stats_.draws_unsupported_prim / n, stats_.draws_failed / n,
+      stats_.copies / n, stats_.clears / n, stats_.render_passes_begun / n, conversions_, stats_.texture_uploads / n,
+      stats_.texture_from_resolve / n, stats_.texture_unsupported / n, stats_.upload_bytes / n / 1048576.0,
+      pipelines_.size(), render_targets_.size(), textures_.size(), resolved_.size(), stats_.swaps_presented,
+      stats_.swaps);
+  std::string prims;
+  for (uint32_t i = 0; i < 32; ++i) {
+    if (stats_.prim_counts[i]) prims += fmt::format(" {}:{:.0f}", i, stats_.prim_counts[i] / n);
+  }
+  REXGPU_INFO("[native] primitive types per frame:{}", prims);
+  const uint64_t pipelines = stats_.pipelines, swaps = stats_.swaps, presented = stats_.swaps_presented;
+  stats_ = Stats();
+  stats_.pipelines = pipelines;
+  stats_.swaps = swaps;
+  stats_.swaps_presented = presented;
+}
+
+// --- Graphics system ---------------------------------------------------------------------------------------------
+
+class NativeGraphicsSystem final : public GraphicsSystem {
+ public:
+  NativeGraphicsSystem() = default;
+  std::string name() const override { return "DS2 native (Vulkan)"; }
+
+ protected:
+  void CreateProvider(bool with_presentation) override {
+    provider_ = ui::vulkan::VulkanProvider::Create(true, with_presentation);
+  }
+  std::unique_ptr<CommandProcessor> CreateCommandProcessor() override {
+    return std::make_unique<NativeCommandProcessor>(this, kernel_state_);
+  }
+};
+
+}  // namespace
+
+rex::system::IGraphicsSystem* CreateNativeGraphicsSystem() {
+  REXGPU_INFO("[native] DS2 native renderer selected (ds2_native_renderer = true); Xenos emulation not used");
+  return new NativeGraphicsSystem();
+}
+
+}  // namespace rex::graphics::native

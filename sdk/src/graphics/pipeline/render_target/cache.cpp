@@ -31,6 +31,12 @@
 REXCVAR_DEFINE_INT32(render_target_max_height, 0, "GPU",
                      "DS2 port: maximum height in guest pixels of a host render target (0 = to the end of the EDRAM, "
                      "the default). Saves memory; draws below that height would be lost");
+REXCVAR_DEFINE_BOOL(render_target_msaa_alias, false, "GPU",
+                    "DS2 port (v51): 1x and 4xMSAA host render targets at the same EDRAM base, pitch and format share "
+                    "one memory allocation (on NVIDIA a 4xMSAA image is laid out like a 1x image twice as wide and "
+                    "tall, samples in the same order as on the Xbox 360), so ownership transfers between them are "
+                    "left out. Needs render_target_max_height; 4xMSAA render targets get the same number of EDRAM "
+                    "tile rows. Such render targets are not compressed");
 REXCVAR_DEFINE_BOOL(mrt_edram_used_range_clamp_to_min, true, "GPU",
                     "Clamp MRT EDRAM used range to minimum");
 
@@ -814,8 +820,13 @@ uint32_t RenderTargetCache::GetRenderTargetHeight(uint32_t pitch_tiles_at_32bpp,
   }
   uint32_t msaa_samples_y_log2 = uint32_t(msaa_samples >= xenos::MsaaSamples::k2X);
   uint32_t tile_height_samples_scaled = xenos::kEdramTileHeightSamples * draw_resolution_scale_y();
-  tile_rows =
-      std::min(tile_rows, (max_height_scaled << msaa_samples_y_log2) / tile_height_samples_scaled);
+  if (REXCVAR_GET(render_target_msaa_alias) && REXCVAR_GET(render_target_max_height) > 0) {
+    // Same tile rows at every sample count, so a 4xMSAA image takes exactly the memory of the 1x one.
+    tile_rows = std::min(tile_rows, max_height_scaled / tile_height_samples_scaled);
+  } else {
+    tile_rows =
+        std::min(tile_rows, (max_height_scaled << msaa_samples_y_log2) / tile_height_samples_scaled);
+  }
   assert_not_zero(tile_rows);
   return tile_rows * (xenos::kEdramTileHeightSamples >> msaa_samples_y_log2);
 }
