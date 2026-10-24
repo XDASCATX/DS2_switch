@@ -18,7 +18,7 @@
 An experimental Nintendo Switch port of the **Xbox 360** release (Title ID `465307E4`). It statically recompiles the game's PowerPC executable to ARM64 and renders through a purpose-built Vulkan backend on Mesa NVK. **This is neither an Xbox 360 emulator nor a port of the PC version.**
 
 > [!NOTE]
-> The [0.56 test build](https://github.com/XDASCATX/DS2_switch/releases/tag/v0.56) includes an NRO, its configuration and an optional HOME Menu forwarder. You need your **own Xbox 360 game files** and Compatibility Pack 4; none are distributed here. The repository is currently private, so the release is available only to people with access.
+> The [0.55 test build](https://github.com/XDASCATX/DS2_switch/releases/tag/v0.55) includes an NRO and its matching configuration. You need your **own Xbox 360 game files** and Compatibility Pack 4; none are distributed here. The repository is currently private, so the release is available only to people with access.
 
 ## Approach
 
@@ -40,7 +40,7 @@ The recompiled game still issues its original Direct3D/Xenos commands. A `GPU Co
 | **Recompilation** | ReXGlue codegen turns `Default.xex` into ~84,000 C++ functions. DS2-specific overrides recover missing entry points; a scanner fix handles 16-bit jump tables. |
 | **Runtime** | ReXGlue SDK implements xboxkrnl, XAM, guest memory, virtual file system, XMA audio and input; DS2's `app/` adds paths, DLC installation, clocks and diagnostics. |
 | **Graphics** | A native `GraphicsSystem`/`CommandProcessor` reads PM4 and records Vulkan commands. Render targets are host images; resolves become textures without an EDRAM round-trip. |
-| **Shaders** | The SDK translates Xenos microcode to SPIR-V during play and caches translations by shader and modification. An offline shader library is **not** part of 0.56. |
+| **Shaders** | The SDK translates Xenos microcode to SPIR-V during play and caches translations by shader and modification. An offline shader library is **not** part of 0.55. |
 | **Platform** | devkitA64 + libnx produce a single NRO; patched Mesa NVK translates Vulkan to Tegra X1 commands. |
 
 ## Engineering highlights
@@ -58,7 +58,7 @@ The recompiled game still issues its original Direct3D/Xenos commands. A `GPU Co
 | **MSAA in sample space** | A 4× 640×360 target is represented as a 1280×720 image, allowing DS2's 1× and 4× views of the same EDRAM region to share storage. It preserves the game's reinterpretation trick, at the cost of extra shading. |
 | **Native resolves** | Image copies produce textures the next passes can sample directly; depth and two DS2-specific color reinterpretations have explicit conversion paths. |
 | **GPU-side work reduction** | Conditional early depth testing, one submission per frame and barriers around copies/uploads rather than every render pass. |
-| **CPU-side work reduction** | Dynamic UBO offsets, descriptor-set reuse within a frame, faster register writes and texture untiling, and cached sub-resolve lookups. |
+| **CPU-side work reduction** | Guest-memory mapping and host-thread stack tuning help the game load and run on Switch. |
 | **Pipelines and lifetime** | New pipelines compile on a worker thread; frame slots defer destruction until GPU work finishes. Unused textures and resolve targets are evicted by age. |
 
 The [Mesa NVK patch](tools/switch/toolchain/mesa-switch-ds2-perf.patch) adds direct CPU-side UBO descriptor handling on Maxwell, sparse-buffer support and NAK compiler tuning. An earlier EDRAM-emulation renderer is kept as a fallback; ongoing development targets the native path. Implementation details and limitations: [native-renderer reference](docs/reference/native-renderer.md) · [performance measurements](docs/performance.md) · [known issues](docs/known-issues.md).
@@ -77,7 +77,7 @@ The [Mesa NVK patch](tools/switch/toolchain/mesa-switch-ds2-perf.patch) adds dir
 
 ## Release & repository
 
-The [0.56 release](https://github.com/XDASCATX/DS2_switch/releases/tag/v0.56) contains `ds2.nro` and `ds2.toml`, plus an optional NSP that points to `sdmc:/switch/ds2/ds2.nro` (it contains neither the NRO nor game files). Keep the original game directory structure inside `game_root/`:
+The [0.55 release](https://github.com/XDASCATX/DS2_switch/releases/tag/v0.55) contains `ds2.nro`, its matching `ds2.toml` and `SHA256SUMS`. Keep the original game directory structure inside `game_root/`:
 
 ```text
 sdmc:/switch/ds2/
@@ -90,10 +90,10 @@ sdmc:/switch/ds2/
   logs/                                         # created by the port
 ```
 
-See the [release notes](RELEASE_0.56.md) for installation details. The forwarder is unsigned homebrew and its launch has not been verified on a physical Switch.
+Download `ds2.nro` and `ds2.toml` together from the [0.55 release](https://github.com/XDASCATX/DS2_switch/releases/tag/v0.55). This release does not include an NSP forwarder.
 
 > [!WARNING]
-> The supplied v56/0.56 configuration requests **CPU 1963 MHz / GPU 1267 MHz**, leaves the memory clock unchanged and enables detailed logs. These are non-stock clocks and require a suitable clock sysmodule and hardware. A crash may leave the override active until it is cleared or the console is restarted. Stable 30 FPS everywhere is a development goal, not a release claim.
+> The supplied v55/0.55 configuration requests **CPU 1963 MHz / GPU 1267 MHz**, leaves the memory clock unchanged and enables detailed logs. These are non-stock clocks and require a suitable clock sysmodule and hardware. A crash may leave the override active until it is cleared or the console is restarted. Stable 30 FPS everywhere is a development goal, not a release claim.
 
 | Path | Contents |
 |---|---|
