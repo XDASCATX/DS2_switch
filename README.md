@@ -18,7 +18,7 @@
 An experimental Nintendo Switch port of the **Xbox 360** release (Title ID `465307E4`). It statically recompiles the game's PowerPC executable to ARM64 and renders through a purpose-built Vulkan backend on Mesa NVK. **This is neither an Xbox 360 emulator nor a port of the PC version.**
 
 > [!NOTE]
-> The [0.55 test build](https://github.com/XDASCATX/DS2_switch/releases/tag/v0.55) includes an NRO and its matching configuration. You need your **own Xbox 360 game files** and Compatibility Pack 4; none are distributed here. The repository is currently private, so the release is available only to people with access.
+> The [0.62 test build](https://github.com/XDASCATX/DS2_switch/releases/tag/v0.62) includes an NRO and its matching configuration. You need your **own Xbox 360 game files** and Compatibility Pack 4; none are distributed here. The repository is currently private, so the release is available only to people with access.
 
 ## Approach
 
@@ -40,7 +40,7 @@ The recompiled game still issues its original Direct3D/Xenos commands. A `GPU Co
 | **Recompilation** | ReXGlue codegen turns `Default.xex` into ~84,000 C++ functions. DS2-specific overrides recover missing entry points; a scanner fix handles 16-bit jump tables. |
 | **Runtime** | ReXGlue SDK implements xboxkrnl, XAM, guest memory, virtual file system, XMA audio and input; DS2's `app/` adds paths, DLC installation, clocks and diagnostics. |
 | **Graphics** | A native `GraphicsSystem`/`CommandProcessor` reads PM4 and records Vulkan commands. Render targets are host images; resolves become textures without an EDRAM round-trip. |
-| **Shaders** | The SDK translates Xenos microcode to SPIR-V during play and caches translations by shader and modification. An offline shader library is **not** part of 0.55. |
+| **Shaders** | The SDK translates Xenos microcode to SPIR-V during play and caches translations by shader and modification. Shader library infrastructure is ready; offline library will come in a future build. |
 | **Platform** | devkitA64 + libnx produce a single NRO; patched Mesa NVK translates Vulkan to Tegra X1 commands. |
 
 ## Engineering highlights

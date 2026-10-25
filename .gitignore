@@ -52,3 +52,7 @@ logs/
 _xfer/
 _to_delete*/
 .DS_Store
+
+# Release artifacts
+release/**/*.nro
+release/**/*.toml
