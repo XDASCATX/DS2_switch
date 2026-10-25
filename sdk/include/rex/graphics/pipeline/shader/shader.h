@@ -809,6 +809,7 @@ class Shader {
    private:
     friend class Shader;
     friend class ShaderTranslator;
+    friend class SpirvShaderLibrary;
 
     Shader& shader_;
     uint64_t modification_;

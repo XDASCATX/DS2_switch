@@ -23,6 +23,8 @@
 #include <rex/assert.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include <rex/graphics/pipeline/shader/spirv_library.h>
+#include <xxhash.h>
 #include <rex/math.h>
 #include <rex/string/buffer.h>
 
@@ -72,6 +74,33 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
   }
 }
 
+uint64_t SpirvShaderTranslator::ShaderLibrarySignature() const {
+  const uint32_t flags = uint32_t(features_.full_draw_index_uint32) |
+      (uint32_t(features_.vertex_pipeline_stores_and_atomics) << 1) |
+      (uint32_t(features_.fragment_stores_and_atomics) << 2) |
+      (uint32_t(features_.clip_distance) << 3) | (uint32_t(features_.cull_distance) << 4) |
+      (uint32_t(features_.image_view_format_swizzle) << 5) |
+      (uint32_t(features_.signed_zero_inf_nan_preserve_float32) << 6) |
+      (uint32_t(features_.denorm_flush_to_zero_float32) << 7) |
+      (uint32_t(features_.rounding_mode_rte_float32) << 8) |
+      (uint32_t(edram_fragment_shader_interlock_ && features_.fragment_shader_sample_interlock) << 9) |
+      (uint32_t(features_.demote_to_helper_invocation) << 10) |
+      (uint32_t(features_.sample_rate_shading) << 11) |
+      (uint32_t(native_2x_msaa_with_attachments_) << 12) |
+      (uint32_t(native_2x_msaa_no_attachments_) << 13) |
+      (uint32_t(edram_fragment_shader_interlock_) << 14);
+  const uint32_t values[] = {Modification::kVersion, features_.spirv_version,
+                            features_.max_storage_buffer_range, flags,
+                            draw_resolution_scale_x_, draw_resolution_scale_y_};
+  constexpr char build_id[] = REX_SPIRV_LIBRARY_BUILD_ID;
+  return XXH3_64bits(values, sizeof(values)) ^ XXH3_64bits(build_id, sizeof(build_id) - 1);
+}
+
+bool SpirvShaderTranslator::TranslateAnalyzedShader(Shader::Translation& translation) {
+  if (RestoreConfiguredSpirvLibrary(translation, ShaderLibrarySignature())) return true;
+  return ShaderTranslator::TranslateAnalyzedShader(translation);
+}
+
 uint64_t SpirvShaderTranslator::GetDefaultVertexShaderModification(
     uint32_t dynamic_addressable_register_count,
     Shader::HostVertexShaderType host_vertex_shader_type) const {
@@ -113,6 +142,7 @@ void SpirvShaderTranslator::Reset() {
   uniform_float_constants_ = spv::NoResult;
 
   input_vertex_index_ = spv::NoResult;
+  native_vertex_inputs_.clear();
   input_primitive_id_ = spv::NoResult;
   input_tess_coord_ = spv::NoResult;
   input_patch_control_point_indices_ = spv::NoResult;

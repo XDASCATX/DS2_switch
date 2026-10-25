@@ -317,7 +317,8 @@
 "0x82C759D8" = {}   # 8 bytes
 "0x82C7B3D0" = {}   # 16 bytes
 "0x82CAA008" = {}   # 8 bytes
-"0x82CB81C0" = {}   # 48 bytes
+"0x82CB81C0" = {}   # 24 bytes, vtable slot +36
+"0x82CB81D8" = {}   # RC62: separate 24-byte thunk, vtable slot +40; three RC61 crashes
 "0x82CC8580" = {}   # 8 bytes
 "0x82CC9128" = {}   # 64 bytes
 "0x82CF5D10" = {}   # 24 bytes

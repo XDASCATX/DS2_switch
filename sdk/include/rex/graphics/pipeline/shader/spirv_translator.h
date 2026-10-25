@@ -33,7 +33,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 12;
+    static constexpr uint32_t kVersion = 13;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -70,6 +70,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
       // For domain host vertex shader types only, xenos::TessellationMode.
       uint32_t tessellation_mode : 2;
+      uint32_t native_vertex_inputs : 1;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -88,6 +89,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      uint32_t alpha_test_always : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -410,6 +412,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
         edram_fragment_shader_interlock_(edram_fragment_shader_interlock),
         draw_resolution_scale_x_(draw_resolution_scale_x ? draw_resolution_scale_x : 1),
         draw_resolution_scale_y_(draw_resolution_scale_y ? draw_resolution_scale_y : 1) {}
+
+  bool TranslateAnalyzedShader(Shader::Translation& translation);
+  uint64_t ShaderLibrarySignature() const;
 
   uint64_t GetDefaultVertexShaderModification(
       uint32_t dynamic_addressable_register_count,
@@ -897,6 +902,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
   // VS as VS only - int, or VS as compute (kMemExportCompute) only - uint3.
   spv::Id input_vertex_index_;
+  std::vector<spv::Id> native_vertex_inputs_;
   // VS as TES only - int.
   spv::Id input_primitive_id_;
   // VS as TES only - float3.

@@ -34,12 +34,29 @@ set(REXGPU_XENOS_SOURCES
 set(REXGPU_XENOS_SPIRV_SOURCES
     pipeline/shader/spirv_builder.cpp
     pipeline/shader/spirv.cpp
+    pipeline/shader/spirv_library.cpp
     pipeline/shader/spirv_translator.cpp
     pipeline/shader/spirv_translator_alu.cpp
     pipeline/shader/spirv_translator_fetch.cpp
     pipeline/shader/spirv_translator_memexport.cpp
     pipeline/shader/spirv_translator_rb.cpp
 )
+
+set(_spirv_library_sources ${REXGPU_XENOS_SPIRV_SOURCES}
+    pipeline/shader/shader.cpp pipeline/shader/translator.cpp pipeline/shader/translator_disasm.cpp
+    ${REXGLUE_ROOT}/include/rex/graphics/pipeline/shader/spirv_translator.h
+    ${REXGLUE_ROOT}/include/rex/graphics/pipeline/shader/shader.h
+    ${REXGLUE_ROOT}/include/rex/graphics/pipeline/shader/native_vertex_layout.h)
+set(_spirv_library_hashes "")
+foreach(_source IN LISTS _spirv_library_sources)
+    get_filename_component(_source "${_source}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    file(SHA256 "${_source}" _hash)
+    string(APPEND _spirv_library_hashes "${_hash}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_source}")
+endforeach()
+string(SHA256 _spirv_library_build_id "${_spirv_library_hashes}")
+set_source_files_properties(pipeline/shader/spirv_translator.cpp PROPERTIES
+    COMPILE_DEFINITIONS "REX_SPIRV_LIBRARY_BUILD_ID=\"${_spirv_library_build_id}\"")
 
 # Vulkan backend
 set(REXGPU_XENOS_VULKAN_SOURCES
@@ -105,6 +122,17 @@ else()
     add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
 endif()
 add_library(rex::gpu-xenos ALIAS rexgpu-xenos)
+
+if(NOT REXGLUE_PLATFORM_SWITCH AND REXGLUE_USE_VULKAN)
+    add_executable(rex-shader-library EXCLUDE_FROM_ALL
+        ${REXGLUE_ROOT}/../tools/shaders/build_library.cpp
+        flags.cpp registers.cpp format/ucode.cpp util/draw.cpp pipeline/shader/shader.cpp
+        pipeline/shader/translator.cpp pipeline/shader/translator_disasm.cpp
+        ${REXGPU_XENOS_SPIRV_SOURCES})
+    target_include_directories(rex-shader-library PRIVATE ${REXGLUE_ROOT}/thirdparty/renderdoc)
+    target_link_libraries(rex-shader-library PRIVATE rexruntime xxHash::xxhash
+        Vulkan::Headers glslang::SPIRV)
+endif()
 
 set_target_properties(rexgpu-xenos PROPERTIES
     EXPORT_NAME gpu-xenos

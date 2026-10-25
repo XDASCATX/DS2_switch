@@ -5,6 +5,7 @@
 // follows nfsmw-nx (GPL-3, docs/native-renderer.md there). This file is new code.
 
 #include "native_renderer.h"
+#include <rex/graphics/native/upload_content_cache.h>
 
 #include <algorithm>
 #include <array>
@@ -20,6 +21,7 @@
 #include <unordered_set>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -32,6 +34,7 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include <rex/graphics/pipeline/shader/native_vertex_layout.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/registers.h>
@@ -49,6 +52,27 @@
 #include <rex/ui/vulkan/provider.h>
 #include <rex/ui/vulkan/util.h>
 
+REXCVAR_DEFINE_INT32(ds2_native_shader_profile_every, 0, "GPU",
+                     "Sample scene shader groups every N frames (0 disables); separate prepass/material/post budgets (192 total groups per frame)")
+    .range(0, 1000000);
+REXCVAR_DEFINE_BOOL(ds2_native_dynamic_ubo, false, "GPU",
+                    "Reuse constant descriptor sets with per-draw dynamic offsets")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(ds2_native_resolve_image_barriers, false, "GPU",
+                    "Use image-scoped dependencies around resolve copies");
+REXCVAR_DEFINE_BOOL(ds2_native_resolve_logical_size, true, "GPU",
+                    "Sample resolved textures at fetch dimensions, without guest pitch/resolve padding");
+REXCVAR_DEFINE_BOOL(ds2_native_resolve_color_convert, true, "GPU",
+                    "Convert single-sample float color resolves to RGBA8 with the guest copy exponent bias")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(ds2_native_alpha_specialization, false, "GPU",
+                    "Compile away alpha tests only when the guest comparison is Always");
+REXCVAR_DEFINE_BOOL(ds2_native_cpu_cache, false, "GPU",
+                    "Reuse exact immutable constant/index uploads and descriptor scratch storage within a frame");
+REXCVAR_DEFINE_BOOL(ds2_native_vertex_inputs, false, "GPU",
+                    "Use raw Vulkan vertex attributes for validated straight-line vertex fetch prefixes");
+REXCVAR_DEFINE_BOOL(ds2_native_texture_sets, false, "GPU",
+                    "Reuse immutable texture descriptor sets within a frame; false restores per-draw allocation");
 REXCVAR_DEFINE_BOOL(ds2_native_renderer, false, "GPU",
                     "DS2 port (v51, experimental): draw with the native renderer instead of the Xenos emulation "
                     "(no EDRAM, render targets as images, resolves as image copies). Fallback: false")
@@ -120,6 +144,7 @@ using VulkanShader = vulkan::VulkanShader;
 
 constexpr uint32_t kFrameSlots = 3;
 constexpr VkDeviceSize kUploadBufferSize = VkDeviceSize(48) << 20;
+static_assert(kUploadBufferSize <= UINT32_MAX, "Dynamic UBO offsets must fit in uint32_t");
 constexpr uint32_t kMaxSetsPerFrame = 12288;
 
 // glslang default built-in resource limits (copy of the Vulkan backend's).
@@ -237,6 +262,7 @@ enum ConvertMode : uint32_t {
   kConvertDepthToRgba8,      // D24S8 / D24FS8 -> the 32-bit guest word (depth << 8 | stencil) as RGBA8 bytes
   kConvertFloat7e3ToUnorm10, // k_2_10_10_10_FLOAT (RGBA16F image) -> its bits as k_2_10_10_10 (A2B10G10R10)
   kConvertUnorm10ToFloat7e3, // the reverse
+  kConvertResolveColorRgba8, // numeric float color resolve, including copy exponent bias and UNORM8 packing
   kConvertModeCount,
 };
 
@@ -248,7 +274,7 @@ void main() {
 )";
 
 constexpr const char* kConvertHeader = R"(#version 450
-layout(push_constant) uniform P { ivec2 src_minus_dst; int float24; int pad; } pc;
+layout(push_constant) uniform P { ivec2 src_minus_dst; int float24; int exp_bias; } pc;
 layout(location = 0) out vec4 o;
 uint E7(float f) {
   if (!(f > 0.0)) return 0u;
@@ -311,6 +337,15 @@ void main() {
   vec4 c = texelFetch(t, ivec2(gl_FragCoord.xy) + pc.src_minus_dst, 0);
   uvec3 b = uvec3(c.rgb * 1023.0 + 0.5);
   o = vec4(D7(b.r), D7(b.g), D7(b.b), c.a);
+}
+)",
+    R"(layout(set = 0, binding = 0) uniform sampler2D t;
+void main() {
+  vec4 c = texelFetch(t, ivec2(gl_FragCoord.xy) + pc.src_minus_dst, 0);
+  // Match the SDK full resolve: scale all RGBA, clamp, round half upward, pack UNORM8.
+  // Source render-target color_exp_bias was already applied by the guest draw.
+  c = clamp(c * exp2(float(pc.exp_bias)), 0.0, 1.0);
+  o = floor(c * 255.0 + 0.5) / 255.0;
 }
 )",
 };
@@ -546,6 +581,9 @@ struct PipelineKey {
   uint32_t has_ps;
   uint32_t depth_clamp;
   uint32_t texture_layout;  // texture/sampler counts for the pipeline layout
+  uint32_t native_binding_count, native_attribute_count;
+  VkVertexInputBindingDescription native_bindings[8];
+  VkVertexInputAttributeDescription native_attributes[32];
 };
 static_assert(sizeof(PipelineKey) % 8 == 0, "PipelineKey must have no tail padding");
 
@@ -581,8 +619,11 @@ class NativeCommandProcessor final : public CommandProcessor {
     VkDeviceSize upload_memory_size = 0;
     uint8_t* upload_mapping = nullptr;
     VkDeviceSize upload_used = 0;
+    UploadContentCache content_cache;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSet shared_memory_set = VK_NULL_HANDLE;
+    std::map<std::vector<uint64_t>, VkDescriptorSet> texture_sets;
+    std::map<std::array<VkDeviceSize, SpirvShaderTranslator::kConstantBufferCount>, VkDescriptorSet> constant_sets;
     std::vector<std::pair<VkImage, VkDeviceMemory>> deferred_destroy;
     std::vector<VkImageView> deferred_views;
     std::vector<VkFramebuffer> deferred_framebuffers;
@@ -613,13 +654,23 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t last_use_frame = 0;
     std::unordered_map<uint32_t, VkImageView> swizzle_views;
   };
+  struct ResolveLogicalImage {
+    NativeImage image;
+    uint64_t generation = UINT64_MAX;
+    std::unordered_map<uint32_t, VkImageView> swizzle_views;
+  };
   struct ResolvedEntry {
     NativeImage image;
     uint32_t guest_format = 0;
     bool rb_swapped = false;  // RB_COPY_DEST_INFO.copy_dest_swap: red and blue swapped in the guest copy
     uint32_t guest_pitch = 0, guest_height = 0, bpp_log2 = 2;  // guest texture layout (tiled), for sub-resolves
+    uint32_t sample_scale_x = 1, sample_scale_y = 1;
+    uint64_t generation = 0;
     uint64_t frame = 0;
     std::unordered_map<uint32_t, VkImageView> swizzle_views;
+    // Guest fetch dimensions may be smaller than the tiled pitch or 8-row resolve rectangle.
+    // Keep the root image unchanged: sub-resolves still write into the complete atlas.
+    std::unordered_map<uint64_t, ResolveLogicalImage> logical_images;
   };
   struct Stats {
     uint64_t draws = 0, draws_skipped = 0, draws_unsupported_prim = 0, draws_failed = 0;
@@ -633,6 +684,11 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t occlusion_begins = 0, occlusion_ends = 0, occlusion_lost = 0, occlusion_visible = 0;
     // CPU time on the command processor thread, microseconds.
     uint64_t us_fence_wait = 0, us_draws = 0, us_textures = 0, us_pipelines = 0, us_copies = 0, us_frame = 0;
+    uint64_t us_constants = 0, us_descriptors = 0, us_geometry = 0, us_commands = 0;
+    uint64_t texture_sets_reused = 0, texture_sets_created = 0;
+    uint64_t constant_sets_reused = 0, constant_sets_created = 0, resolve_image_barriers = 0;
+    uint64_t native_vertex_draws = 0, legacy_vertex_draws = 0;
+    uint64_t content_hits = 0, content_saved_bytes = 0;
   };
   struct ProfileLabel {
     std::string name;
@@ -647,7 +703,9 @@ class NativeCommandProcessor final : public CommandProcessor {
   void SubmitFrame();
   FrameSlot& slot() { return slots_[frame_ % kFrameSlots]; }
   uint8_t* Upload(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset_out);
+  bool UploadImmutable(const void* data, size_t size, VkDeviceSize alignment, uint32_t tag, VkDeviceSize& offset);
   void Barrier();
+  void ResolveBarrier(NativeImage& src, NativeImage& dst, bool before);
   void EndRenderPass();
   bool CreateImage(NativeImage& img, VkFormat format, uint32_t w, uint32_t h, bool depth, VkImageUsageFlags usage,
                    uint32_t levels = 1);
@@ -668,10 +726,13 @@ class NativeCommandProcessor final : public CommandProcessor {
   VkImageView GetTextureView(uint32_t fetch_index, xenos::FetchOpDimension dimension, bool& resolved_out);
   VkImageView GetSwizzleView(std::unordered_map<uint32_t, VkImageView>& views, const NativeImage& image,
                              uint32_t swizzle);
+  ResolveLogicalImage* GetResolveLogicalImage(ResolvedEntry& entry, uint32_t width, uint32_t height);
+  void DestroyResolveLogicalImages(ResolvedEntry& entry, bool deferred);
   bool ClearRect(NativeImage& rt, const VkClearValue& value, const VkRect2D& rect);
   bool SetupConversions();
   bool Convert(ConvertMode mode, NativeImage& src, NativeImage& dst, int32_t src_x, int32_t src_y,
-               const VkRect2D& dst_rect, bool src_float24);
+               const VkRect2D& dst_rect, bool src_float24, int32_t resolve_exp_bias = 0);
+  NativeImage* PrepareColorResolve(NativeImage& src, const VkRect2D& rect, int32_t exp_bias);
   void AdoptRenderTarget(uint32_t base, uint32_t pitch, uint64_t key, NativeImage& img);
   void LogStats();
   void DumpImages();
@@ -701,6 +762,10 @@ class NativeCommandProcessor final : public CommandProcessor {
   std::array<FrameSlot, kFrameSlots> slots_;
   uint64_t frame_ = 0;
   bool frame_open_ = false;
+  VkPipeline profile_shader_pipeline_ = VK_NULL_HANDLE;
+  uint32_t profile_shader_groups_ = 0;
+  std::array<uint32_t, 3> profile_shader_phase_groups_ = {};
+  bool profile_shader_active_ = false;
 
   VkDescriptorSetLayout set_layout_shared_memory_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout set_layout_constants_ = VK_NULL_HANDLE;
@@ -724,6 +789,7 @@ class NativeCommandProcessor final : public CommandProcessor {
   VkPipelineLayout convert_layout_[2] = {};
   VkSampler convert_sampler_ = VK_NULL_HANDLE;
   std::unordered_map<uint64_t, VkPipeline> convert_pipelines_;
+  NativeImage color_resolve_scratch_;  // converted source pixels, never the root atlas
   VkShaderModule present_fs_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout present_set_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout present_layout_ = VK_NULL_HANDLE;
@@ -743,6 +809,10 @@ class NativeCommandProcessor final : public CommandProcessor {
 
   // Per-frame vertex buffer dedupe: (guest address << 32 | size) -> upload offset.
   std::unordered_map<uint64_t, VkDeviceSize> frame_vertex_uploads_;
+  std::unordered_map<uint64_t, NativeVertexLayout> native_vertex_layouts_;
+  std::vector<uint32_t> native_indices_;
+  std::vector<VkWriteDescriptorSet> descriptor_writes_;
+  std::vector<uint64_t> descriptor_key_;
 
   SpirvShaderTranslator::SystemConstants system_constants_ = {};
   Stats stats_;
@@ -847,7 +917,8 @@ bool NativeCommandProcessor::SetupContext() {
     VkDescriptorSetLayoutBinding b[SpirvShaderTranslator::kConstantBufferCount] = {};
     for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
       b[i].binding = i;
-      b[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+      b[i].descriptorType = REXCVAR_GET(ds2_native_dynamic_ubo) ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+                                                              : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
       b[i].descriptorCount = 1;
       b[i].stageFlags = guest_stages;
     }
@@ -878,6 +949,7 @@ bool NativeCommandProcessor::SetupContext() {
     if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
             vulkan_device_, kUploadBufferSize,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             ui::vulkan::util::MemoryPurpose::kUpload, s.upload, s.upload_memory, &s.upload_memory_type,
             &s.upload_memory_size)) {
@@ -887,15 +959,16 @@ bool NativeCommandProcessor::SetupContext() {
     void* map = nullptr;
     if (dfn().vkMapMemory(dev, s.upload_memory, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) return false;
     s.upload_mapping = static_cast<uint8_t*>(map);
-    VkDescriptorPoolSize sizes[4] = {
+    VkDescriptorPoolSize sizes[5] = {
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, kMaxSetsPerFrame * 2},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxSetsPerFrame * 2},
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxSetsPerFrame * 4},
         {VK_DESCRIPTOR_TYPE_SAMPLER, kMaxSetsPerFrame * 4},
     };
     VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets = kMaxSetsPerFrame;
-    dpci.poolSizeCount = 4;
+    dpci.poolSizeCount = 5;
     dpci.pPoolSizes = sizes;
     if (dfn().vkCreateDescriptorPool(dev, &dpci, nullptr, &s.descriptor_pool) != VK_SUCCESS) return false;
   }
@@ -984,10 +1057,12 @@ void NativeCommandProcessor::ShutdownContext() {
     DestroyImage(t.image, false);
   }
   for (auto& [k, r] : resolved_) {
+    DestroyResolveLogicalImages(r, false);
     for (auto& [s, v] : r.swizzle_views) dfn().vkDestroyImageView(dev, v, nullptr);
     DestroyImage(r.image, false);
   }
   DestroyImage(white_, false);
+  DestroyImage(color_resolve_scratch_, false);
   for (auto& [k, p] : convert_pipelines_) dfn().vkDestroyPipeline(dev, p, nullptr);
   for (uint32_t i = 0; i < 2; ++i) {
     if (convert_layout_[i]) dfn().vkDestroyPipelineLayout(dev, convert_layout_[i], nullptr);
@@ -1067,8 +1142,15 @@ bool NativeCommandProcessor::BeginFrame() {
   }
   s.deferred_destroy.clear();
   dfn().vkResetCommandPool(dev, s.pool, 0);
+  s.texture_sets.clear();
+  s.constant_sets.clear();
   dfn().vkResetDescriptorPool(dev, s.descriptor_pool, 0);
   s.upload_used = 0;
+  s.content_cache.Reset();
+  profile_shader_pipeline_ = VK_NULL_HANDLE;
+  profile_shader_groups_ = 0;
+  profile_shader_phase_groups_.fill(0);
+  profile_shader_active_ = false;
   frame_vertex_uploads_.clear();
   // The frame's "shared memory" descriptor: every binding is the upload buffer.
   VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -1220,6 +1302,26 @@ uint8_t* NativeCommandProcessor::Upload(VkDeviceSize size, VkDeviceSize alignmen
   return s.upload_mapping + offset;
 }
 
+bool NativeCommandProcessor::UploadImmutable(const void* data, size_t size, VkDeviceSize alignment,
+                                              uint32_t tag, VkDeviceSize& offset) {
+  if (!data || !size) return false;
+  const bool cache = REXCVAR_GET(ds2_native_cpu_cache);
+  const uint64_t hash = cache ? XXH3_64bits(data, size) : 0;
+  uint64_t cached_offset;
+  if (cache && slot().content_cache.Find(hash, tag, data, size, slot().upload_mapping,
+                                         slot().upload_used, cached_offset) && cached_offset % alignment == 0) {
+    offset = cached_offset;
+    ++stats_.content_hits;
+    stats_.content_saved_bytes += size;
+    return true;
+  }
+  uint8_t* dst = Upload(size, alignment, offset);
+  if (!dst) return false;
+  std::memcpy(dst, data, size);
+  if (cache) slot().content_cache.Insert(hash, tag, size, offset);
+  return true;
+}
+
 void NativeCommandProcessor::Barrier() {
   VkMemoryBarrier b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
   b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
@@ -1228,9 +1330,47 @@ void NativeCommandProcessor::Barrier() {
                              1, &b, 0, nullptr, 0, nullptr);
 }
 
+void NativeCommandProcessor::ResolveBarrier(NativeImage& src, NativeImage& dst, bool before) {
+  if (!REXCVAR_GET(ds2_native_resolve_image_barriers) || src.image == dst.image) {
+    Barrier();
+    return;
+  }
+  constexpr VkPipelineStageFlags stages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+      VK_PIPELINE_STAGE_TRANSFER_BIT;
+  constexpr VkAccessFlags access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+      VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+      VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  VkImageMemoryBarrier barriers[2] = {};
+  NativeImage* images[2] = {&src, &dst};
+  for (uint32_t i = 0; i < 2; ++i) {
+    auto& b = barriers[i];
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.srcAccessMask = before ? access : (i ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT);
+    b.dstAccessMask = before ? (i ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT) : access;
+    b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = images[i]->image;
+    b.subresourceRange = {VkImageAspectFlags(images[i]->depth
+                             ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT
+                             : VK_IMAGE_ASPECT_COLOR_BIT), 0, images[i]->levels, 0, 1};
+  }
+  ++stats_.resolve_image_barriers;
+  dfn().vkCmdPipelineBarrier(slot().cmd, before ? stages : VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           before ? VK_PIPELINE_STAGE_TRANSFER_BIT : stages, 0,
+                           0, nullptr, 0, nullptr, 2, barriers);
+}
+
 void NativeCommandProcessor::EndRenderPass() {
   if (in_render_pass_) {
     dfn().vkCmdEndRenderPass(slot().cmd);
+    if (profile_shader_active_) {
+      Mark("other (after shader group)");
+      profile_shader_active_ = false;
+      profile_shader_pipeline_ = VK_NULL_HANDLE;
+    }
     in_render_pass_ = false;
     current_framebuffer_key_ = 0;
   }
@@ -1593,9 +1733,36 @@ bool NativeCommandProcessor::SetupConversions() {
   return convert_vs_ && convert_fs_[0] && convert_fs_[1] && convert_fs_[2];
 }
 
+NativeImage* NativeCommandProcessor::PrepareColorResolve(NativeImage& src, const VkRect2D& rect,
+                                                          int32_t exp_bias) {
+  if (!convert_vs_ || !convert_fs_[kConvertResolveColorRgba8]) return nullptr;
+  const uint32_t width = uint32_t(rect.offset.x) + rect.extent.width;
+  const uint32_t height = uint32_t(rect.offset.y) + rect.extent.height;
+  if (!color_resolve_scratch_.image || color_resolve_scratch_.width < width ||
+      color_resolve_scratch_.height < height) {
+    EndRenderPass();
+    DestroyImage(color_resolve_scratch_, true);
+    if (!CreateImage(color_resolve_scratch_, VK_FORMAT_R8G8B8A8_UNORM, width, height, false,
+                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+      DestroyImage(color_resolve_scratch_, false);
+      return nullptr;
+    }
+    EnsureGeneral(color_resolve_scratch_);
+  }
+  // Do not change the resolve entry's format/generation until conversion succeeds.
+  // If pipeline/descriptor/framebuffer creation fails, IssueCopy uses its original source.
+  if (!Convert(kConvertResolveColorRgba8, src, color_resolve_scratch_, rect.offset.x, rect.offset.y,
+               rect, false, exp_bias)) {
+    REXGPU_WARN("[native] RGBA8 resolve conversion unavailable, keeping the original native copy path");
+    return nullptr;
+  }
+  return &color_resolve_scratch_;
+}
+
 bool NativeCommandProcessor::Convert(ConvertMode mode, NativeImage& src, NativeImage& dst, int32_t src_x,
-                                     int32_t src_y, const VkRect2D& dst_rect, bool src_float24) {
-  if (!convert_vs_ || !dst_rect.extent.width || !dst_rect.extent.height) return false;
+                                     int32_t src_y, const VkRect2D& dst_rect, bool src_float24,
+                                     int32_t resolve_exp_bias) {
+  if (!convert_vs_ || !convert_fs_[mode] || !dst_rect.extent.width || !dst_rect.extent.height) return false;
   const VkDevice dev = vulkan_device_->device();
   VkFormat dst_format = dst.format;
   VkRenderPass pass = GetRenderPass(&dst_format, 1, VK_FORMAT_UNDEFINED);
@@ -1704,7 +1871,8 @@ bool NativeCommandProcessor::Convert(ConvertMode mode, NativeImage& src, NativeI
   dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
   dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, convert_layout_[layout_index], 0, 1, &set, 0,
                                 nullptr);
-  const int32_t pc[4] = {src_x - dst_rect.offset.x, src_y - dst_rect.offset.y, src_float24 ? 1 : 0, 0};
+  const int32_t pc[4] = {src_x - dst_rect.offset.x, src_y - dst_rect.offset.y,
+                         src_float24 ? 1 : 0, resolve_exp_bias};
   dfn().vkCmdPushConstants(cmd, convert_layout_[layout_index], VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), pc);
   VkViewport vp = {float(dst_rect.offset.x), float(dst_rect.offset.y), float(dst_rect.extent.width),
                    float(dst_rect.extent.height), 0.0f, 1.0f};
@@ -1932,6 +2100,10 @@ VkPipeline NativeCommandProcessor::CreatePipelineObject(const PipelineKey& key, 
     ++stage_count;
   }
   VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  vi.vertexBindingDescriptionCount = key.native_binding_count;
+  vi.pVertexBindingDescriptions = key.native_bindings;
+  vi.vertexAttributeDescriptionCount = key.native_attribute_count;
+  vi.pVertexAttributeDescriptions = key.native_attributes;
   VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
   ia.topology = VkPrimitiveTopology(key.topology);
   ia.primitiveRestartEnable = key.primitive_restart ? VK_TRUE : VK_FALSE;
@@ -2096,6 +2268,70 @@ VkImageView NativeCommandProcessor::GetSwizzleView(std::unordered_map<uint32_t, 
   return view;
 }
 
+void NativeCommandProcessor::DestroyResolveLogicalImages(ResolvedEntry& entry, bool deferred) {
+  for (auto& [key, logical] : entry.logical_images) {
+    for (auto& [swizzle, view] : logical.swizzle_views) {
+      if (deferred) {
+        slot().deferred_views.push_back(view);
+      } else {
+        dfn().vkDestroyImageView(vulkan_device_->device(), view, nullptr);
+      }
+    }
+    DestroyImage(logical.image, deferred);
+  }
+  entry.logical_images.clear();
+}
+
+NativeCommandProcessor::ResolveLogicalImage* NativeCommandProcessor::GetResolveLogicalImage(
+    ResolvedEntry& entry, uint32_t width, uint32_t height) {
+  if (!REXCVAR_GET(ds2_native_resolve_logical_size)) return nullptr;
+  // Preserve sample-space MSAA (not downsampling): only discard layout padding.
+  // Check in 64 bits before narrowing, including a defensive zero-size check.
+  const uint64_t scaled_width = uint64_t(width) * entry.sample_scale_x;
+  const uint64_t scaled_height = uint64_t(height) * entry.sample_scale_y;
+  if (!scaled_width || !scaled_height || scaled_width > entry.image.width ||
+      scaled_height > entry.image.height ||
+      (scaled_width == entry.image.width && scaled_height == entry.image.height)) {
+    return nullptr;
+  }
+  width = uint32_t(scaled_width);
+  height = uint32_t(scaled_height);
+  const uint64_t key = uint64_t(width) | (uint64_t(height) << 32);
+  ResolveLogicalImage& logical = entry.logical_images[key];
+  if (!logical.image.image) {
+    if (!CreateImage(logical.image, entry.image.format, width, height, entry.image.depth,
+                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+      // CreateImage may have allocated the image before a view allocation failed.
+      // Nothing using this new image has been recorded, so immediate cleanup is safe.
+      DestroyImage(logical.image, false);
+      entry.logical_images.erase(key);
+      return nullptr;
+    }
+    EnsureGeneral(logical.image);
+  }
+  // A resolve may be updated and sampled multiple times in one frame. A frame tag would
+  // incorrectly reuse the first copy; every successful root/sub-resolve bumps generation.
+  if (logical.generation != entry.generation) {
+    EndRenderPass();
+    ResolveBarrier(entry.image, logical.image, true);
+    VkImageCopy copy = {};
+    copy.srcSubresource = {VkImageAspectFlags(entry.image.depth
+                              ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT
+                              : VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1};
+    copy.dstSubresource = copy.srcSubresource;
+    copy.extent = {width, height, 1};
+    cmd_copy_image_(slot().cmd, entry.image.image, VK_IMAGE_LAYOUT_GENERAL, logical.image.image,
+                    VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+    ResolveBarrier(entry.image, logical.image, false);
+    logical.generation = entry.generation;
+    if (Tracing()) {
+      REXGPU_INFO("[native trace]   resolve logical image {}x{} from {}x{} generation {}", width, height,
+                  entry.image.width, entry.image.height, entry.generation);
+    }
+  }
+  return &logical;
+}
+
 VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::FetchOpDimension dimension,
                                                    bool& resolved_out) {
   resolved_out = false;
@@ -2131,6 +2367,9 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
     if (rit->second.rb_swapped && !rit->second.image.depth) {
       const uint32_t h[4] = {host & 7, (host >> 3) & 7, (host >> 6) & 7, (host >> 9) & 7};
       host = h[2] | (h[1] << 3) | (h[0] << 6) | (h[3] << 9);
+    }
+    if (ResolveLogicalImage* logical = GetResolveLogicalImage(rit->second, width, height)) {
+      return GetSwizzleView(logical->swizzle_views, logical->image, fetch.swizzle | (host << 12));
     }
     return GetSwizzleView(rit->second.swizzle_views, rit->second.image, fetch.swizzle | (host << 12));
   }
@@ -2387,6 +2626,9 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         ps->GetDynamicAddressableRegisterCount(regs.Get<reg::SQ_PROGRAM_CNTL>().ps_num_reg)));
     ps_mod.pixel.interpolator_mask = interpolator_mask;
     ps_mod.pixel.interpolators_centroid = 0;
+    const auto alpha_control = regs.Get<reg::RB_COLORCONTROL>();
+    ps_mod.pixel.alpha_test_always = REXCVAR_GET(ds2_native_alpha_specialization) &&
+        (!alpha_control.alpha_test_enable || alpha_control.alpha_func == xenos::CompareFunction::kAlways);
     if (ps_param_gen_pos < xenos::kMaxInterpolators) {
       ps_mod.pixel.param_gen_enable = 1;
       ps_mod.pixel.param_gen_interpolator = ps_param_gen_pos;
@@ -2407,6 +2649,64 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   auto* vst = static_cast<VulkanShader::VulkanTranslation*>(vs->GetOrCreateTranslation(vs_mod.value));
   auto* pst = ps ? static_cast<VulkanShader::VulkanTranslation*>(ps->GetOrCreateTranslation(ps_mod.value)) : nullptr;
+  auto plan_it = native_vertex_layouts_.find(vs->ucode_data_hash());
+  if (plan_it == native_vertex_layouts_.end()) {
+    plan_it = native_vertex_layouts_.emplace(vs->ucode_data_hash(), BuildNativeVertexLayout(*vs)).first;
+  }
+  const NativeVertexLayout& native_plan = plan_it->second;
+  bool native_vertex = REXCVAR_GET(ds2_native_vertex_inputs) && native_plan.valid &&
+      prim_type == xenos::PrimitiveType::kTriangleList &&
+      !regs.Get<reg::PA_SU_SC_MODE_CNTL>().multi_prim_ib_ena &&
+      regs.Get<int32_t>(XE_GPU_REG_VGT_INDX_OFFSET) == 0 &&
+      regs.Get<uint32_t>(XE_GPU_REG_VGT_MIN_VTX_INDX) == 0 && index_count && index_count <= (1u << 20) &&
+      native_plan.bindings.size() <= 8 &&
+      native_plan.words.size() <= 16;
+  uint32_t native_max_index = index_count ? index_count - 1 : 0;
+  native_indices_.clear();
+  if (native_vertex && index_buffer_info && index_buffer_info->guest_base) {
+    const bool is32 = index_buffer_info->format == xenos::IndexFormat::kInt32;
+    const auto endian = index_buffer_info->endianness;
+    const uint32_t bytes_per_index = is32 ? 4 : 2;
+    const uint64_t bytes = uint64_t(index_count) * bytes_per_index;
+    const uint8_t* data = memory_->TranslatePhysical<const uint8_t*>(index_buffer_info->guest_base);
+    native_vertex = data && (!index_buffer_info->length || bytes <= index_buffer_info->length) &&
+        (endian == xenos::Endian::kNone || (is32 ? endian == xenos::Endian::k8in32 : endian == xenos::Endian::k8in16));
+    if (native_vertex) {
+      native_indices_.resize(index_count);
+      native_max_index = 0;
+      for (uint32_t i = 0; i < index_count; ++i) {
+        uint32_t value = 0;
+        if (is32) { std::memcpy(&value, data + size_t(i) * 4, 4); }
+        else { uint16_t word; std::memcpy(&word, data + size_t(i) * 2, 2); value = word; }
+        value = xenos::GpuSwap(value, endian);
+        native_indices_[i] = value;
+        native_max_index = std::max(native_max_index, value);
+      }
+    }
+  }
+  native_vertex = native_vertex && native_max_index <= 0x7FFFFF &&
+      native_max_index <= regs.Get<uint32_t>(XE_GPU_REG_VGT_MAX_VTX_INDX);
+  if (native_vertex) {
+    for (const auto& binding : native_plan.bindings) {
+      bool uploaded_binding = false;
+      for (const auto& original : vs->vertex_bindings()) {
+        if (original.fetch_constant == binding.fetch_constant && original.stride_words * 4 == binding.stride) uploaded_binding = true;
+      }
+      if (!uploaded_binding) native_vertex = false;
+      const auto fetch = regs.GetVertexFetch(binding.fetch_constant);
+      const uint64_t required = uint64_t(native_max_index + 1) * binding.stride;
+      if (required > (uint64_t(fetch.size) << 2) ||
+          binding.stride > 2048 ||
+          !memory_->TranslatePhysical<const uint8_t*>(uint32_t(fetch.address) << 2)) native_vertex = false;
+    }
+    for (const auto& word : native_plan.words) {
+      if (word.offset > 2047) native_vertex = false;
+    }
+  }
+  if (native_vertex) {
+    vs_mod.vertex.native_vertex_inputs = 1;
+    vst = static_cast<VulkanShader::VulkanTranslation*>(vs->GetOrCreateTranslation(vs_mod.value));
+  }
   uint64_t translate_start = NowUs();
   if (!vst->is_translated()) {
     if (!translator_->TranslateAnalyzedShader(*vst) || !vst->GetOrCreateShaderModule()) {
@@ -2417,6 +2717,13 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (!translator_->TranslateAnalyzedShader(*pst) || !pst->GetOrCreateShaderModule()) {
       REXGPU_ERROR("[native] pixel shader {:016X} translation failed", ps->ucode_data_hash());
     }
+  }
+  if (native_vertex && (!vst->is_valid() || !vst->shader_module())) {
+    native_vertex = false;
+    vs_mod.vertex.native_vertex_inputs = 0;
+    vst = static_cast<VulkanShader::VulkanTranslation*>(vs->GetOrCreateTranslation(vs_mod.value));
+    if (!vst->is_translated()) translator_->TranslateAnalyzedShader(*vst);
+    if (vst->is_valid()) vst->GetOrCreateShaderModule();
   }
   stats_.us_pipelines += NowUs() - translate_start;
   if (!vst->is_valid() || !vst->shader_module() || (pst && (!pst->is_valid() || !pst->shader_module()))) {
@@ -2561,12 +2868,34 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   key.color_count = color_count;
   key.has_ps = ps ? 1 : 0;
   key.depth_clamp = regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable ? 1 : 0;
+  if (native_vertex) {
+    key.native_binding_count = uint32_t(native_plan.bindings.size());
+    key.native_attribute_count = uint32_t(native_plan.words.size());
+    for (uint32_t i = 0; i < key.native_binding_count; ++i) {
+      key.native_bindings[i] = {i, native_plan.bindings[i].stride, VK_VERTEX_INPUT_RATE_VERTEX};
+    }
+    for (uint32_t i = 0; i < key.native_attribute_count; ++i) {
+      key.native_attributes[i] = {i, native_plan.words[i].binding, VK_FORMAT_R32_UINT, native_plan.words[i].offset};
+    }
+  }
   key.texture_layout = uint32_t(vs_textures.size()) | (uint32_t(vs_samplers.size()) << 8) |
                        (uint32_t(ps_textures.size()) << 16) | (uint32_t(ps_samplers.size()) << 24);
   // Full-screen passes (rectangles, a few vertices) wait for their pipeline: skipping one would flash the frame.
   const bool allow_async = prim_type != xenos::PrimitiveType::kRectangleList && index_count > 6;
   bool pipeline_pending = false;
-  VkPipeline pipeline = GetPipeline(key, vst, pst, layout->layout, allow_async, pipeline_pending);
+  VkPipeline pipeline = GetPipeline(key, vst, pst, layout->layout, allow_async && !native_vertex, pipeline_pending);
+  if (!pipeline && native_vertex) {
+    native_vertex = false;
+    vs_mod.vertex.native_vertex_inputs = 0;
+    vst = static_cast<VulkanShader::VulkanTranslation*>(vs->GetOrCreateTranslation(vs_mod.value));
+    if (!vst->is_translated()) translator_->TranslateAnalyzedShader(*vst);
+    if (vst->is_valid()) vst->GetOrCreateShaderModule();
+    key.vs_modification = vs_mod.value;
+    key.native_binding_count = key.native_attribute_count = 0;
+    std::memset(key.native_bindings, 0, sizeof(key.native_bindings));
+    std::memset(key.native_attributes, 0, sizeof(key.native_attributes));
+    if (vst->is_valid() && vst->shader_module()) pipeline = GetPipeline(key, vst, pst, layout->layout, false, pipeline_pending);
+  }
   if (pipeline_pending) {
     ++stats_.draws_pipeline_pending;
     return true;
@@ -2578,6 +2907,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   const uint64_t draw_frame = frame_;
   // Vertex data: copy every vertex buffer the shader fetches into the upload buffer, patch its fetch constant.
+  const uint64_t geometry_start = NowUs();
+  VkDeviceSize native_vertex_offsets[8] = {};
   uint32_t fetch_constants[6 * 32];
   std::memcpy(fetch_constants, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(fetch_constants));
   for (const auto& binding : vs->vertex_bindings()) {
@@ -2619,6 +2950,11 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       }
       std::memcpy(dst, src, size);
       frame_vertex_uploads_.emplace(vkey, offset);
+    }
+    if (native_vertex) {
+      for (size_t i = 0; i < native_plan.bindings.size(); ++i) {
+        if (native_plan.bindings[i].fetch_constant == fc) native_vertex_offsets[i] = offset;
+      }
     }
     vf.address = uint32_t(offset >> 2);
     std::memcpy(&fetch_constants[fc * 2], &vf, sizeof(vf));
@@ -2718,19 +3054,25 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // 16-bit guest indices widened to 32 bits keep their 16-bit swap.
     use_indices = true;
     draw_count = out_count;
+  } else if (indexed && native_vertex) {
+    const VkDeviceSize bytes = VkDeviceSize(native_indices_.size()) * sizeof(uint32_t);
+    if (!UploadImmutable(native_indices_.data(), size_t(bytes), 16, 100, index_offset)) {
+      ++stats_.draws_failed; return true;
+    }
+    index_type = VK_INDEX_TYPE_UINT32;
+    index_endian = xenos::Endian::kNone;
   } else if (indexed) {
     const VkDeviceSize bytes = index_buffer_info->length
                                    ? VkDeviceSize(index_buffer_info->length)
                                    : VkDeviceSize(index_count) * (index_type == VK_INDEX_TYPE_UINT32 ? 4 : 2);
     const uint8_t* src = memory_->TranslatePhysical<const uint8_t*>(index_buffer_info->guest_base);
-    uint8_t* dst = src ? Upload(bytes, 16, index_offset) : nullptr;
-    if (!dst) {
+    if (!UploadImmutable(src, size_t(bytes), 16, 101, index_offset)) {
       ++stats_.draws_failed;
       return true;
     }
-    std::memcpy(dst, src, bytes);
   }
 
+  stats_.us_geometry += NowUs() - geometry_start;
   // System constants.
   SpirvShaderTranslator::SystemConstants& sc = system_constants_;
   std::memset(&sc, 0, sizeof(sc));
@@ -2799,22 +3141,21 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   signs_of(ps_textures);
 
   // Constant buffers.
+  const uint64_t constants_start = NowUs();
   const VkDeviceSize ub_align = std::max<VkDeviceSize>(device()->properties().minUniformBufferOffsetAlignment, 16);
   VkDescriptorBufferInfo cbuf[SpirvShaderTranslator::kConstantBufferCount];
   auto put = [&](uint32_t index, const void* data, size_t size) -> bool {
     VkDeviceSize off;
-    uint8_t* p = Upload(size, ub_align, off);
-    if (!p) return false;
-    std::memcpy(p, data, size);
+    if (!UploadImmutable(data, size, ub_align, index, off)) return false;
     cbuf[index] = {slot().upload, off, size};
     return true;
   };
   auto put_float = [&](uint32_t index, const Shader& shader, uint32_t first_register) -> bool {
     const auto& map = shader.constant_register_map();
     const size_t size = sizeof(float) * 4 * std::max(map.float_count, 1u);
-    VkDeviceSize off;
-    uint8_t* p = Upload(size, ub_align, off);
-    if (!p) return false;
+    alignas(16) std::array<float, 256 * 4> packed;
+    if (size > sizeof(packed)) return false;
+    uint8_t* p = reinterpret_cast<uint8_t*>(packed.data());
     uint8_t* w = p;
     for (uint32_t i = 0; i < 4; ++i) {
       uint64_t bits = map.float_bitmap[i];
@@ -2826,8 +3167,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       }
     }
     if (w == p) std::memset(p, 0, 16);
-    cbuf[index] = {slot().upload, off, size};
-    return true;
+    return put(index, p, size);
   };
   bool ok = put(SpirvShaderTranslator::kConstantBufferSystem, &sc, sizeof(sc)) &&
             put_float(SpirvShaderTranslator::kConstantBufferFloatVertex, *vs, XE_GPU_REG_SHADER_CONSTANT_000_X);
@@ -2851,32 +3191,78 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     ++stats_.draws_failed;
     return true;
   }
+  stats_.us_constants += NowUs() - constants_start;
+  const uint64_t descriptors_start = NowUs();
   const VkDevice dev = vulkan_device_->device();
-  VkDescriptorSet sets[4];
+  VkDescriptorSet sets[4] = {slot().shared_memory_set};
+  const bool reuse_texture_sets = REXCVAR_GET(ds2_native_texture_sets);
+  const bool dynamic_ubo = REXCVAR_GET(ds2_native_dynamic_ubo);
+  std::array<VkDeviceSize, SpirvShaderTranslator::kConstantBufferCount> constant_ranges;
+  uint32_t constant_offsets[SpirvShaderTranslator::kConstantBufferCount];
+  for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+    constant_ranges[i] = cbuf[i].range;
+    constant_offsets[i] = uint32_t(cbuf[i].offset);
+  }
+  bool write_constants = true;
+  if (dynamic_ubo) {
+    auto found = slot().constant_sets.find(constant_ranges);
+    if (found != slot().constant_sets.end()) {
+      sets[1] = found->second;
+      write_constants = false;
+    }
+  }
   VkDescriptorSetLayout set_layouts[3] = {set_layout_constants_, layout->textures_vertex, layout->textures_pixel};
   VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
   ai.descriptorPool = slot().descriptor_pool;
-  ai.descriptorSetCount = 3;
+  ai.descriptorSetCount = (reuse_texture_sets || dynamic_ubo) ? 1 : 3;
   ai.pSetLayouts = set_layouts;
-  if (dfn().vkAllocateDescriptorSets(dev, &ai, sets + 1) != VK_SUCCESS) {
+  if (write_constants && dfn().vkAllocateDescriptorSets(dev, &ai, sets + 1) != VK_SUCCESS) {
     ++stats_.draws_failed;
     return true;
   }
-  sets[0] = slot().shared_memory_set;
-  std::vector<VkWriteDescriptorSet> writes;
-  writes.reserve(8 + image_infos.size());
-  for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
-    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    w.dstSet = sets[1];
-    w.dstBinding = i;
-    w.descriptorCount = 1;
-    w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    w.pBufferInfo = &cbuf[i];
-    writes.push_back(w);
+  std::vector<VkWriteDescriptorSet> local_writes;
+  auto& writes = REXCVAR_GET(ds2_native_cpu_cache) ? descriptor_writes_ : local_writes;
+  writes.clear();
+  writes.reserve(SpirvShaderTranslator::kConstantBufferCount + image_infos.size());
+  if (write_constants) {
+    for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+      if (dynamic_ubo) cbuf[i].offset = 0;
+      VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+      w.dstSet = sets[1];
+      w.dstBinding = i;
+      w.descriptorCount = 1;
+      w.descriptorType = dynamic_ubo ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+      w.pBufferInfo = &cbuf[i];
+      writes.push_back(w);
+    }
   }
   size_t img_i = 0;
-  auto write_images = [&](VkDescriptorSet set, size_t textures, size_t samplers) {
-    for (size_t i = 0; i < textures + samplers; ++i) {
+  auto texture_set = [&](VkDescriptorSetLayout set_layout, size_t textures, size_t samplers,
+                         VkDescriptorSet& set) -> bool {
+    const size_t count = textures + samplers;
+    std::vector<uint64_t> local_key;
+    auto& key = REXCVAR_GET(ds2_native_cpu_cache) ? descriptor_key_ : local_key;
+    key.clear();
+    if (reuse_texture_sets) {
+      key.reserve(1 + count * 3);
+      key.push_back(reinterpret_cast<uint64_t>(set_layout));
+      for (size_t i = 0; i < count; ++i) {
+        const auto& info = image_infos[img_i + i];
+        key.push_back(reinterpret_cast<uint64_t>(info.imageView));
+        key.push_back(reinterpret_cast<uint64_t>(info.sampler));
+        key.push_back(uint64_t(info.imageLayout));
+      }
+      auto found = slot().texture_sets.find(key);
+      if (found != slot().texture_sets.end()) {
+        set = found->second;
+        img_i += count;
+        ++stats_.texture_sets_reused;
+        return true;
+      }
+    }
+    ai.pSetLayouts = &set_layout;
+    if ((reuse_texture_sets || dynamic_ubo) && dfn().vkAllocateDescriptorSets(dev, &ai, &set) != VK_SUCCESS) return false;
+    for (size_t i = 0; i < count; ++i) {
       VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
       w.dstSet = set;
       w.dstBinding = uint32_t(i);
@@ -2885,12 +3271,25 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       w.pImageInfo = &image_infos[img_i++];
       writes.push_back(w);
     }
+    if (reuse_texture_sets) slot().texture_sets.emplace(key, set);
+    ++stats_.texture_sets_created;
+    return true;
   };
-  write_images(sets[2], vs_textures.size(), vs_samplers.size());
-  write_images(sets[3], ps_textures.size(), ps_samplers.size());
-  dfn().vkUpdateDescriptorSets(dev, uint32_t(writes.size()), writes.data(), 0, nullptr);
+  if (!texture_set(layout->textures_vertex, vs_textures.size(), vs_samplers.size(), sets[2]) ||
+      !texture_set(layout->textures_pixel, ps_textures.size(), ps_samplers.size(), sets[3])) {
+    // A failed allocation must not leave cached sets whose writes were never applied.
+    slot().texture_sets.clear();
+    ++stats_.draws_failed;
+    return true;
+  }
+  if (!writes.empty()) dfn().vkUpdateDescriptorSets(dev, uint32_t(writes.size()), writes.data(), 0, nullptr);
+  if (dynamic_ubo && write_constants) slot().constant_sets.emplace(constant_ranges, sets[1]);
+  if (write_constants) ++stats_.constant_sets_created;
+  else ++stats_.constant_sets_reused;
+  stats_.us_descriptors += NowUs() - descriptors_start;
 
   // Render pass.
+  ScopedUs commands_time(stats_.us_commands);
   uint64_t fb_key = reinterpret_cast<uint64_t>(pass);
   for (uint32_t i = 0; i < color_count; ++i) fb_key = fb_key * 1000003u + reinterpret_cast<uint64_t>(color_rts[i]->view);
   if (depth_rt) fb_key = fb_key * 1000003u + reinterpret_cast<uint64_t>(depth_rt->view);
@@ -2981,8 +3380,41 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                 regs[XE_GPU_REG_PA_CL_CLIP_CNTL], key.blend[0], ps ? ps->ucode_data_hash() : 0,
                 regs[XE_GPU_REG_RB_STENCILREFMASK]);
   }
+  const uint32_t shader_profile_every = uint32_t(REXCVAR_GET(ds2_native_shader_profile_every));
+  const bool sample_shader = profiling_ && shader_profile_every && frame_ % shader_profile_every == 0 &&
+                             color_count && viewport.xy_extent[0] >= 640 && viewport.xy_extent[1] >= 360;
+  if (!sample_shader && profile_shader_active_) {
+    Mark("other (outside scene shader group)");
+    profile_shader_active_ = false;
+    profile_shader_pipeline_ = VK_NULL_HANDLE;
+  }
+  const uint32_t shader_phase = color_count && color_formats[0] == VK_FORMAT_R16G16B16A16_SFLOAT
+                                    ? 1 : (color_count && depth_rt ? 0 : 2);
+  constexpr uint32_t phase_limits[3] = {64, 96, 32};
+  if (sample_shader && pipeline != profile_shader_pipeline_) {
+    if (profile_shader_phase_groups_[shader_phase] < phase_limits[shader_phase]) {
+      Mark(fmt::format("shader VS {:016X} PS {:016X}", key.vs_hash, key.ps_hash));
+      profile_shader_pipeline_ = pipeline;
+      profile_shader_active_ = true;
+      ++profile_shader_groups_;
+      ++profile_shader_phase_groups_[shader_phase];
+    } else if (profile_shader_active_) {
+      Mark("other (shader sampling limit)");
+      profile_shader_active_ = false;
+    }
+  }
+  if (native_vertex) {
+    VkBuffer buffers[8];
+    std::fill_n(buffers, native_plan.bindings.size(), slot().upload);
+    dfn().vkCmdBindVertexBuffers(cmd, 0, uint32_t(native_plan.bindings.size()), buffers, native_vertex_offsets);
+    ++stats_.native_vertex_draws;
+  } else {
+    ++stats_.legacy_vertex_draws;
+  }
   dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-  dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout->layout, 0, 4, sets, 0, nullptr);
+  dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout->layout, 0, 4, sets,
+                              dynamic_ubo ? SpirvShaderTranslator::kConstantBufferCount : 0,
+                              dynamic_ubo ? constant_offsets : nullptr);
   VkViewport vp;
   vp.x = float(viewport.xy_offset[0]);
   vp.y = float(viewport.xy_offset[1]);
@@ -3205,9 +3637,22 @@ bool NativeCommandProcessor::IssueCopy() {
     const xenos::TextureFormat dest_tex_format = xenos::TextureFormat(dest_info.copy_dest_format);
     // Measured in DS2: depth is resolved with a k_8_8_8_8 destination format but sampled as k_24_8 /
     // k_24_8_FLOAT, so the resolved image stays a depth image (sampled through its depth aspect).
-    (void)dest_tex_format;
     const bool depth_as_color = false;
-    const VkFormat resolved_format = depth_as_color ? VK_FORMAT_R8G8B8A8_UNORM : src->format;
+    NativeImage* copy_src = src;
+    // Only the measured numeric path: 1x float RGBA -> unsigned RGBA8. Do not reinterpret
+    // depth, gamma targets, other destination formats or MSAA sample selection here.
+    const int32_t resolve_exp_bias = int32_t(info.copy_dest_info.copy_dest_exp_bias);
+    if (REXCVAR_GET(ds2_native_resolve_color_convert) && !is_depth &&
+        surface_info.msaa_samples == xenos::MsaaSamples::k1X &&
+        src->format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+        dest_tex_format == xenos::TextureFormat::k_8_8_8_8 &&
+        dest_info.copy_dest_number == xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction) {
+      const VkRect2D rect = {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
+      if (NativeImage* converted = PrepareColorResolve(*src, rect, resolve_exp_bias)) {
+        copy_src = converted;
+      }
+    }
+    const VkFormat resolved_format = depth_as_color ? VK_FORMAT_R8G8B8A8_UNORM : copy_src->format;
     // A resolve into a part of a bigger texture (DS2 packs 4 shadow cascades into one 1600x1600 atlas): Direct3D
     // moves the destination base to the 32x32 tile of the destination point. Find the texture that contains the
     // address and the tile it starts at.
@@ -3246,6 +3691,7 @@ bool NativeCommandProcessor::IssueCopy() {
         (r.image.width < dw || r.image.height < dh || r.image.format != resolved_format)) {
       for (auto& [s, view] : r.swizzle_views) slot().deferred_views.push_back(view);
       r.swizzle_views.clear();
+      DestroyResolveLogicalImages(r, true);
       DestroyImage(r.image, true);
     }
     if (!r.image.image) {
@@ -3263,6 +3709,8 @@ bool NativeCommandProcessor::IssueCopy() {
       r.guest_pitch = dest_pitch.copy_dest_pitch;
       r.guest_height = dest_pitch.copy_dest_height;
       r.bpp_log2 = dest_bpp_log2;
+      r.sample_scale_x = uint32_t(sx);
+      r.sample_scale_y = uint32_t(sy);
     }
     // Destination offset: the source position plus the sub-texture tile (in the source's sample space).
     const int32_t dst_x0 = x0 + sub_x * sx, dst_y0 = y0 + sub_y * sy;
@@ -3289,13 +3737,15 @@ bool NativeCommandProcessor::IssueCopy() {
       const bool float24 =
           xenos::DepthRenderTargetFormat(regs.Get<reg::RB_DEPTH_INFO>().depth_format) ==
           xenos::DepthRenderTargetFormat::kD24FS8;
-      Convert(kConvertDepthToRgba8, *src, r.image, x0, y0,
-              {{dst_x0, dst_y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}}, float24);
+      if (Convert(kConvertDepthToRgba8, *src, r.image, x0, y0,
+                  {{dst_x0, dst_y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}}, float24)) {
+        ++r.generation;
+      }
     } else {
     if (profiling_) {
       Mark(fmt::format("resolve copy {} {}x{}", is_depth ? "depth" : "color", src->width, src->height));
     }
-    Barrier();
+    ResolveBarrier(*copy_src, r.image, true);
     VkImageCopy c = {};
     c.srcSubresource = {VkImageAspectFlags(is_depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
                                                     : VK_IMAGE_ASPECT_COLOR_BIT),
@@ -3304,8 +3754,9 @@ bool NativeCommandProcessor::IssueCopy() {
     c.srcOffset = {x0, y0, 0};
     c.dstOffset = {dst_x0, dst_y0, 0};
     c.extent = {uint32_t(x1 - x0), uint32_t(y1 - y0), 1};
-    cmd_copy_image_(slot().cmd, src->image, VK_IMAGE_LAYOUT_GENERAL, r.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
-    Barrier();
+    cmd_copy_image_(slot().cmd, copy_src->image, VK_IMAGE_LAYOUT_GENERAL, r.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    ResolveBarrier(*copy_src, r.image, false);
+    ++r.generation;
     }
   }
 
@@ -3584,6 +4035,7 @@ void NativeCommandProcessor::EvictTextures() {
   }
   for (auto it = resolved_.begin(); it != resolved_.end();) {
     if (frame_ - it->second.frame > keep_frames * 4) {
+      DestroyResolveLogicalImages(it->second, true);
       for (auto& [sw, v] : it->second.swizzle_views) slot().deferred_views.push_back(v);
       DestroyImage(it->second.image, true);
       it = resolved_.erase(it);
@@ -3759,6 +4211,17 @@ void NativeCommandProcessor::LogStats() {
               stats_.texture_levels / n, stats_.texture_upload_bytes / n / 1048576.0, stats_.submits / n,
               stats_.occlusion_begins / n, stats_.occlusion_ends / n, stats_.occlusion_visible / n,
               stats_.occlusion_lost / n);
+  REXGPU_INFO("[native] draw detail ms/frame: geometry {:.2f}, constants {:.2f}, descriptors {:.2f}, commands {:.2f} | "
+              "texture descriptor sets/frame: {:.1f} reused, {:.1f} created",
+              stats_.us_geometry / n / 1000.0, stats_.us_constants / n / 1000.0,
+              stats_.us_descriptors / n / 1000.0, stats_.us_commands / n / 1000.0,
+              stats_.texture_sets_reused / n, stats_.texture_sets_created / n);
+  REXGPU_INFO("[native] constant sets/frame: {:.1f} reused, {:.1f} created | image resolve barriers/frame {:.1f}",
+              stats_.constant_sets_reused / n, stats_.constant_sets_created / n, stats_.resolve_image_barriers / n);
+  REXGPU_INFO("[native] immutable uploads/frame: {:.1f} hits, {:.2f} MB saved",
+              stats_.content_hits / n, stats_.content_saved_bytes / n / 1048576.0);
+  REXGPU_INFO("[native] vertex draws/frame: {:.1f} hardware inputs, {:.1f} legacy fetch",
+              stats_.native_vertex_draws / n, stats_.legacy_vertex_draws / n);
   if (profiling_ && profile_buffers_) {
     std::vector<ProfileLabel*> order;
     double sum = 0;
@@ -3775,6 +4238,16 @@ void NativeCommandProcessor::LogStats() {
     }
     REXGPU_INFO("[native gpu] GPU ms per frame: {:.2f} (command buffers {:.2f} per frame), by pass kind:{}",
                 profile_gpu_ms_ / n, profile_buffers_ / n, top);
+    std::string shader_top;
+    uint32_t shader_groups_logged = 0;
+    for (const auto* label : order) {
+      if (label->name.rfind("shader VS ", 0) != 0) continue;
+      shader_top += fmt::format("\n[native shader gpu] {:.3f} ms/group, {} groups, {:.1f} draws/group: {}",
+                                label->ms / double(label->count), label->count,
+                                double(label->draws) / double(label->count), label->name);
+      if (++shader_groups_logged == 16) break;
+    }
+    if (!shader_top.empty()) REXGPU_INFO("[native shader gpu] sampled groups (not a frame average):{}", shader_top);
     for (ProfileLabel& l : profile_labels_) l = {l.name};
     profile_gpu_ms_ = 0;
     profile_buffers_ = 0;

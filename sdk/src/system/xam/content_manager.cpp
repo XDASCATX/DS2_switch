@@ -26,6 +26,7 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_device.h>
 #include <rex/system/xam/content_manager.h>
+#include <rex/system/xam/user_profile.h>
 #include <rex/system/xfile.h>
 #include <rex/system/xobject.h>
 
@@ -763,24 +764,27 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
     return X_ERROR_FILE_NOT_FOUND;
   }
 
-  // Mount the STFS package as a virtual filesystem device
   auto device = std::make_unique<rex::filesystem::StfsContainerDevice>("", package_path);
   if (!device->Initialize()) {
     return X_ERROR_ACCESS_DENIED;
   }
 
-  // Derive install destination:
-  // root_path_/0000000000000000/{title_id}/00000002/{filename}/
-  auto file_name = rex::path_to_utf8(package_path.filename());
+  const auto content_type = device->header().metadata.content_type;
+  const uint32_t title_id = device->header().metadata.execution_info.title_id;
+  if (title_id != kernel_state_->title_id()) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
 
+  const uint64_t xuid = content_type == XContentType::kMarketplaceContent
+                            ? 0
+                            : kernel_state_->user_profile()->xuid();
   XCONTENT_AGGREGATE_DATA content_data;
   content_data.device_id = static_cast<uint32_t>(DummyDeviceId::HDD);
-  content_data.content_type = XContentType::kMarketplaceContent;
-  content_data.title_id = kernel_state_->title_id();
-  content_data.xuid = 0;
-  content_data.set_file_name(file_name);
+  content_data.content_type = content_type;
+  content_data.title_id = title_id;
+  content_data.xuid = xuid;
+  content_data.set_file_name(rex::path_to_utf8(package_path.filename()));
 
-  // Read display name from STFS metadata
   auto display_name = device->header().metadata.display_name(rex::system::XLanguage::kEnglish);
   if (!display_name.empty()) {
     content_data.set_display_name(display_name);
@@ -788,16 +792,17 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
     content_data.set_display_name(rex::path_to_utf16(package_path.filename()));
   }
 
-  auto install_path = ResolvePackagePath(0, content_data);
+  if (ContentExists(xuid, content_data)) {
+    return X_ERROR_ALREADY_EXISTS;
+  }
 
-  // Create destination directory
+  auto install_path = ResolvePackagePath(xuid, content_data);
   std::error_code ec;
   std::filesystem::create_directories(install_path, ec);
   if (ec) {
     return X_ERROR_ACCESS_DENIED;
   }
 
-  // Extract all files breadth-first
   auto* root = device->ResolvePath("");
   if (!root) {
     return X_ERROR_ACCESS_DENIED;
@@ -805,7 +810,6 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
 
   std::queue<rex::filesystem::Entry*> queue;
   queue.push(root);
-
   while (!queue.empty()) {
     auto* entry = queue.front();
     queue.pop();
@@ -820,7 +824,6 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
     }
   }
 
-  // Compute license mask from STFS header licenses
   uint32_t license_mask = 0;
   for (size_t i = 0; i < 0x10; i++) {
     if (device->header().header.licenses[i].license_flags) {
@@ -828,8 +831,7 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
     }
   }
 
-  // Write .header file
-  return WriteContentHeaderFile(0, content_data, license_mask);
+  return WriteContentHeaderFile(xuid, content_data, license_mask);
 }
 
 }  // namespace xam

@@ -18,14 +18,15 @@
 #include <vector>
 
 REXCVAR_DEFINE_STRING(ds2_install_dlc, "", "DS2",
-                      "STFS DLC packages to install at startup if missing, separated by ';' "
-                      "(e.g. the Compatibility Pack 4 file D4B91B6B...). Relative paths are taken from the executable folder. "
+                      "STFS content packages to install at startup if missing, separated by ';' "
+                      "(e.g. Compatibility Pack 4 or Calibration -GAME_0000). Relative paths are taken from the executable folder. "
                       "Empty: every file of <executable folder>/dlc/ is installed.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace ds2::dlc {
 
 void InstallConfigured(rex::Runtime* runtime) {
+  using rex::X_RESULT;
   if (!runtime || !runtime->kernel_state()) {
     return;
   }
@@ -49,7 +50,6 @@ void InstallConfigured(rex::Runtime* runtime) {
     REXLOG_WARN("[ds2 dlc] no content manager");
     return;
   }
-  const auto installed = content->ListContent(1, 0, rex::system::XContentType::kMarketplaceContent);
   size_t start = 0;
   while (start <= list.size()) {
     size_t end = list.find(';', start);
@@ -60,21 +60,17 @@ void InstallConfigured(rex::Runtime* runtime) {
     std::filesystem::path path(item);
     if (path.is_relative() && !exe_dir.empty()) path = exe_dir / path;
     const std::string name = path.filename().string();
-    bool present = false;
-    for (const auto& c : installed) {
-      if (c.file_name() == name) present = true;
-    }
-    if (present) {
-      REXLOG_INFO("[ds2 dlc] {} already installed", name);
-      continue;
-    }
     REXLOG_INFO("[ds2 dlc] installing {} (first boot only: the package is unpacked onto the SD card, which takes "
                 "minutes on the console)", rex::path_to_utf8(path));
     rex::FlushLogging();
     const auto t0 = std::chrono::steady_clock::now();
     const auto result = content->InstallContent(path);
-    REXLOG_INFO("[ds2 dlc] install {} -> {:08X} in {:.1f} s", rex::path_to_utf8(path), uint32_t(result),
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    if (result == X_ERROR_ALREADY_EXISTS) {
+      REXLOG_INFO("[ds2 dlc] {} already installed", name);
+    } else {
+      REXLOG_INFO("[ds2 dlc] install {} -> {:08X} in {:.1f} s", rex::path_to_utf8(path), uint32_t(result),
+                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
   }
 }
 

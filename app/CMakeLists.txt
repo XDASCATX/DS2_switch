@@ -57,10 +57,12 @@ target_link_libraries(ds2 PRIVATE ds2_recomp rex::runtime)
 if(REXGLUE_PLATFORM_SWITCH)
     # One static executable: the GPU plugin is linked in instead of loaded from a shared library.
     rexglue_configure_target(ds2 GPU_PLUGINS xenos)
+    set(DS2_DISPLAY_VERSION "0.62 RC62" CACHE STRING "Version displayed by homebrew launchers and forwarders")
     rexglue_switch_add_nro(ds2
-        NAME "Dark Souls II SotFS (recomp)"
-        AUTHOR "DS2 Switch port"
-        VERSION "0.1.0")
+        NAME "Dark Souls II: Scholar of the First Sin"
+        AUTHOR "xDASCATx"
+        VERSION "${DS2_DISPLAY_VERSION}"
+        ICON "${CMAKE_CURRENT_SOURCE_DIR}/resources/icon.jpg")
 else()
     rexglue_configure_target(ds2)
 endif()

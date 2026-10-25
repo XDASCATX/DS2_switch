@@ -63,6 +63,7 @@ class SpirvShader : public Shader {
 
  private:
   friend class SpirvShaderTranslator;
+  friend class SpirvShaderLibrary;
 
   std::atomic_flag bindings_setup_entered_ = ATOMIC_FLAG_INIT;
   std::vector<TextureBinding> texture_bindings_;

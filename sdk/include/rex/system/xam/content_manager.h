@@ -177,9 +177,8 @@ class ContentManager {
   // Returns the host filesystem path for an open content package, or empty.
   std::filesystem::path GetOpenPackagePath(const std::string_view root_name) const;
 
-  // Installs an STFS content package from an arbitrary host path.
-  // Extracts the package into root_path_/0000000000000000/{title_id}/00000002/{filename}/
-  // and writes a .header file for XAM enumeration.
+  // Installs an STFS content package from an arbitrary host path. The package's
+  // own title and content type select its virtual storage location.
   X_RESULT InstallContent(const std::filesystem::path& package_path);
 
  private:

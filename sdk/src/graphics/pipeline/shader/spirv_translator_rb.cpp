@@ -487,6 +487,8 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
       builder_->setBuildPoint(&block_fsi_rt_0_alpha_tests_rt_written);
     }
 
+    // Native pipeline specialization: the guest alpha function is provably Always.
+    if (!GetSpirvShaderModification().pixel.alpha_test_always) {
     // Alpha test.
     // TODO(Triang3l): Check how alpha test works with NaN on Direct3D 9.
     // Extract the comparison function (less, equal, greater bits).
@@ -586,6 +588,7 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
       }
     }
     if_alpha_test_function_is_non_always.makeEndIf();
+    }
 
     // Alpha to coverage.
     if (edram_fragment_shader_interlock_ || output_fragment_sample_mask_ != spv::NoResult) {

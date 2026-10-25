@@ -20,6 +20,7 @@
 
 #include <rex/assert.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include <rex/graphics/pipeline/shader/native_vertex_layout.h>
 #include <rex/math.h>
 
 namespace rex::graphics {
@@ -45,8 +46,11 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
 
   uint32_t fetch_constant_word_0_index = instr.operands[1].storage_index << 1;
 
-  spv::Id address;
-  if (instr.is_mini_fetch) {
+  const bool native_fetch = GetSpirvShaderModification().vertex.native_vertex_inputs != 0;
+  spv::Id address = const_int_0_;
+  if (native_fetch) {
+    // Hardware vertex addressing is prevalidated by the native command processor.
+  } else if (instr.is_mini_fetch) {
     // `base + index * stride` loaded by vfetch_full.
     address = builder_->createLoad(var_main_vfetch_address_, spv::NoPrecision);
   } else {
@@ -123,7 +127,22 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     // any games relying on out-of-bounds access. On Adreno 200 on Android (LG
     // P705), however, words (not full elements) out of glBufferData bounds
     // contain 0.
-    word_composite_constituents[word_count++] = LoadUint32FromSharedMemory(word_address);
+    if (native_fetch) {
+      const auto layout = BuildNativeVertexLayout(current_shader());
+      const int location = layout.Location(instr.operands[1].storage_index,
+                                            uint32_t(instr.attributes.offset + word_index) * 4);
+      assert_true(layout.valid && location >= 0);
+      if (native_vertex_inputs_.size() < layout.words.size()) native_vertex_inputs_.resize(layout.words.size(), spv::NoResult);
+      auto& input = native_vertex_inputs_[size_t(location)];
+      if (input == spv::NoResult) {
+        input = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput, type_uint_, "xe_native_vertex_word");
+        builder_->addDecoration(input, spv::DecorationLocation, location);
+        main_interface_.push_back(input);
+      }
+      word_composite_constituents[word_count++] = builder_->createLoad(input, spv::NoPrecision);
+    } else {
+      word_composite_constituents[word_count++] = LoadUint32FromSharedMemory(word_address);
+    }
   }
   spv::Id words;
   if (word_count > 1) {
