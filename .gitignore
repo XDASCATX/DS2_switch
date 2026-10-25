@@ -22,6 +22,8 @@ sdk/out/
 *.o
 *.a
 
+CLAUDE.md
+
 # --- Third-party sources --------------------------------------------------------
 # sdk/thirdparty is filled by tools/fetch_thirdparty.py (ReXGlue v0.10.0, c94f5eb, with submodules).
 # Only the files changed by the NFSMW-NX port are tracked (same 7 files as in nfsmw-nx).
