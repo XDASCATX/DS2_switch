@@ -44,6 +44,7 @@ __pycache__/
 *.pyc
 
 # --- Owner's project root (SW1_ds2 on the Mac) is this repository; local-only folders there ---------------
+docs/
 DARK.SOULS*/
 ds2_logs/
 switch/
