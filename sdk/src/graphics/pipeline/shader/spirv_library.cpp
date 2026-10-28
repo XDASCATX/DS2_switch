@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstring>
 #include <mutex>
+#include <set>
 #include <vector>
 
 #include <xxhash.h>
@@ -14,6 +15,11 @@
 
 REXCVAR_DEFINE_STRING(ds2_shader_library, "", "GPU",
                       "Offline SPIR-V library; empty disables it. Unknown variants use the SDK translator.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(ds2_shader_cache, "", "GPU",
+                      "RC64: runtime-learned SPIR-V cache next to the NRO (empty disables it). Every shader variant "
+                      "translated on the console is appended and restored on later starts.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(ds2_shader_library_index, true, "GPU",
@@ -45,11 +51,12 @@ SpirvShaderLibrary::~SpirvShaderLibrary() {
   if (file_) fclose(file_);
 }
 
-bool SpirvShaderLibrary::Open(const std::filesystem::path& path, uint64_t expected_signature) {
+bool SpirvShaderLibrary::Open(const std::filesystem::path& path, uint64_t expected_signature, bool tolerate_tail) {
   static_assert(std::endian::native == std::endian::little);
   if (file_) fclose(file_);
   file_ = nullptr;
   file_size_ = 0;
+  valid_size_ = 0;
   indexed_ = false;
   entries_.clear();
   FILE* file = rex::filesystem::OpenFile(path, "rb");
@@ -79,7 +86,7 @@ bool SpirvShaderLibrary::Open(const std::filesystem::path& path, uint64_t expect
   if (fseek(file, long(sizeof(header)), SEEK_SET)) return fail();
   auto index_path = path;
   index_path += ".idx";
-  if (REXCVAR_GET(ds2_shader_library_index) && ReadIndex(index_path)) {
+  if (!tolerate_tail && REXCVAR_GET(ds2_shader_library_index) && ReadIndex(index_path)) {
     file_ = file;
     indexed_ = true;
     return true;
@@ -88,14 +95,21 @@ bool SpirvShaderLibrary::Open(const std::filesystem::path& path, uint64_t expect
   while (offset < uint64_t(file_size)) {
     Record record;
     if (uint64_t(file_size) - offset < sizeof(record) ||
-        fread(record.data(), 1, sizeof(record), file) != sizeof(record)) return fail();
+        fread(record.data(), 1, sizeof(record), file) != sizeof(record)) {
+      if (tolerate_tail) break;
+      return fail();
+    }
     uint64_t bytes;
     if (!PayloadSize(record, bytes) || bytes > uint64_t(file_size) - offset - sizeof(record) ||
-        entries_.size() >= 200000) return fail();
+        entries_.size() >= 200000 || (tolerate_tail && record[2] != file_signature_)) {
+      if (tolerate_tail) break;
+      return fail();
+    }
     entries_.emplace(Key{record[0], record[1], record[2], record[3]}, offset);
     if (fseek(file, long(bytes), SEEK_CUR)) return fail();
     offset += sizeof(record) + bytes;
   }
+  valid_size_ = offset;
   file_ = file;
   return true;
 }
@@ -245,7 +259,90 @@ bool SpirvShaderLibrary::Append(FILE* file, const Shader::Translation& translati
          fwrite(payload.data(), 1, payload.size(), file) == payload.size();
 }
 
+namespace {
+struct LearnedCache {
+  std::mutex mutex;
+  SpirvShaderLibrary library;
+  FILE* append = nullptr;
+  bool initialized = false, opened = false;
+  uint64_t hits = 0, misses = 0, appended = 0, appended_bytes = 0;
+  std::set<std::array<uint64_t, 4>> written;
+};
+
+LearnedCache& Learned() {
+  static LearnedCache cache;
+  return cache;
+}
+
+// Called with the mutex held.
+void InitLearned(LearnedCache& c, uint64_t signature) {
+  if (c.initialized) return;
+  c.initialized = true;
+  const std::string path = REXCVAR_GET(ds2_shader_cache);
+  if (path.empty()) return;
+  std::filesystem::path full_path(path);
+  if (full_path.is_relative()) full_path = rex::filesystem::GetExecutableFolder() / full_path;
+  const auto start = std::chrono::steady_clock::now();
+  c.opened = c.library.Open(full_path, signature, true);
+  if (c.opened) {
+    c.append = rex::filesystem::OpenFile(full_path, "r+b");
+    if (c.append && fseek(c.append, long(c.library.valid_size()), SEEK_SET)) {
+      fclose(c.append);
+      c.append = nullptr;
+    }
+  } else {
+    // Missing, header-only or made by another translator build: start over.
+    c.append = rex::filesystem::OpenFile(full_path, "wb");
+    if (c.append && (!SpirvShaderLibrary::Begin(c.append) || fflush(c.append))) {
+      fclose(c.append);
+      c.append = nullptr;
+    }
+  }
+  const double open_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  REXGPU_INFO("[shader cache] {}: {} variants, translator signature {:016X}, open {:.2f} ms, appending {}",
+              full_path.string(), c.library.size(), signature, open_ms, c.append ? "on" : "OFF (cannot write)");
+}
+}  // namespace
+
+void RecordConfiguredSpirvCache(const Shader::Translation& translation, uint64_t signature) {
+  LearnedCache& c = Learned();
+  std::lock_guard lock(c.mutex);
+  InitLearned(c, signature);
+  if (!c.append) return;
+  const Shader& shader = translation.shader();
+  const std::array<uint64_t, 4> key = {shader.ucode_data_hash(), translation.modification(), signature,
+                                       uint64_t(shader.type())};
+  if (c.library.Contains(key[0], key[1], key[2], key[3]) || !c.written.insert(key).second) return;
+  const long before = ftell(c.append);
+  if (!SpirvShaderLibrary::Append(c.append, translation, signature) || fflush(c.append)) {
+    REXGPU_WARN("[shader cache] append failed; disabled for this session");
+    fclose(c.append);
+    c.append = nullptr;
+    return;
+  }
+  ++c.appended;
+  c.appended_bytes += uint64_t(ftell(c.append) - before);
+  if (c.appended <= 4 || c.appended % 128 == 0) {
+    REXGPU_INFO("[shader cache] {} new variants appended this session ({:.1f} MB)", c.appended,
+                c.appended_bytes / 1048576.0);
+  }
+}
+
 bool RestoreConfiguredSpirvLibrary(Shader::Translation& translation, uint64_t signature) {
+  {
+    LearnedCache& c = Learned();
+    std::lock_guard lock(c.mutex);
+    InitLearned(c, signature);
+    if (c.opened) {
+      const bool restored = c.library.Restore(translation, signature);
+      if (restored) ++c.hits; else ++c.misses;
+      if (c.hits + c.misses <= 8 || (c.hits + c.misses) % 256 == 0) {
+        REXGPU_INFO("[shader cache] {} hits, {} misses", c.hits, c.misses);
+      }
+      if (restored) return true;
+    }
+  }
   const std::string path = REXCVAR_GET(ds2_shader_library);
   if (path.empty()) return false;
   static std::mutex mutex;

@@ -97,8 +97,11 @@ uint64_t SpirvShaderTranslator::ShaderLibrarySignature() const {
 }
 
 bool SpirvShaderTranslator::TranslateAnalyzedShader(Shader::Translation& translation) {
-  if (RestoreConfiguredSpirvLibrary(translation, ShaderLibrarySignature())) return true;
-  return ShaderTranslator::TranslateAnalyzedShader(translation);
+  const uint64_t signature = ShaderLibrarySignature();
+  if (RestoreConfiguredSpirvLibrary(translation, signature)) return true;
+  const bool translated = ShaderTranslator::TranslateAnalyzedShader(translation);
+  if (translated) RecordConfiguredSpirvCache(translation, signature);
+  return translated;
 }
 
 uint64_t SpirvShaderTranslator::GetDefaultVertexShaderModification(

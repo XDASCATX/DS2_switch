@@ -92,6 +92,8 @@ REXCVAR_DEFINE_BOOL(ds2_native_gamma_ramp, true, "GPU",
                     "DS2 native renderer: apply the game's 256-entry gamma ramp when presenting (as the emulation)");
 REXCVAR_DEFINE_BOOL(ds2_native_textures_1d, true, "GPU",
                     "DS2 native renderer: sample 1D textures (false = white, as before RC63)");
+REXCVAR_DEFINE_BOOL(ds2_native_textures_cube, true, "GPU",
+                    "DS2 native renderer: sample cube textures (false = white, as before RC64)");
 REXCVAR_DEFINE_DOUBLE(ds2_native_present_gamma, 1.0, "GPU",
                       "DS2 native renderer: display gamma after the guest ramp, out = in^(1/value); 1.0 = as the "
                       "Xbox 360 output, above 1.0 brightens dark tones (TV vs. handheld screen)")
@@ -409,6 +411,8 @@ struct NativeImage {
   VkFormat format = VK_FORMAT_UNDEFINED;
   uint32_t width = 0, height = 0;
   uint32_t levels = 1;
+  uint32_t layers = 1;  // 6 for a cube
+  bool cube = false;
   bool depth = false;
   bool initialized = false;  // transitioned to GENERAL
 };
@@ -659,6 +663,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t content_hash = 0;
     uint64_t last_check_frame = 0;
     uint64_t last_use_frame = 0;
+    uint64_t resolve_signature = 0;  // cube faces copied from resolve targets: their generations
     std::unordered_map<uint32_t, VkImageView> swizzle_views;
   };
   struct ResolveLogicalImage {
@@ -683,7 +688,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t draws = 0, draws_skipped = 0, draws_unsupported_prim = 0, draws_failed = 0;
     uint64_t copies = 0, clears = 0, swaps = 0, swaps_presented = 0;
     uint64_t texture_uploads = 0, texture_unsupported = 0, texture_from_resolve = 0;
-    uint64_t texture_1d = 0, texture_white_dimension = 0;
+    uint64_t texture_1d = 0, texture_white_dimension = 0, texture_cube = 0, cube_faces_from_resolves = 0;
     uint64_t upload_bytes = 0, pipelines = 0, render_passes_begun = 0;
     uint64_t prim_counts[32] = {};
     uint64_t conversions = 0, texture_levels = 0, texture_upload_bytes = 0, submits = 0;
@@ -716,7 +721,7 @@ class NativeCommandProcessor final : public CommandProcessor {
   void ResolveBarrier(NativeImage& src, NativeImage& dst, bool before);
   void EndRenderPass();
   bool CreateImage(NativeImage& img, VkFormat format, uint32_t w, uint32_t h, bool depth, VkImageUsageFlags usage,
-                   uint32_t levels = 1);
+                   uint32_t levels = 1, bool cube = false);
   void DestroyImage(NativeImage& img, bool deferred);
   void EnsureGeneral(NativeImage& img);
   NativeImage* GetRenderTarget(uint32_t base, uint32_t pitch, uint32_t format, bool depth, uint32_t height_hint);
@@ -792,6 +797,8 @@ class NativeCommandProcessor final : public CommandProcessor {
   std::unordered_map<uint64_t, TextureEntry> textures_;
   std::unordered_map<uint32_t, ResolvedEntry> resolved_;
   NativeImage white_;
+  NativeImage white_cube_;  // RC63+: cube bindings need a cube view (a 2D view there is undefined on NVK)
+  VkImageView GetCubeTextureView(const xenos::xe_gpu_texture_fetch_t& fetch);
   // Format reinterpretation passes.
   VkShaderModule convert_vs_ = VK_NULL_HANDLE;
   VkShaderModule convert_fs_[kConvertModeCount] = {};
@@ -1042,6 +1049,15 @@ bool NativeCommandProcessor::SetupContext() {
     Barrier();
   }
   white_view_ = white_.view;
+  if (CreateImage(white_cube_, VK_FORMAT_R8G8B8A8_UNORM, 1, 1, false,
+                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 1, true)) {
+    EnsureGeneral(white_cube_);
+    VkClearColorValue c = {};
+    c.float32[0] = c.float32[1] = c.float32[2] = c.float32[3] = 1.0f;
+    VkImageSubresourceRange r = ui::vulkan::util::InitializeSubresourceRange();
+    dfn().vkCmdClearColorImage(slot().cmd, white_cube_.image, VK_IMAGE_LAYOUT_GENERAL, &c, 1, &r);
+    Barrier();
+  }
   if (!SetupConversions()) {
     REXGPU_WARN("[native] format reinterpretation passes unavailable");
   }
@@ -1072,6 +1088,7 @@ void NativeCommandProcessor::ShutdownContext() {
     DestroyImage(r.image, false);
   }
   DestroyImage(white_, false);
+  DestroyImage(white_cube_, false);
   DestroyImage(color_resolve_scratch_, false);
   for (auto& [k, p] : convert_pipelines_) dfn().vkDestroyPipeline(dev, p, nullptr);
   for (uint32_t i = 0; i < 2; ++i) {
@@ -1403,13 +1420,14 @@ void NativeCommandProcessor::EndRenderPass() {
 }
 
 bool NativeCommandProcessor::CreateImage(NativeImage& img, VkFormat format, uint32_t w, uint32_t h, bool depth,
-                                         VkImageUsageFlags usage, uint32_t levels) {
+                                         VkImageUsageFlags usage, uint32_t levels, bool cube) {
   VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   ci.imageType = VK_IMAGE_TYPE_2D;
+  if (cube) ci.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
   ci.format = format;
   ci.extent = {std::max(w, 1u), std::max(h, 1u), 1};
   ci.mipLevels = std::max(levels, 1u);
-  ci.arrayLayers = 1;
+  ci.arrayLayers = cube ? 6 : 1;
   ci.samples = VK_SAMPLE_COUNT_1_BIT;
   ci.tiling = VK_IMAGE_TILING_OPTIMAL;
   ci.usage = usage;
@@ -1423,7 +1441,7 @@ bool NativeCommandProcessor::CreateImage(NativeImage& img, VkFormat format, uint
   }
   VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
   vci.image = img.image;
-  vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  vci.viewType = cube ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D;
   vci.format = format;
   vci.subresourceRange = ui::vulkan::util::InitializeSubresourceRange(
       depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT);
@@ -1444,6 +1462,8 @@ bool NativeCommandProcessor::CreateImage(NativeImage& img, VkFormat format, uint
   img.width = ci.extent.width;
   img.height = ci.extent.height;
   img.levels = ci.mipLevels;
+  img.layers = ci.arrayLayers;
+  img.cube = cube;
   img.depth = depth;
   img.initialized = false;
   return true;
@@ -2279,7 +2299,7 @@ VkImageView NativeCommandProcessor::GetSwizzleView(std::unordered_map<uint32_t, 
   // swizzle: bits 0-11 guest swizzle, 12-23 host swizzle.
   VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
   vci.image = image.image;
-  vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  vci.viewType = image.cube ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D;
   vci.format = image.format;
   const uint32_t guest = swizzle & 0xFFF, host = swizzle >> 12;
   vci.components.r = SwizzleComponent(guest, host, 0);
@@ -2366,6 +2386,19 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
   // RC63: 1D textures (the translator binds tfetch1D as a 2D array, so dimension is k2D here) are a 2D image one
   // row tall. Before RC63 every 1D fetch read the white 1x1 texture (e.g. DS2's 256-entry tone curve).
   const bool is_1d = fetch.dimension == xenos::DataDimension::k1D && REXCVAR_GET(ds2_native_textures_1d);
+  if (dimension == xenos::FetchOpDimension::kCube) {
+    // RC64: cube maps (DS2 materials: specular/ambient cube tf9 with register LOD). Before RC64 the 2D white view
+    // was bound to a cube binding: undefined on NVK (dark or unstable lighting).
+    if (fetch.type == xenos::FetchConstantType::kTexture && fetch.dimension == xenos::DataDimension::kCube &&
+        REXCVAR_GET(ds2_native_textures_cube) && REXCVAR_GET(ds2_native_textures)) {
+      if (VkImageView v = GetCubeTextureView(fetch)) {
+        ++stats_.texture_cube;
+        return v;
+      }
+    }
+    ++stats_.texture_white_dimension;
+    return white_cube_.view ? white_cube_.view : white_view_;
+  }
   if (fetch.type != xenos::FetchConstantType::kTexture || dimension != xenos::FetchOpDimension::k2D ||
       (fetch.dimension != xenos::DataDimension::k2DOrStacked && !is_1d)) {
     if (fetch.type == xenos::FetchConstantType::kTexture) ++stats_.texture_white_dimension;
@@ -2543,6 +2576,196 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
   stats_.texture_levels += levels;
   stats_.texture_upload_bytes += total;
   return GetSwizzleView(t.swizzle_views, t.image, fetch.swizzle | (fi.host_swizzle << 12));
+}
+
+// RC64: a guest cube texture (6 faces as array slices, tiled or linear, packed mips per face) as a Vulkan cube.
+// Faces the game rendered and resolved this session (native images, not in guest memory) are copied from the
+// resolve targets at the face addresses; the others come from guest memory.
+VkImageView NativeCommandProcessor::GetCubeTextureView(const xenos::xe_gpu_texture_fetch_t& fetch) {
+  TextureFormatInfo fi;
+  if (!GetTextureFormat(fetch.format, fi)) {
+    ++stats_.texture_unsupported;
+    return VK_NULL_HANDLE;
+  }
+  const uint32_t base = uint32_t(fetch.base_address) << 12;
+  const uint32_t width = fetch.size_2d.width + 1, height = fetch.size_2d.height + 1;
+  uint32_t base_page = 0, mip_page = 0, mip_min_level = 0, mip_max_level = 0;
+  texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, &base_page, &mip_page,
+                                                 &mip_min_level, &mip_max_level);
+  if (!REXCVAR_GET(ds2_native_mips) || !mip_page) mip_max_level = 0;
+  const uint32_t levels = mip_max_level + 1;
+  const uint32_t key_words[6] = {fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_5, levels, 0xC0BEu};
+  const uint64_t key = XXH3_64bits(key_words, sizeof(key_words)) ^ (uint64_t(fetch.endianness) << 60);
+  TextureEntry& t = textures_[key];
+  t.last_use_frame = frame_;
+  const texture_util::TextureGuestLayout layout = texture_util::GetGuestTextureLayout(
+      xenos::DataDimension::kCube, fetch.pitch, width, height, 6, fetch.tiled, fetch.format, fetch.packed_mips, true,
+      levels - 1);
+  const uint32_t face_stride = layout.base.array_slice_stride_bytes;
+  const uint8_t* guest = memory_->TranslatePhysical<const uint8_t*>(base);
+  if (!guest || !face_stride) return VK_NULL_HANDLE;
+  const uint8_t* guest_mips = nullptr;
+  if (levels > 1) {
+    guest_mips = memory_->TranslatePhysical<const uint8_t*>(mip_page << 12);
+    if (!guest_mips || !layout.mips_total_extent_bytes) return VK_NULL_HANDLE;
+  }
+  // Faces (any level, not inside a packed mip tail) the game resolved: same format, at least the level size.
+  // DS2 renders its environment cubes this way (64x64 faces 0x4000 apart, mips 32/16/8 resolved separately).
+  ResolvedEntry* face_resolves[xenos::kTextureMaxMips + 1][6] = {};
+  uint64_t resolve_signature = 0;
+  for (uint32_t l = 0; l < levels; ++l) {
+    if (fetch.packed_mips && l >= layout.packed_level) break;
+    const uint32_t stored = l == 0 ? 0 : std::min(l, layout.packed_level);
+    const auto& ll = l == 0 ? layout.base : layout.mips[stored];
+    const uint32_t level_base = l == 0 ? base : (mip_page << 12) + layout.mip_offsets_bytes[stored];
+    const uint32_t lw = std::max(width >> l, 1u), lh = std::max(height >> l, 1u);
+    for (uint32_t f = 0; f < 6; ++f) {
+      auto rit = resolved_.find(level_base + f * ll.array_slice_stride_bytes);
+      if (rit == resolved_.end() || rit->second.image.depth || rit->second.image.format != fi.format ||
+          rit->second.image.width < lw || rit->second.image.height < lh) {
+        continue;
+      }
+      face_resolves[l][f] = &rit->second;
+      rit->second.frame = frame_;
+      resolve_signature = resolve_signature * 1000003u + rit->second.generation + 1 + f + 7 * l;
+    }
+  }
+  const uint32_t swz = fetch.swizzle | (fi.host_swizzle << 12);
+  const bool need_check = !t.image.image || frame_ - t.last_check_frame >= 30 || resolve_signature != t.resolve_signature;
+  if (!need_check) return GetSwizzleView(t.swizzle_views, t.image, swz);
+  ScopedUs texture_timer(stats_.us_textures);
+  t.last_check_frame = frame_;
+  const size_t base_extent = size_t(face_stride) * 6;
+  uint64_t content = XXH3_64bits(guest, std::min<size_t>(base_extent, 64 << 20)) ^ resolve_signature * 0x9E3779B97F4A7C15ull;
+  if (guest_mips) content ^= XXH3_64bits(guest_mips, std::min<size_t>(layout.mips_total_extent_bytes, 64 << 20)) * 31;
+  if (t.image.image && content == t.content_hash) {
+    t.resolve_signature = resolve_signature;
+    return GetSwizzleView(t.swizzle_views, t.image, swz);
+  }
+  if (!t.image.image) {
+    if (!CreateImage(t.image, fi.format, width, height, false,
+                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, levels, true)) {
+      DestroyImage(t.image, false);
+      textures_.erase(key);
+      return VK_NULL_HANDLE;
+    }
+  }
+  t.content_hash = content;
+  t.resolve_signature = resolve_signature;
+  const uint32_t bpb_log2 = rex::log2_floor(fi.bytes_per_block);
+  // Upload buffer: level-major, then face.
+  VkDeviceSize face_offsets[xenos::kTextureMaxMips + 1][6];
+  VkDeviceSize total = 0;
+  for (uint32_t l = 0; l < levels; ++l) {
+    const uint32_t lbw = (std::max(width >> l, 1u) + fi.block_size - 1) / fi.block_size;
+    const uint32_t lbh = (std::max(height >> l, 1u) + fi.block_size - 1) / fi.block_size;
+    for (uint32_t f = 0; f < 6; ++f) {
+      face_offsets[l][f] = total;
+      total += rex::align<VkDeviceSize>(VkDeviceSize(lbw) * lbh * fi.bytes_per_block, 16);
+    }
+  }
+  VkDeviceSize offset;
+  uint8_t* dst_all = Upload(total, 16, offset);
+  if (!dst_all) return VK_NULL_HANDLE;
+  auto copy_face = [&](uint8_t* dst, uint32_t lbw, uint32_t lbh, const uint8_t* src, size_t src_size,
+                       uint32_t row_pitch_bytes, uint32_t ox, uint32_t oy) {
+    const size_t row_bytes = size_t(lbw) * fi.bytes_per_block;
+    const uint32_t pitch_blocks = row_pitch_bytes >> bpb_log2;
+    for (uint32_t y = 0; y < lbh; ++y) {
+      uint8_t* row = dst + row_bytes * y;
+      if (fetch.tiled) {
+        for (uint32_t x = 0; x < lbw; ++x) {
+          const int32_t o = texture_util::GetTiledOffset2D(int32_t(x + ox), int32_t(y + oy), pitch_blocks, bpb_log2);
+          if (o < 0 || size_t(o) + fi.bytes_per_block > src_size) {
+            std::memset(row + size_t(x) * fi.bytes_per_block, 0, fi.bytes_per_block);
+            continue;
+          }
+          std::memcpy(row + size_t(x) * fi.bytes_per_block, src + o, fi.bytes_per_block);
+        }
+      } else {
+        const size_t so = size_t(y + oy) * row_pitch_bytes + size_t(ox) * fi.bytes_per_block;
+        if (so + row_bytes <= src_size) {
+          std::memcpy(row, src + so, row_bytes);
+        } else {
+          std::memset(row, 0, row_bytes);
+        }
+      }
+      SwapElements(row, row_bytes, fetch.endianness);
+    }
+  };
+  for (uint32_t l = 0; l < levels; ++l) {
+    const uint32_t lbw = (std::max(width >> l, 1u) + fi.block_size - 1) / fi.block_size;
+    const uint32_t lbh = (std::max(height >> l, 1u) + fi.block_size - 1) / fi.block_size;
+    const bool is_base = l == 0;
+    const uint32_t stored = is_base ? 0 : std::min(l, layout.packed_level);
+    const auto& ll = is_base ? layout.base : layout.mips[stored];
+    uint32_t ox = 0, oy = 0, oz = 0;
+    if (fetch.packed_mips && l >= layout.packed_level) {
+      texture_util::GetPackedMipOffset(width, height, 1, fetch.format, l, ox, oy, oz);
+    }
+    const uint8_t* level_src = is_base ? guest : guest_mips + layout.mip_offsets_bytes[stored];
+    const size_t level_size = is_base ? base_extent
+                              : (layout.mip_offsets_bytes[stored] < layout.mips_total_extent_bytes
+                                     ? layout.mips_total_extent_bytes - layout.mip_offsets_bytes[stored]
+                                     : 0);
+    for (uint32_t f = 0; f < 6; ++f) {
+      uint8_t* dst = dst_all + face_offsets[l][f];
+      const size_t face_off = size_t(f) * ll.array_slice_stride_bytes;
+      if (!level_size || face_off >= level_size) {
+        std::memset(dst, 0, size_t(lbw) * lbh * fi.bytes_per_block);
+        continue;
+      }
+      copy_face(dst, lbw, lbh, level_src + face_off, level_size - face_off, ll.row_pitch_bytes, ox, oy);
+    }
+  }
+  EndRenderPass();
+  EnsureGeneral(t.image);
+  Barrier();
+  if (profiling_) Mark("texture upload cube");
+  std::vector<VkBufferImageCopy> regions;
+  regions.reserve(levels * 6);
+  for (uint32_t l = 0; l < levels; ++l) {
+    const uint32_t lw = std::max(width >> l, 1u), lh = std::max(height >> l, 1u);
+    for (uint32_t f = 0; f < 6; ++f) {
+      if (face_resolves[l][f]) continue;
+      VkBufferImageCopy r = {};
+      r.bufferOffset = offset + face_offsets[l][f];
+      r.bufferRowLength = (lw + fi.block_size - 1) / fi.block_size * fi.block_size;
+      r.bufferImageHeight = (lh + fi.block_size - 1) / fi.block_size * fi.block_size;
+      r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, f, 1};
+      r.imageExtent = {lw, lh, 1};
+      regions.push_back(r);
+    }
+  }
+  if (!regions.empty()) {
+    dfn().vkCmdCopyBufferToImage(slot().cmd, slot().upload, t.image.image, VK_IMAGE_LAYOUT_GENERAL,
+                                 uint32_t(regions.size()), regions.data());
+  }
+  uint32_t faces_resolved = 0;
+  for (uint32_t l = 0; l < levels; ++l) {
+    for (uint32_t f = 0; f < 6; ++f) {
+      if (!face_resolves[l][f]) continue;
+      VkImageCopy c = {};
+      c.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, f, 1};
+      c.extent = {std::max(width >> l, 1u), std::max(height >> l, 1u), 1};
+      cmd_copy_image_(slot().cmd, face_resolves[l][f]->image.image, VK_IMAGE_LAYOUT_GENERAL, t.image.image,
+                      VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+      ++faces_resolved;
+    }
+  }
+  stats_.cube_faces_from_resolves += faces_resolved;
+  Barrier();
+  ++stats_.texture_uploads;
+  stats_.texture_levels += levels * 6;
+  stats_.texture_upload_bytes += total;
+  if (Tracing()) {
+    REXGPU_INFO("[native trace]   cube {:08X} mips {:08X} fmt {} {}x{} levels {} face stride {:X} tiled {} packed {} "
+                "faces from resolves {} of {}",
+                base, mip_page << 12, uint32_t(fetch.format), width, height, levels, face_stride,
+                uint32_t(fetch.tiled), uint32_t(fetch.packed_mips), faces_resolved, levels * 6);
+  }
+  return GetSwizzleView(t.swizzle_views, t.image, swz);
 }
 
 // --- Shaders ----------------------------------------------------------------------------------------------------
@@ -4231,8 +4454,10 @@ void NativeCommandProcessor::LogStats() {
       stats_.texture_from_resolve / n, stats_.texture_unsupported / n, stats_.upload_bytes / n / 1048576.0,
       pipelines_.size(), render_targets_.size(), textures_.size(), resolved_.size(), stats_.swaps_presented,
       stats_.swaps);
-  REXGPU_INFO("[native] texture fetches/frame: {:.1f} 1D, {:.1f} white (3D/cube/other dimension)",
-              stats_.texture_1d / n, stats_.texture_white_dimension / n);
+  REXGPU_INFO("[native] texture fetches/frame: {:.1f} 1D, {:.1f} cube ({:.2f} faces copied from resolves), "
+              "{:.1f} white (3D/unsupported cube/other dimension)",
+              stats_.texture_1d / n, stats_.texture_cube / n, stats_.cube_faces_from_resolves / n,
+              stats_.texture_white_dimension / n);
   std::string prims;
   for (uint32_t i = 0; i < 32; ++i) {
     if (stats_.prim_counts[i]) prims += fmt::format(" {}:{:.0f}", i, stats_.prim_counts[i] / n);
