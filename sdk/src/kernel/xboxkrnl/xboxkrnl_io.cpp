@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 
 #include <rex/cvar.h>
@@ -339,6 +340,14 @@ inline void AnotarApertura(uint64_t us, bool ok, const std::string_view ruta) {
   }
   g_io.us_aperturas.fetch_add(us, std::memory_order_relaxed);
   MaxAtomico(g_io.us_apertura_peor, us);
+  // DS2: which calibration (regulation) the game reads - disc file or the copy kept in the save.
+  {
+    std::string lower(ruta);
+    for (char& ch : lower) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+    if (lower.find("regulation") != std::string::npos || lower.find("user_data15") != std::string::npos) {
+      REXKRNL_INFO("[io] regulation: abrir '{}' ({}, {:.1f} ms)", ruta, ok ? "abierto" : "no existe", us / 1000.0);
+    }
+  }
 
   const int32_t aviso_ms = REXCVAR_GET(nfsmw_io_aviso_ms);
   if (aviso_ms > 0 && us >= static_cast<uint64_t>(aviso_ms) * 1000ull &&

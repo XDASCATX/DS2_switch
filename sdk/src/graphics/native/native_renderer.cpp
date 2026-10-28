@@ -2672,12 +2672,19 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   auto* vst = static_cast<VulkanShader::VulkanTranslation*>(vs->GetOrCreateTranslation(vs_mod.value));
   auto* pst = ps ? static_cast<VulkanShader::VulkanTranslation*>(ps->GetOrCreateTranslation(ps_mod.value)) : nullptr;
-  auto plan_it = native_vertex_layouts_.find(vs->ucode_data_hash());
-  if (plan_it == native_vertex_layouts_.end()) {
-    plan_it = native_vertex_layouts_.emplace(vs->ucode_data_hash(), BuildNativeVertexLayout(*vs)).first;
+  // RC63: the layout is analysed only when the experimental path is on (RC62 console logs: 0 % eligible draws).
+  static const NativeVertexLayout kNoNativeVertexLayout;
+  const bool native_vertex_cvar = REXCVAR_GET(ds2_native_vertex_inputs);
+  const NativeVertexLayout* native_plan_ptr = &kNoNativeVertexLayout;
+  if (native_vertex_cvar) {
+    auto plan_it = native_vertex_layouts_.find(vs->ucode_data_hash());
+    if (plan_it == native_vertex_layouts_.end()) {
+      plan_it = native_vertex_layouts_.emplace(vs->ucode_data_hash(), BuildNativeVertexLayout(*vs)).first;
+    }
+    native_plan_ptr = &plan_it->second;
   }
-  const NativeVertexLayout& native_plan = plan_it->second;
-  bool native_vertex = REXCVAR_GET(ds2_native_vertex_inputs) && native_plan.valid &&
+  const NativeVertexLayout& native_plan = *native_plan_ptr;
+  bool native_vertex = native_vertex_cvar && native_plan.valid &&
       prim_type == xenos::PrimitiveType::kTriangleList &&
       !regs.Get<reg::PA_SU_SC_MODE_CNTL>().multi_prim_ib_ena &&
       regs.Get<int32_t>(XE_GPU_REG_VGT_INDX_OFFSET) == 0 &&
