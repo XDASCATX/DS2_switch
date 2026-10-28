@@ -90,6 +90,10 @@ REXCVAR_DEFINE_INT32(ds2_native_texture_keep_frames, 600, "GPU",
     .range(30, 100000);
 REXCVAR_DEFINE_BOOL(ds2_native_gamma_ramp, true, "GPU",
                     "DS2 native renderer: apply the game's 256-entry gamma ramp when presenting (as the emulation)");
+REXCVAR_DEFINE_DOUBLE(ds2_native_present_gamma, 1.0, "GPU",
+                      "DS2 native renderer: display gamma after the guest ramp, out = in^(1/value); 1.0 = as the "
+                      "Xbox 360 output, above 1.0 brightens dark tones (TV vs. handheld screen)")
+    .range(0.5, 2.5);
 REXCVAR_DEFINE_BOOL(ds2_native_textures, true, "GPU",
                     "DS2 native renderer: load guest textures (false = a white 1x1 texture everywhere, for "
                     "checking geometry)");
@@ -353,7 +357,7 @@ void main() {
 constexpr const char* kPresentShader = R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D t;
 layout(set = 0, binding = 1) uniform Ramp { uvec4 lut[64]; } ramp;
-layout(push_constant) uniform P { vec2 scale; int use_ramp; int pad; } pc;
+layout(push_constant) uniform P { vec2 scale; int use_ramp; float inv_gamma; } pc;
 layout(location = 0) out vec4 o;
 void main() {
   vec4 c = texelFetch(t, ivec2(gl_FragCoord.xy * pc.scale), 0);
@@ -364,6 +368,7 @@ void main() {
     uint b = ramp.lut[i.b >> 2][i.b & 3u];
     c.rgb = vec3(float((r >> 20) & 1023u), float((g >> 10) & 1023u), float(b & 1023u)) / 1023.0;
   }
+  if (pc.inv_gamma != 1.0) c.rgb = pow(clamp(c.rgb, 0.0, 1.0), vec3(pc.inv_gamma));
   o = vec4(c.rgb, 1.0);
 }
 )";
@@ -735,6 +740,8 @@ class NativeCommandProcessor final : public CommandProcessor {
   NativeImage* PrepareColorResolve(NativeImage& src, const VkRect2D& rect, int32_t exp_bias);
   void AdoptRenderTarget(uint32_t base, uint32_t pitch, uint64_t key, NativeImage& img);
   void LogStats();
+  void LogGammaRamp();
+  uint64_t last_gamma_ramp_hash_ = 0;
   void DumpImages();
   void EvictTextures();
   // GPU profile: a timestamp that ends the current segment and starts one labelled `label`.
@@ -1320,6 +1327,22 @@ bool NativeCommandProcessor::UploadImmutable(const void* data, size_t size, VkDe
   std::memcpy(dst, data, size);
   if (cache) slot().content_cache.Insert(hash, tag, size, offset);
   return true;
+}
+
+// Logs the guest 256-entry gamma ramp whenever the game changes it (brightness setting, fades).
+void NativeCommandProcessor::LogGammaRamp() {
+  const auto* table = gamma_ramp_256_entry_table();
+  const uint64_t hash = XXH3_64bits(table, 256 * 4);
+  if (hash == last_gamma_ramp_hash_) return;
+  last_gamma_ramp_hash_ = hash;
+  std::string text;
+  for (uint32_t i : {0u, 16u, 32u, 64u, 96u, 128u, 192u, 255u}) {
+    uint32_t v;
+    std::memcpy(&v, &table[i], 4);
+    text += fmt::format(" {}:{}/{}/{}", i, (v >> 20) & 1023, (v >> 10) & 1023, v & 1023);
+  }
+  REXGPU_INFO("[native] gamma ramp (index:R/G/B of 1023){}; present gamma {:.2f}", text,
+              REXCVAR_GET(ds2_native_present_gamma));
 }
 
 void NativeCommandProcessor::Barrier() {
@@ -3924,8 +3947,10 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           struct {
             float scale[2];
             int32_t use_ramp;
-            int32_t pad;
-          } pc = {{1.0f, 1.0f}, REXCVAR_GET(ds2_native_gamma_ramp) ? 1 : 0, 0};
+            float inv_gamma;
+          } pc = {{1.0f, 1.0f}, REXCVAR_GET(ds2_native_gamma_ramp) ? 1 : 0,
+                  float(1.0 / std::clamp(REXCVAR_GET(ds2_native_present_gamma), 0.5, 2.5))};
+          LogGammaRamp();
           dfn().vkCmdPushConstants(cmd, present_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
           VkViewport vpp = {0.0f, 0.0f, float(w), float(h), 0.0f, 1.0f};
           VkRect2D sr = {{0, 0}, {w, h}};
