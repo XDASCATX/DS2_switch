@@ -92,6 +92,9 @@ REXCVAR_DEFINE_BOOL(ds2_native_gamma_ramp, true, "GPU",
                     "DS2 native renderer: apply the game's 256-entry gamma ramp when presenting (as the emulation)");
 REXCVAR_DEFINE_BOOL(ds2_native_textures_1d, true, "GPU",
                     "DS2 native renderer: sample 1D textures (false = white, as before RC63)");
+REXCVAR_DEFINE_BOOL(ds2_native_depth_from_rgba8, true, "GPU",
+                    "DS2 native renderer: decode k_24_8/k_24_8_FLOAT fetches of 8888 depth resolves to R32F depth "
+                    "(shadow maps, depth effects); false = raw bytes as before RC64");
 REXCVAR_DEFINE_BOOL(ds2_native_textures_cube, true, "GPU",
                     "DS2 native renderer: sample cube textures (false = white, as before RC64)");
 REXCVAR_DEFINE_DOUBLE(ds2_native_present_gamma, 1.0, "GPU",
@@ -271,6 +274,7 @@ enum ConvertMode : uint32_t {
   kConvertFloat7e3ToUnorm10, // k_2_10_10_10_FLOAT (RGBA16F image) -> its bits as k_2_10_10_10 (A2B10G10R10)
   kConvertUnorm10ToFloat7e3, // the reverse
   kConvertResolveColorRgba8, // numeric float color resolve, including copy exponent bias and UNORM8 packing
+  kConvertRgba8ToDepth,      // RC64: guest 32-bit depth word stored as RGBA8 -> R32F depth for k_24_8(_FLOAT) fetches
   kConvertModeCount,
 };
 
@@ -354,6 +358,27 @@ void main() {
   // Source render-target color_exp_bias was already applied by the guest draw.
   c = clamp(c * exp2(float(pc.exp_bias)), 0.0, 1.0);
   o = floor(c * 255.0 + 0.5) / 255.0;
+}
+)",
+    R"(layout(set = 0, binding = 0) uniform sampler2D t;
+// The guest word is (depth24 << 8) | stencil; kConvertDepthToRgba8 stored it as R = bits 0-7 ... A = bits 24-31.
+float DF24(uint f) {
+  f &= 0xFFFFFFu;
+  if (f == 0u) return 0.0;
+  uint m = f & 0xFFFFFu, e = f >> 20;
+  if (e == 0u) {
+    uint lz = 31u - uint(findMSB(m)) - 11u;
+    e = uint(1 - int(lz));
+    m = (m << lz) & 0xFFFFFu;
+  }
+  return uintBitsToFloat(((e + 112u) << 23) | (m << 3));
+}
+void main() {
+  vec4 c = texelFetch(t, ivec2(gl_FragCoord.xy) + pc.src_minus_dst, 0);
+  uvec4 b = uvec4(clamp(c, 0.0, 1.0) * 255.0 + 0.5);
+  uint z24 = (b.a << 16) | (b.b << 8) | b.g;
+  float z = pc.float24 != 0 ? DF24(z24) : float(z24 + (z24 >> 23)) * (1.0 / 16777216.0);
+  o = vec4(z);
 }
 )",
 };
@@ -683,12 +708,15 @@ class NativeCommandProcessor final : public CommandProcessor {
     // Guest fetch dimensions may be smaller than the tiled pitch or 8-row resolve rectangle.
     // Keep the root image unchanged: sub-resolves still write into the complete atlas.
     std::unordered_map<uint64_t, ResolveLogicalImage> logical_images;
+    // RC64: R32F depth decoded from an RGBA8 depth resolve, per (width, height, float24).
+    std::unordered_map<uint64_t, ResolveLogicalImage> depth_decoded;
   };
   struct Stats {
     uint64_t draws = 0, draws_skipped = 0, draws_unsupported_prim = 0, draws_failed = 0;
     uint64_t copies = 0, clears = 0, swaps = 0, swaps_presented = 0;
     uint64_t texture_uploads = 0, texture_unsupported = 0, texture_from_resolve = 0;
     uint64_t texture_1d = 0, texture_white_dimension = 0, texture_cube = 0, cube_faces_from_resolves = 0;
+    uint64_t depth_decoded_fetches = 0, depth_decodes = 0;
     uint64_t upload_bytes = 0, pipelines = 0, render_passes_begun = 0;
     uint64_t prim_counts[32] = {};
     uint64_t conversions = 0, texture_levels = 0, texture_upload_bytes = 0, submits = 0;
@@ -799,6 +827,8 @@ class NativeCommandProcessor final : public CommandProcessor {
   NativeImage white_;
   NativeImage white_cube_;  // RC63+: cube bindings need a cube view (a 2D view there is undefined on NVK)
   VkImageView GetCubeTextureView(const xenos::xe_gpu_texture_fetch_t& fetch);
+  VkImageView GetResolveDepthView(ResolvedEntry& entry, uint32_t width, uint32_t height, bool float24,
+                                  uint32_t guest_swizzle);
   // Format reinterpretation passes.
   VkShaderModule convert_vs_ = VK_NULL_HANDLE;
   VkShaderModule convert_fs_[kConvertModeCount] = {};
@@ -2326,6 +2356,17 @@ void NativeCommandProcessor::DestroyResolveLogicalImages(ResolvedEntry& entry, b
     DestroyImage(logical.image, deferred);
   }
   entry.logical_images.clear();
+  for (auto& [key, decoded] : entry.depth_decoded) {
+    for (auto& [swizzle, view] : decoded.swizzle_views) {
+      if (deferred) {
+        slot().deferred_views.push_back(view);
+      } else {
+        dfn().vkDestroyImageView(vulkan_device_->device(), view, nullptr);
+      }
+    }
+    DestroyImage(decoded.image, deferred);
+  }
+  entry.depth_decoded.clear();
 }
 
 NativeCommandProcessor::ResolveLogicalImage* NativeCommandProcessor::GetResolveLogicalImage(
@@ -2432,6 +2473,18 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
     if (rit->second.rb_swapped && !rit->second.image.depth) {
       const uint32_t h[4] = {host & 7, (host >> 3) & 7, (host >> 6) & 7, (host >> 9) & 7};
       host = h[2] | (h[1] << 3) | (h[0] << 6) | (h[3] << 9);
+    }
+    // RC64: k_24_8 / k_24_8_FLOAT sampled from a depth word the game resolved into an 8888 surface (shadow
+    // maps 1024/1600, scene depth 1280x720/640x360 for fog, DOF and soft particles). Before RC64 the shader read
+    // the raw bytes (R = stencil): shadows let light through walls, depth effects drew halos.
+    if ((fetch.format == xenos::TextureFormat::k_24_8 || fetch.format == xenos::TextureFormat::k_24_8_FLOAT) &&
+        !rit->second.image.depth && rit->second.image.format == VK_FORMAT_R8G8B8A8_UNORM &&
+        REXCVAR_GET(ds2_native_depth_from_rgba8)) {
+      if (VkImageView v = GetResolveDepthView(rit->second, width, height,
+                                              fetch.format == xenos::TextureFormat::k_24_8_FLOAT, fetch.swizzle)) {
+        ++stats_.depth_decoded_fetches;
+        return v;
+      }
     }
     if (ResolveLogicalImage* logical = GetResolveLogicalImage(rit->second, width, height)) {
       return GetSwizzleView(logical->swizzle_views, logical->image, fetch.swizzle | (host << 12));
@@ -2576,6 +2629,34 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
   stats_.texture_levels += levels;
   stats_.texture_upload_bytes += total;
   return GetSwizzleView(t.swizzle_views, t.image, fetch.swizzle | (fi.host_swizzle << 12));
+}
+
+VkImageView NativeCommandProcessor::GetResolveDepthView(ResolvedEntry& entry, uint32_t width, uint32_t height,
+                                                       bool float24, uint32_t guest_swizzle) {
+  if (!convert_fs_[kConvertRgba8ToDepth]) return VK_NULL_HANDLE;
+  // Logical (fetch) size in the resolve's sample space, clamped to the image.
+  const uint32_t w = std::min<uint32_t>(width * entry.sample_scale_x, entry.image.width);
+  const uint32_t h = std::min<uint32_t>(height * entry.sample_scale_y, entry.image.height);
+  if (!w || !h) return VK_NULL_HANDLE;
+  const uint64_t key = uint64_t(w) | (uint64_t(h) << 24) | (uint64_t(float24) << 48);
+  ResolveLogicalImage& d = entry.depth_decoded[key];
+  if (!d.image.image) {
+    if (!CreateImage(d.image, VK_FORMAT_R32_SFLOAT, w, h, false,
+                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
+      DestroyImage(d.image, false);
+      entry.depth_decoded.erase(key);
+      return VK_NULL_HANDLE;
+    }
+    EnsureGeneral(d.image);
+  }
+  if (d.generation != entry.generation) {
+    if (!Convert(kConvertRgba8ToDepth, entry.image, d.image, 0, 0, {{0, 0}, {w, h}}, float24)) {
+      return VK_NULL_HANDLE;
+    }
+    d.generation = entry.generation;
+    ++stats_.depth_decodes;
+  }
+  return GetSwizzleView(d.swizzle_views, d.image, guest_swizzle | (uint32_t(xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR) << 12));
 }
 
 // RC64: a guest cube texture (6 faces as array slices, tiled or linear, packed mips per face) as a Vulkan cube.
@@ -4455,9 +4536,9 @@ void NativeCommandProcessor::LogStats() {
       pipelines_.size(), render_targets_.size(), textures_.size(), resolved_.size(), stats_.swaps_presented,
       stats_.swaps);
   REXGPU_INFO("[native] texture fetches/frame: {:.1f} 1D, {:.1f} cube ({:.2f} faces copied from resolves), "
-              "{:.1f} white (3D/unsupported cube/other dimension)",
+              "{:.1f} white (3D/unsupported cube/other dimension), {:.1f} depth from 8888 ({:.2f} decodes)",
               stats_.texture_1d / n, stats_.texture_cube / n, stats_.cube_faces_from_resolves / n,
-              stats_.texture_white_dimension / n);
+              stats_.texture_white_dimension / n, stats_.depth_decoded_fetches / n, stats_.depth_decodes / n);
   std::string prims;
   for (uint32_t i = 0; i < 32; ++i) {
     if (stats_.prim_counts[i]) prims += fmt::format(" {}:{:.0f}", i, stats_.prim_counts[i] / n);

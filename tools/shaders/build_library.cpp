@@ -1,3 +1,4 @@
+#include <array>
 #include <algorithm>
 #include <bit>
 #include <cstdio>
@@ -197,8 +198,32 @@ int main(int argc, char** argv) {
     std::printf("indexed %zu variants\n", library.size());
     return 0;
   }
+  // RC65: --learned <ds2_shader_cache.spvlib>: also generate, for every source shader, the modification patterns
+  // the console actually used (runtime-learned cache), adapted to the shader (register count, interpolators,
+  // early-Z eligibility). The RC60/61 pack never matched them (0 hits).
+  std::vector<std::pair<uint32_t, uint64_t>> learned_patterns;  // (shader type, modification)
+  if (argc == 5 && std::string(argv[1]) == "--learned") {
+    FILE* f = std::fopen(argv[2], "rb");
+    if (!f) return 2;
+    std::array<uint32_t, 4> header;
+    if (std::fread(header.data(), 1, sizeof(header), f) != sizeof(header)) return 2;
+    std::set<std::pair<uint32_t, uint64_t>> unique;
+    for (;;) {
+      std::array<uint64_t, 10> r;
+      if (std::fread(r.data(), 1, sizeof(r), f) != sizeof(r)) break;
+      const uint64_t payload = r[4] * 4 + r[5] + (r[6] + r[7]) * 4;
+      if (r[3] > 1 || payload > (8u << 20)) break;
+      unique.emplace(uint32_t(r[3]), r[1]);
+      if (std::fseek(f, long(payload), SEEK_CUR)) break;
+    }
+    std::fclose(f);
+    learned_patterns.assign(unique.begin(), unique.end());
+    std::printf("learned patterns: %zu\n", learned_patterns.size());
+    argv += 2;
+    argc -= 2;
+  }
   if (argc != 3) {
-    std::fprintf(stderr, "usage: rex-shader-library <manifest.txt> <new-output.spvlib>\n");
+    std::fprintf(stderr, "usage: rex-shader-library [--learned <cache.spvlib>] <manifest.txt> <new-output.spvlib>\n");
     return 2;
   }
   const std::filesystem::path manifest_path(argv[1]);
@@ -283,6 +308,24 @@ int main(int argc, char** argv) {
       SpirvShaderTranslator::Modification mod(translator.GetDefaultPixelShaderModification(register_count));
       mod.pixel.interpolator_mask = own_mask;
       mod.pixel.alpha_test_always = 1;
+      modifications.insert(mod.value);
+    }
+    for (const auto& [type, pattern] : learned_patterns) {
+      if (type != uint32_t(shader.type())) continue;
+      SpirvShaderTranslator::Modification mod(pattern);
+      if (vertex) {
+        mod.vertex.dynamic_addressable_register_count = register_count;
+        mod.vertex.interpolator_mask &= own_mask;
+        mod.vertex.native_vertex_inputs = 0;
+      } else {
+        mod.pixel.dynamic_addressable_register_count = register_count;
+        mod.pixel.interpolator_mask &= own_mask;
+        mod.pixel.interpolators_centroid &= own_mask;
+        if (!shader.implicit_early_z_write_allowed() &&
+            mod.pixel.depth_stencil_mode == SpirvShaderTranslator::Modification::DepthStencilMode::kEarlyHint) {
+          mod.pixel.depth_stencil_mode = SpirvShaderTranslator::Modification::DepthStencilMode::kNoModifiers;
+        }
+      }
       modifications.insert(mod.value);
     }
     bool shader_ok = false;
