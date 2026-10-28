@@ -14,7 +14,7 @@ assets/
 
 # --- Generated from the game / build output -----------------------------------
 out/
-app/generated/
+app/generated
 generated/
 sdk/out/
 *.log
@@ -47,12 +47,12 @@ __pycache__/
 *.pyc
 
 # --- Owner's project root (SW1_ds2 on the Mac) is this repository; local-only folders there ---------------
-docs/
-DARK.SOULS*/
-ds2_logs/
-switch/
-backups/
-logs/
+/docs/
+/DARK.SOULS*/
+/ds2_logs/
+/switch/
+/backups/
+/logs/
 _xfer/
 _to_delete*/
 .DS_Store
