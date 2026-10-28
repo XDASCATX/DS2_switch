@@ -90,6 +90,8 @@ REXCVAR_DEFINE_INT32(ds2_native_texture_keep_frames, 600, "GPU",
     .range(30, 100000);
 REXCVAR_DEFINE_BOOL(ds2_native_gamma_ramp, true, "GPU",
                     "DS2 native renderer: apply the game's 256-entry gamma ramp when presenting (as the emulation)");
+REXCVAR_DEFINE_BOOL(ds2_native_textures_1d, true, "GPU",
+                    "DS2 native renderer: sample 1D textures (false = white, as before RC63)");
 REXCVAR_DEFINE_DOUBLE(ds2_native_present_gamma, 1.0, "GPU",
                       "DS2 native renderer: display gamma after the guest ramp, out = in^(1/value); 1.0 = as the "
                       "Xbox 360 output, above 1.0 brightens dark tones (TV vs. handheld screen)")
@@ -681,6 +683,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t draws = 0, draws_skipped = 0, draws_unsupported_prim = 0, draws_failed = 0;
     uint64_t copies = 0, clears = 0, swaps = 0, swaps_presented = 0;
     uint64_t texture_uploads = 0, texture_unsupported = 0, texture_from_resolve = 0;
+    uint64_t texture_1d = 0, texture_white_dimension = 0;
     uint64_t upload_bytes = 0, pipelines = 0, render_passes_begun = 0;
     uint64_t prim_counts[32] = {};
     uint64_t conversions = 0, texture_levels = 0, texture_upload_bytes = 0, submits = 0;
@@ -2360,12 +2363,18 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
   resolved_out = false;
   const RegisterFile& regs = *register_file_;
   const xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(fetch_index);
+  // RC63: 1D textures (the translator binds tfetch1D as a 2D array, so dimension is k2D here) are a 2D image one
+  // row tall. Before RC63 every 1D fetch read the white 1x1 texture (e.g. DS2's 256-entry tone curve).
+  const bool is_1d = fetch.dimension == xenos::DataDimension::k1D && REXCVAR_GET(ds2_native_textures_1d);
   if (fetch.type != xenos::FetchConstantType::kTexture || dimension != xenos::FetchOpDimension::k2D ||
-      fetch.dimension != xenos::DataDimension::k2DOrStacked) {
+      (fetch.dimension != xenos::DataDimension::k2DOrStacked && !is_1d)) {
+    if (fetch.type == xenos::FetchConstantType::kTexture) ++stats_.texture_white_dimension;
     return white_view_;
   }
   const uint32_t base = uint32_t(fetch.base_address) << 12;
-  const uint32_t width = fetch.size_2d.width + 1, height = fetch.size_2d.height + 1;
+  const uint32_t width = is_1d ? fetch.size_1d.width + 1 : fetch.size_2d.width + 1;
+  const uint32_t height = is_1d ? 1u : fetch.size_2d.height + 1;
+  if (is_1d) ++stats_.texture_1d;
   TextureFormatInfo fi;
   const bool format_known = GetTextureFormat(fetch.format, fi);
   // A resolve target at this address: sample the native image directly.
@@ -4222,6 +4231,8 @@ void NativeCommandProcessor::LogStats() {
       stats_.texture_from_resolve / n, stats_.texture_unsupported / n, stats_.upload_bytes / n / 1048576.0,
       pipelines_.size(), render_targets_.size(), textures_.size(), resolved_.size(), stats_.swaps_presented,
       stats_.swaps);
+  REXGPU_INFO("[native] texture fetches/frame: {:.1f} 1D, {:.1f} white (3D/cube/other dimension)",
+              stats_.texture_1d / n, stats_.texture_white_dimension / n);
   std::string prims;
   for (uint32_t i = 0; i < 32; ++i) {
     if (stats_.prim_counts[i]) prims += fmt::format(" {}:{:.0f}", i, stats_.prim_counts[i] / n);
