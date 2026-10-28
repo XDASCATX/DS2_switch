@@ -9,6 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
+#include <mutex>
+#include <unordered_map>
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
@@ -36,6 +39,10 @@
 #include <rex/system/user_module.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+REXCVAR_DEFINE_INT32(ds2_cp_wait_poll_us, 100, "GPU",
+                     "RC67: PM4 WAIT_REG_MEM re-check interval in microseconds while the value does not match "
+                     "(0 = sleep wait/256 ms as before RC67; the command processor overslept every such wait)")
+    .range(0, 100000);
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
@@ -1035,6 +1042,30 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* re
   return true;
 }
 
+// RC67: how long the command processor sleeps in WAIT_REG_MEM, per polled address (logged every 10 s).
+static void NoteWaitRegMemSleep(uint32_t addr, bool is_memory, uint64_t us) {
+  static std::mutex mutex;
+  static std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> per_addr;  // key -> (sleeps, us)
+  static auto last = std::chrono::steady_clock::now();
+  std::lock_guard lock(mutex);
+  auto& e = per_addr[(uint64_t(is_memory) << 32) | addr];
+  ++e.first;
+  e.second += us;
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last < std::chrono::seconds(10)) return;
+  const double secs = std::chrono::duration<double>(now - last).count();
+  last = now;
+  std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> v(per_addr.begin(), per_addr.end());
+  std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+  std::string top;
+  for (size_t i = 0; i < v.size() && i < 4; ++i) {
+    top += fmt::format(" | {} {:08X}: {:.0f}/s, {:.1f} ms/s", (v[i].first >> 32) ? "mem" : "reg",
+                       uint32_t(v[i].first), v[i].second.first / secs, v[i].second.second / 1000.0 / secs);
+  }
+  REXGPU_INFO("[cp] WAIT_REG_MEM sleeps (poll {} us){}", REXCVAR_GET(ds2_cp_wait_poll_us), top);
+  per_addr.clear();
+}
+
 bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reader, uint32_t packet,
                                                        uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
@@ -1093,12 +1124,20 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
+        const int32_t poll_us = REXCVAR_GET(ds2_cp_wait_poll_us);
+        const auto sleep_start = std::chrono::steady_clock::now();
         if (!REXCVAR_GET(vsync)) {
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
+        } else if (poll_us > 0) {
+          rex::thread::Sleep(std::chrono::microseconds(poll_us));
         } else {
           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
         }
+        NoteWaitRegMemSleep(poll_reg_addr, is_memory,
+                            uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now() - sleep_start)
+                                         .count()));
         rex::thread::SyncMemory();
         ReturnFromWait();
 

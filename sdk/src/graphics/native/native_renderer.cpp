@@ -92,6 +92,9 @@ REXCVAR_DEFINE_BOOL(ds2_native_gamma_ramp, true, "GPU",
                     "DS2 native renderer: apply the game's 256-entry gamma ramp when presenting (as the emulation)");
 REXCVAR_DEFINE_BOOL(ds2_native_textures_1d, true, "GPU",
                     "DS2 native renderer: sample 1D textures (false = white, as before RC63)");
+REXCVAR_DEFINE_BOOL(ds2_native_7e3_as_r11g11b10, false, "GPU",
+                    "DS2 native renderer (RC67 test): store k_2_10_10_10_FLOAT render targets as B10G11R11_UFLOAT "
+                    "instead of RGBA16F (half the bandwidth, no alpha); restart");
 REXCVAR_DEFINE_BOOL(ds2_native_barrier_elision, true, "GPU",
                     "DS2 native renderer: skip a pipeline barrier when no GPU work was recorded since the previous one "
                     "(each barrier is a GPU wait-for-idle on NVK)");
@@ -463,6 +466,10 @@ VkFormat ColorRtFormat(xenos::ColorRenderTargetFormat f) {
       return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     case F::k_2_10_10_10_FLOAT:
     case F::k_2_10_10_10_FLOAT_AS_16_16_16_16:
+      // RC67 test: 32-bit float storage (full-rate blending, half the bandwidth) instead of 64-bit RGBA16F.
+      // Loses the 2-bit alpha of 7e3; RGB 6/6/5-bit mantissa instead of 7.
+      if (REXCVAR_GET(ds2_native_7e3_as_r11g11b10)) return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+      return VK_FORMAT_R16G16B16A16_SFLOAT;
     case F::k_16_16_16_16_FLOAT:
       return VK_FORMAT_R16G16B16A16_SFLOAT;
     case F::k_16_16:
@@ -1286,6 +1293,8 @@ const char* VkFormatShortName(VkFormat f) {
       return "2_10_10_10";
     case VK_FORMAT_R16G16B16A16_SFLOAT:
       return "16f x4";
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+      return "11_11_10f";
     case VK_FORMAT_R16G16_SFLOAT:
       return "16f x2";
     case VK_FORMAT_R32_SFLOAT:
@@ -3777,7 +3786,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     profile_shader_active_ = false;
     profile_shader_pipeline_ = VK_NULL_HANDLE;
   }
-  const uint32_t shader_phase = color_count && color_formats[0] == VK_FORMAT_R16G16B16A16_SFLOAT
+  const uint32_t shader_phase = color_count && (color_formats[0] == VK_FORMAT_R16G16B16A16_SFLOAT ||
+                                                color_formats[0] == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
                                     ? 1 : (color_count && depth_rt ? 0 : 2);
   constexpr uint32_t phase_limits[3] = {64, 96, 32};
   if (sample_shader && pipeline != profile_shader_pipeline_) {
@@ -4037,7 +4047,7 @@ bool NativeCommandProcessor::IssueCopy() {
     const int32_t resolve_exp_bias = int32_t(info.copy_dest_info.copy_dest_exp_bias);
     if (REXCVAR_GET(ds2_native_resolve_color_convert) && !is_depth &&
         surface_info.msaa_samples == xenos::MsaaSamples::k1X &&
-        src->format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+        (src->format == VK_FORMAT_R16G16B16A16_SFLOAT || src->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) &&
         dest_tex_format == xenos::TextureFormat::k_8_8_8_8 &&
         dest_info.copy_dest_number == xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction) {
       const VkRect2D rect = {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
