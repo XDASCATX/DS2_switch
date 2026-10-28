@@ -92,6 +92,16 @@ REXCVAR_DEFINE_BOOL(ds2_native_gamma_ramp, true, "GPU",
                     "DS2 native renderer: apply the game's 256-entry gamma ramp when presenting (as the emulation)");
 REXCVAR_DEFINE_BOOL(ds2_native_textures_1d, true, "GPU",
                     "DS2 native renderer: sample 1D textures (false = white, as before RC63)");
+REXCVAR_DEFINE_BOOL(ds2_native_barrier_elision, true, "GPU",
+                    "DS2 native renderer: skip a pipeline barrier when no GPU work was recorded since the previous one "
+                    "(each barrier is a GPU wait-for-idle on NVK)");
+REXCVAR_DEFINE_BOOL(ds2_native_float24_half_range, false, "GPU",
+                    "DS2 native renderer: map D24FS8 depth [0,2) to host [0,1) (before RC66). false keeps guest depth "
+                    "values, so depth textures (shadow maps, fog/DOF/soft-particle depth) read what the game wrote");
+REXCVAR_DEFINE_INT32(ds2_native_gpu_profile_every, 30, "GPU",
+                     "DS2 native renderer: with ds2_native_gpu_profile, time one command buffer in N (timestamps "
+                     "drain the GPU on NVK); 1 = every one, as before RC66")
+    .range(1, 100000);
 REXCVAR_DEFINE_BOOL(ds2_native_depth_from_rgba8, true, "GPU",
                     "DS2 native renderer: decode k_24_8/k_24_8_FLOAT fetches of 8888 depth resolves to R32F depth "
                     "(shadow maps, depth effects); false = raw bytes as before RC64");
@@ -717,6 +727,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t texture_uploads = 0, texture_unsupported = 0, texture_from_resolve = 0;
     uint64_t texture_1d = 0, texture_white_dimension = 0, texture_cube = 0, cube_faces_from_resolves = 0;
     uint64_t depth_decoded_fetches = 0, depth_decodes = 0;
+    uint64_t barriers_issued = 0, barriers_elided = 0;
     uint64_t upload_bytes = 0, pipelines = 0, render_passes_begun = 0;
     uint64_t prim_counts[32] = {};
     uint64_t conversions = 0, texture_levels = 0, texture_upload_bytes = 0, submits = 0;
@@ -778,6 +789,7 @@ class NativeCommandProcessor final : public CommandProcessor {
   void LogStats();
   void LogGammaRamp();
   uint64_t last_gamma_ramp_hash_ = 0;
+  bool work_since_barrier_ = true;  // RC66: GPU work recorded since the last pipeline barrier
   void DumpImages();
   void EvictTextures();
   // GPU profile: a timestamp that ends the current segment and starts one labelled `label`.
@@ -895,7 +907,9 @@ class NativeCommandProcessor final : public CommandProcessor {
   void EndOcclusionQuery(uint32_t result_address);
 
   // GPU profile.
-  bool profiling_ = false;
+  bool profiling_ = false;       // timestamps available and requested
+  bool profile_capable_ = false;  // RC66: profiling_ is set per command buffer (1 in ds2_native_gpu_profile_every)
+  uint64_t profile_counter_ = 0;
   double timestamp_period_ns_ = 1.0;
   uint64_t timestamp_mask_ = ~uint64_t(0);
   std::vector<ProfileLabel> profile_labels_;
@@ -1048,6 +1062,7 @@ bool NativeCommandProcessor::SetupContext() {
 #endif
       timestamp_mask_ = bits >= 64 ? ~uint64_t(0) : ((uint64_t(1) << bits) - 1);
       profiling_ = true;
+      profile_capable_ = true;
       for (FrameSlot& s : slots_) {
         VkQueryPoolCreateInfo qci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -1075,6 +1090,7 @@ bool NativeCommandProcessor::SetupContext() {
     VkClearColorValue c = {};
     c.float32[0] = c.float32[1] = c.float32[2] = c.float32[3] = 1.0f;
     VkImageSubresourceRange r = ui::vulkan::util::InitializeSubresourceRange();
+    work_since_barrier_ = true;
     dfn().vkCmdClearColorImage(slot().cmd, white_.image, VK_IMAGE_LAYOUT_GENERAL, &c, 1, &r);
     Barrier();
   }
@@ -1085,6 +1101,7 @@ bool NativeCommandProcessor::SetupContext() {
     VkClearColorValue c = {};
     c.float32[0] = c.float32[1] = c.float32[2] = c.float32[3] = 1.0f;
     VkImageSubresourceRange r = ui::vulkan::util::InitializeSubresourceRange();
+    work_since_barrier_ = true;
     dfn().vkCmdClearColorImage(slot().cmd, white_cube_.image, VK_IMAGE_LAYOUT_GENERAL, &c, 1, &r);
     Barrier();
   }
@@ -1227,10 +1244,15 @@ bool NativeCommandProcessor::BeginFrame() {
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   if (dfn().vkBeginCommandBuffer(s.cmd, &bi) != VK_SUCCESS) return false;
   frame_open_ = true;
+  work_since_barrier_ = true;
   s.queries = 0;
   s.query_labels.clear();
   s.seg_draws.clear();
   if (s.occlusion_pool) dfn().vkCmdResetQueryPool(s.cmd, s.occlusion_pool, 0, kMaxOcclusionQueries);
+  if (profile_capable_) {
+    const uint64_t every = uint64_t(std::max(REXCVAR_GET(ds2_native_gpu_profile_every), 1));
+    profiling_ = (profile_counter_++ % every) == 0;
+  }
   if (profiling_ && s.query_pool) {
     dfn().vkCmdResetQueryPool(s.cmd, s.query_pool, 0, kMaxQueries);
     Mark("other (between passes)");
@@ -1287,7 +1309,7 @@ void NativeCommandProcessor::MarkPass(const VkFormat* color_formats, uint32_t co
 }
 
 void NativeCommandProcessor::CollectProfile(FrameSlot& s) {
-  if (!profiling_ || s.queries < 2) return;
+  if (!profile_capable_ || s.queries < 2) return;
   uint64_t ts[kMaxQueries];
   if (dfn().vkGetQueryPoolResults(vulkan_device_->device(), s.query_pool, 0, s.queries, sizeof(uint64_t) * s.queries,
                                   ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
@@ -1396,6 +1418,14 @@ void NativeCommandProcessor::LogGammaRamp() {
 }
 
 void NativeCommandProcessor::Barrier() {
+  // RC66: on NVK every pipeline barrier is a wait-for-idle plus cache flushes. A barrier with no GPU work recorded
+  // since the previous one adds nothing (the previous one already drained the pipe and flushed every cache).
+  if (!work_since_barrier_ && REXCVAR_GET(ds2_native_barrier_elision)) {
+    ++stats_.barriers_elided;
+    return;
+  }
+  work_since_barrier_ = false;
+  ++stats_.barriers_issued;
   VkMemoryBarrier b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
   b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
   b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -1408,6 +1438,12 @@ void NativeCommandProcessor::ResolveBarrier(NativeImage& src, NativeImage& dst, 
     Barrier();
     return;
   }
+  if (!work_since_barrier_ && REXCVAR_GET(ds2_native_barrier_elision)) {
+    ++stats_.barriers_elided;
+    return;
+  }
+  work_since_barrier_ = false;
+  ++stats_.barriers_issued;
   constexpr VkPipelineStageFlags stages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
       VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
@@ -1548,6 +1584,7 @@ void NativeCommandProcessor::EnsureGeneral(NativeImage& img) {
       img.depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_COLOR_BIT);
   dfn().vkCmdPipelineBarrier(slot().cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
                              nullptr, 0, nullptr, 1, &b);
+  work_since_barrier_ = true;
   img.initialized = true;
 }
 
@@ -1599,6 +1636,7 @@ NativeImage* NativeCommandProcessor::GetRenderTarget(uint32_t base, uint32_t pit
     if (clear_ds) clear_ds(slot().cmd, img.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
   } else {
     VkClearColorValue v = {};
+    work_since_barrier_ = true;
     dfn().vkCmdClearColorImage(slot().cmd, img.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
   }
   Barrier();
@@ -1943,6 +1981,7 @@ bool NativeCommandProcessor::Convert(ConvertMode mode, NativeImage& src, NativeI
   bi.renderPass = pass;
   bi.framebuffer = fb;
   bi.renderArea = {{0, 0}, {dst.width, dst.height}};
+  work_since_barrier_ = true;
   dfn().vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
   dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
   dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, convert_layout_[layout_index], 0, 1, &set, 0,
@@ -1954,6 +1993,7 @@ bool NativeCommandProcessor::Convert(ConvertMode mode, NativeImage& src, NativeI
                    float(dst_rect.extent.height), 0.0f, 1.0f};
   dfn().vkCmdSetViewport(cmd, 0, 1, &vp);
   dfn().vkCmdSetScissor(cmd, 0, 1, &dst_rect);
+  work_since_barrier_ = true;
   dfn().vkCmdDraw(cmd, 3, 1, 0, 0);
   dfn().vkCmdEndRenderPass(cmd);
   Barrier();
@@ -2407,6 +2447,7 @@ NativeCommandProcessor::ResolveLogicalImage* NativeCommandProcessor::GetResolveL
                               : VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1};
     copy.dstSubresource = copy.srcSubresource;
     copy.extent = {width, height, 1};
+    work_since_barrier_ = true;
     cmd_copy_image_(slot().cmd, entry.image.image, VK_IMAGE_LAYOUT_GENERAL, logical.image.image,
                     VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
     ResolveBarrier(entry.image, logical.image, false);
@@ -2623,6 +2664,7 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
     r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, 1};
     r.imageExtent = {lw, lh, 1};
   }
+  work_since_barrier_ = true;
   dfn().vkCmdCopyBufferToImage(slot().cmd, slot().upload, t.image.image, VK_IMAGE_LAYOUT_GENERAL, levels, regions);
   Barrier();
   ++stats_.texture_uploads;
@@ -2819,6 +2861,7 @@ VkImageView NativeCommandProcessor::GetCubeTextureView(const xenos::xe_gpu_textu
     }
   }
   if (!regions.empty()) {
+    work_since_barrier_ = true;
     dfn().vkCmdCopyBufferToImage(slot().cmd, slot().upload, t.image.image, VK_IMAGE_LAYOUT_GENERAL,
                                  uint32_t(regions.size()), regions.data());
   }
@@ -2830,6 +2873,7 @@ VkImageView NativeCommandProcessor::GetCubeTextureView(const xenos::xe_gpu_textu
       c.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
       c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, f, 1};
       c.extent = {std::max(width >> l, 1u), std::max(height >> l, 1u), 1};
+      work_since_barrier_ = true;
       cmd_copy_image_(slot().cmd, face_resolves[l][f]->image.image, VK_IMAGE_LAYOUT_GENERAL, t.image.image,
                       VK_IMAGE_LAYOUT_GENERAL, 1, &c);
       ++faces_resolved;
@@ -3446,7 +3490,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   draw_util::ViewportInfo viewport;
   // As the emulation: host viewport limits, reverse depth allowed (Vulkan accepts minDepth > maxDepth).
   draw_util::GetHostViewportInfo(regs, sx, sy, false, device()->properties().maxViewportDimensions[0],
-                                 device()->properties().maxViewportDimensions[1], true, depth_control, false, true,
+                                 device()->properties().maxViewportDimensions[1], true, depth_control, false,
+                                 REXCVAR_GET(ds2_native_float24_half_range),
                                  ps && ps->writes_depth(), viewport);
   for (uint32_t i = 0; i < 3; ++i) {
     sc.ndc_scale[i] = viewport.ndc_scale[i];
@@ -3677,6 +3722,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     bi.renderPass = pass;
     bi.framebuffer = fb;
     bi.renderArea = {{0, 0}, {rt_width, rt_height}};
+    work_since_barrier_ = true;
     dfn().vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
     in_render_pass_ = true;
     if (Tracing()) {
@@ -3724,7 +3770,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                 regs[XE_GPU_REG_RB_STENCILREFMASK]);
   }
   const uint32_t shader_profile_every = uint32_t(REXCVAR_GET(ds2_native_shader_profile_every));
-  const bool sample_shader = profiling_ && shader_profile_every && frame_ % shader_profile_every == 0 &&
+  const bool sample_shader = profiling_ && shader_profile_every && (profile_counter_ - 1) % shader_profile_every == 0 &&
                              color_count && viewport.xy_extent[0] >= 640 && viewport.xy_extent[1] >= 360;
   if (!sample_shader && profile_shader_active_) {
     Mark("other (outside scene shader group)");
@@ -3793,8 +3839,10 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   dfn().vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_BACK_BIT, bf ? srm_bf.stencilref : srm.stencilref);
   if (use_indices) {
     dfn().vkCmdBindIndexBuffer(cmd, slot().upload, index_offset, index_type);
+    work_since_barrier_ = true;
     dfn().vkCmdDrawIndexed(cmd, draw_count, 1, 0, 0, 0);
   } else {
+    work_since_barrier_ = true;
     dfn().vkCmdDraw(cmd, draw_count, 1, 0, 0);
   }
   ++stats_.draws;
@@ -3837,6 +3885,7 @@ bool NativeCommandProcessor::ClearRect(NativeImage& rt, const VkClearValue& valu
   bi.framebuffer = fb;
   bi.renderArea = {{0, 0}, {rt.width, rt.height}};
   VkCommandBuffer cmd = slot().cmd;
+  work_since_barrier_ = true;
   dfn().vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
   VkClearAttachment ca = {};
   ca.aspectMask = rt.depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
@@ -3845,6 +3894,7 @@ bool NativeCommandProcessor::ClearRect(NativeImage& rt, const VkClearValue& valu
   VkClearRect cr = {};
   cr.rect = rect;
   cr.layerCount = 1;
+  work_since_barrier_ = true;
   dfn().vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
   dfn().vkCmdEndRenderPass(cmd);
   Barrier();
@@ -4097,6 +4147,7 @@ bool NativeCommandProcessor::IssueCopy() {
     c.srcOffset = {x0, y0, 0};
     c.dstOffset = {dst_x0, dst_y0, 0};
     c.extent = {uint32_t(x1 - x0), uint32_t(y1 - y0), 1};
+    work_since_barrier_ = true;
     cmd_copy_image_(slot().cmd, copy_src->image, VK_IMAGE_LAYOUT_GENERAL, r.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     ResolveBarrier(*copy_src, r.image, false);
     ++r.generation;
@@ -4260,6 +4311,7 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           rbi.renderPass = present_pass_;
           rbi.framebuffer = fb;
           rbi.renderArea = {{0, 0}, {w, h}};
+          work_since_barrier_ = true;
           dfn().vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
           dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, present_pipeline_);
           dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, present_layout_, 0, 1, &set, 0,
@@ -4276,6 +4328,7 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           VkRect2D sr = {{0, 0}, {w, h}};
           dfn().vkCmdSetViewport(cmd, 0, 1, &vpp);
           dfn().vkCmdSetScissor(cmd, 0, 1, &sr);
+          work_since_barrier_ = true;
           dfn().vkCmdDraw(cmd, 3, 1, 0, 0);
           dfn().vkCmdEndRenderPass(cmd);
           SubmitFrame();
@@ -4350,6 +4403,7 @@ uint32_t NativeCommandProcessor::ReadPixel(NativeImage& img, uint32_t x, uint32_
   r.imageSubresource = {aspect, 0, 0, 1};
   r.imageOffset = {int32_t(x), int32_t(y), 0};
   r.imageExtent = {1, 1, 1};
+  work_since_barrier_ = true;
   dfn().vkCmdCopyImageToBuffer(slot().cmd, img.image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &r);
   FrameSlot& sl = slot();
   SubmitFrame();
@@ -4420,6 +4474,7 @@ void NativeCommandProcessor::DumpImages() {
                           1};
     r.imageExtent = {img->width, img->height, 1};
     Barrier();
+    work_since_barrier_ = true;
     dfn().vkCmdCopyImageToBuffer(slot().cmd, img->image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &r);
     FrameSlot& sl = slot();
     SubmitFrame();
@@ -4535,6 +4590,8 @@ void NativeCommandProcessor::LogStats() {
       stats_.texture_from_resolve / n, stats_.texture_unsupported / n, stats_.upload_bytes / n / 1048576.0,
       pipelines_.size(), render_targets_.size(), textures_.size(), resolved_.size(), stats_.swaps_presented,
       stats_.swaps);
+  REXGPU_INFO("[native] barriers/frame: {:.1f} issued, {:.1f} elided", stats_.barriers_issued / n,
+              stats_.barriers_elided / n);
   REXGPU_INFO("[native] texture fetches/frame: {:.1f} 1D, {:.1f} cube ({:.2f} faces copied from resolves), "
               "{:.1f} white (3D/unsupported cube/other dimension), {:.1f} depth from 8888 ({:.2f} decodes)",
               stats_.texture_1d / n, stats_.texture_cube / n, stats_.cube_faces_from_resolves / n,
@@ -4571,7 +4628,9 @@ void NativeCommandProcessor::LogStats() {
               stats_.content_hits / n, stats_.content_saved_bytes / n / 1048576.0);
   REXGPU_INFO("[native] vertex draws/frame: {:.1f} hardware inputs, {:.1f} legacy fetch",
               stats_.native_vertex_draws / n, stats_.legacy_vertex_draws / n);
-  if (profiling_ && profile_buffers_) {
+  if (profile_capable_ && profile_buffers_) {
+    // RC66: only 1 command buffer in ds2_native_gpu_profile_every is timed; scale to all buffers.
+    const double sampled_scale = double(stats_.submits) / double(profile_buffers_);
     std::vector<ProfileLabel*> order;
     double sum = 0;
     for (ProfileLabel& l : profile_labels_) {
@@ -4581,12 +4640,12 @@ void NativeCommandProcessor::LogStats() {
     std::sort(order.begin(), order.end(), [](const ProfileLabel* a, const ProfileLabel* b) { return a->ms > b->ms; });
     std::string top;
     for (size_t i = 0; i < order.size() && i < 16; ++i) {
-      top += fmt::format("\n[native gpu]   {:6.2f} ms {:5.1f}%  x{:.1f}  {:.0f} draws  {}", order[i]->ms / n,
-                         sum > 0 ? 100.0 * order[i]->ms / sum : 0.0, order[i]->count / n, order[i]->draws / n,
-                         order[i]->name);
+      top += fmt::format("\n[native gpu]   {:6.2f} ms {:5.1f}%  x{:.1f}  {:.0f} draws  {}",
+                         order[i]->ms * sampled_scale / n, sum > 0 ? 100.0 * order[i]->ms / sum : 0.0,
+                         order[i]->count * sampled_scale / n, order[i]->draws * sampled_scale / n, order[i]->name);
     }
     REXGPU_INFO("[native gpu] GPU ms per frame: {:.2f} (command buffers {:.2f} per frame), by pass kind:{}",
-                profile_gpu_ms_ / n, profile_buffers_ / n, top);
+                profile_gpu_ms_ * sampled_scale / n, stats_.submits / n, top);
     std::string shader_top;
     uint32_t shader_groups_logged = 0;
     for (const auto* label : order) {
