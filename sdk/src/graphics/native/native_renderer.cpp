@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -149,7 +150,12 @@ REXCVAR_DEFINE_BOOL(ds2_native_msaa_host, true, "GPU",
 REXCVAR_DEFINE_INT32(ds2_native_msaa_min_draws, 8, "GPU",
                      "RC72: a 4x color target uses the host 4x copy only with at least this many non-rectangle 4x "
                      "draws in this or the previous frame (DS2 clears in 4x and draws at 1x elsewhere)");
-REXCVAR_DEFINE_BOOL(ds2_native_bias_sample_scale, true, "GPU",
+REXCVAR_DEFINE_BOOL(ds2_native_shadow_face_clear, true, "GPU",
+                    "RC74: clear the whole viewport of a shadow face drawn after a depth-only clear rectangle");
+REXCVAR_DEFINE_BOOL(ds2_native_msaa_clear_replay, false, "GPU",
+                    "RC73: draw lone 4x clear rectangles in sample space and replay them into the 4x copies; false = "
+                    "RC71 (4x clears go to the 4x copies)");
+REXCVAR_DEFINE_BOOL(ds2_native_bias_sample_scale, false, "GPU",
                     "RC72: scale the slope-scaled depth bias by the sample-space factor of 4x targets");
 REXCVAR_DEFINE_INT32(ds2_native_shader_profile_groups, 0, "GPU",
                      "RC72: shader groups timed per profiled command buffer (0 = 64/96/32 by pass kind)");
@@ -766,6 +772,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t depth_decoded_fetches = 0, depth_decodes = 0;
     uint64_t barriers_issued = 0, barriers_elided = 0;
     uint64_t state_calls = 0, state_calls_skipped = 0;
+    uint64_t face_clears = 0;
     uint64_t msaa_draws = 0, msaa_imports = 0, msaa_imports_skipped = 0, msaa_exports = 0;
     uint64_t upload_bytes = 0, pipelines = 0, render_passes_begun = 0;
     uint64_t prim_counts[32] = {};
@@ -846,7 +853,13 @@ class NativeCommandProcessor final : public CommandProcessor {
                              uint32_t swizzle);
   ResolveLogicalImage* GetResolveLogicalImage(ResolvedEntry& entry, uint32_t width, uint32_t height);
   void DestroyResolveLogicalImages(ResolvedEntry& entry, bool deferred);
-  bool ClearRect(NativeImage& rt, const VkClearValue& value, const VkRect2D& rect);
+  bool ClearRect(NativeImage& rt, const VkClearValue& value, const VkRect2D& rect, bool depth_only = false);
+  // RC74: a depth-only clear rectangle followed by depth-only geometry in a smaller viewport (point light shadow
+  // cube faces packed in one target): the face is cleared to the clear depth over its whole viewport.
+  struct PendingFaceClear {
+    VkImage image = VK_NULL_HANDLE;
+    float depth = 0.0f;
+  } pending_face_clear_;
   bool SetupConversions();
   bool Convert(ConvertMode mode, NativeImage& src, NativeImage& dst, int32_t src_x, int32_t src_y,
                const VkRect2D& dst_rect, bool src_float24, int32_t resolve_exp_bias = 0);
@@ -3648,7 +3661,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       // otherwise it stays in sample space (DS2 also clears in 4x and then draws at 1x: a 4x copy for a lone
       // clear would cost an export and save nothing).
       host_msaa = true;
-      if (prim_type == xenos::PrimitiveType::kRectangleList && !msaa_force_clear_) {
+      if (REXCVAR_GET(ds2_native_msaa_clear_replay) && prim_type == xenos::PrimitiveType::kRectangleList &&
+          !msaa_force_clear_) {
         auto sit = msaa_shadows_.find(color_rts[0]->image);
         host_msaa = sit != msaa_shadows_.end() && sit->second.valid && sit->second.newer;
         // A full clear outside an active 4x copy: drawn in sample space, then replayed into the 4x copies (they
@@ -3844,12 +3858,18 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   VkDeviceSize native_vertex_offsets[8] = {};
   uint32_t fetch_constants[6 * 32];
   std::memcpy(fetch_constants, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(fetch_constants));
+  float rect_first_z = std::numeric_limits<float>::quiet_NaN();
   for (const auto& binding : vs->vertex_bindings()) {
     const uint32_t fc = binding.fetch_constant;
     xenos::xe_gpu_vertex_fetch_t vf;
     std::memcpy(&vf, &fetch_constants[fc * 2], sizeof(vf));
     const uint32_t address = uint32_t(vf.address) << 2;
     uint32_t size = uint32_t(vf.size) << 2;
+    if (prim_type == xenos::PrimitiveType::kRectangleList && std::isnan(rect_first_z) && size >= 12) {
+      if (const uint32_t* vtx = memory_->TranslatePhysical<const uint32_t*>(address)) {
+        rect_first_z = xenos::GpuSwap(rex::memory::Reinterpret<float>(vtx[2]), vf.endian);
+      }
+    }
     if (Tracing()) {
       REXGPU_INFO("[native trace]   draw {} vfetch {} addr {:08X} size {} stride {}", draws_this_frame_, fc, address,
                   size, binding.stride_words * 4);
@@ -4233,6 +4253,38 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   else ++stats_.constant_sets_reused;
   stats_.us_descriptors += NowUs() - descriptors_start;
 
+  // RC74: shadow cube faces. A depth-only clear rectangle is remembered; the next depth-only draw on the same
+  // target with a viewport smaller than the target clears that viewport to the clear depth first (DS2 clears the
+  // faces with a 1x and a 4x rectangle; parts of the face kept depth from earlier lights: squares and stripes in
+  // the torch light).
+  if (REXCVAR_GET(ds2_native_shadow_face_clear) && !color_count && depth_rt && !host_msaa) {
+    const bool clear_rect = prim_type == xenos::PrimitiveType::kRectangleList && depth_control.z_enable &&
+                            depth_control.z_write_enable && depth_control.zfunc == xenos::CompareFunction::kAlways;
+    if (clear_rect) {
+      if (!std::isnan(rect_first_z)) {
+        pending_face_clear_.image = depth_rt->image;
+        pending_face_clear_.depth = std::clamp(rect_first_z, 0.0f, 1.0f);
+      }
+    } else if (pending_face_clear_.image == depth_rt->image && depth_control.z_enable) {
+      const int32_t vx = std::max<int32_t>(viewport.xy_offset[0], 0), vy = std::max<int32_t>(viewport.xy_offset[1], 0);
+      const uint32_t vw = std::min<uint32_t>(viewport.xy_extent[0], depth_rt->width > uint32_t(vx) ? depth_rt->width - vx : 0);
+      const uint32_t vh = std::min<uint32_t>(viewport.xy_extent[1], depth_rt->height > uint32_t(vy) ? depth_rt->height - vy : 0);
+      if (vw && vh && vw * 2 <= depth_rt->width) {  // a face of a packed target, not a full-screen pass
+        VkClearValue cv = {};
+        cv.depthStencil.depth = pending_face_clear_.depth;
+        ClearRect(*depth_rt, cv, {{vx, vy}, {vw, vh}}, true);
+        ++stats_.face_clears;
+        if (Tracing()) {
+          REXGPU_INFO("[native trace]   shadow face clear {},{} {}x{} depth {}", vx, vy, vw, vh,
+                      pending_face_clear_.depth);
+        }
+      }
+      pending_face_clear_.image = VK_NULL_HANDLE;
+    }
+  } else if (color_count) {
+    pending_face_clear_.image = VK_NULL_HANDLE;
+  }
+
   // Render pass.
   ScopedUs commands_time(stats_.us_commands);
   uint64_t fb_key = reinterpret_cast<uint64_t>(pass);
@@ -4481,7 +4533,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
 // --- Resolves ---------------------------------------------------------------------------------------------------
 
-bool NativeCommandProcessor::ClearRect(NativeImage& rt, const VkClearValue& value, const VkRect2D& rect) {
+bool NativeCommandProcessor::ClearRect(NativeImage& rt, const VkClearValue& value, const VkRect2D& rect,
+                                       bool depth_only) {
   // A one-attachment render pass on the target and vkCmdClearAttachments for the rectangle.
   VkFormat color_format = rt.format;
   VkRenderPass pass = rt.depth ? GetRenderPass(nullptr, 0, rt.format) : GetRenderPass(&color_format, 1,
@@ -4517,7 +4570,9 @@ bool NativeCommandProcessor::ClearRect(NativeImage& rt, const VkClearValue& valu
   InvalidateDrawState();
   dfn().vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
   VkClearAttachment ca = {};
-  ca.aspectMask = rt.depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
+  ca.aspectMask = rt.depth ? (depth_only ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                         : (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
+                           : VK_IMAGE_ASPECT_COLOR_BIT;
   ca.colorAttachment = 0;
   ca.clearValue = value;
   VkClearRect cr = {};
@@ -5273,9 +5328,10 @@ void NativeCommandProcessor::LogStats() {
   REXGPU_INFO("[native] barriers/frame: {:.1f} issued, {:.1f} elided | draw state groups/frame: {:.1f} recorded, "
               "{:.1f} skipped as redundant", stats_.barriers_issued / n, stats_.barriers_elided / n,
               stats_.state_calls / n, stats_.state_calls_skipped / n);
-  REXGPU_INFO("[native] host 4x MSAA/frame: {:.1f} draws, {:.2f} imports ({:.2f} skipped after a clear), {:.2f} exports",
+  REXGPU_INFO("[native] host 4x MSAA/frame: {:.1f} draws, {:.2f} imports ({:.2f} skipped after a clear), {:.2f} exports"
+              " | shadow face clears/frame {:.1f}",
               stats_.msaa_draws / n, stats_.msaa_imports / n, stats_.msaa_imports_skipped / n,
-              stats_.msaa_exports / n);
+              stats_.msaa_exports / n, stats_.face_clears / n);
   REXGPU_INFO("[native] texture fetches/frame: {:.1f} 1D, {:.1f} cube ({:.2f} faces copied from resolves), "
               "{:.1f} white (3D/unsupported cube/other dimension), {:.1f} depth from 8888 ({:.2f} decodes)",
               stats_.texture_1d / n, stats_.texture_cube / n, stats_.cube_faces_from_resolves / n,
