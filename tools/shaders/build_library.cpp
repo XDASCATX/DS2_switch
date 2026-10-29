@@ -186,6 +186,23 @@ int NativeTemplateTest(const std::filesystem::path& manifest_path, const std::fi
 int main(int argc, char** argv) {
   if (argc == 4 && std::string(argv[1]) == "--native-test") return NativeTemplateTest(argv[2], argv[3]);
   if (argc == 3 && std::string(argv[1]) == "--selftest") return SelfTest(argv[2]);
+  if (argc == 4 && std::string(argv[1]) == "--disasm") {
+    // --disasm <ps|vs> <raw ucode dwords, host order>: prints the microcode disassembly.
+    FILE* f = std::fopen(argv[3], "rb");
+    if (!f) return 1;
+    std::vector<uint32_t> code;
+    uint32_t w;
+    while (std::fread(&w, 4, 1, f) == 1) code.push_back(w);
+    std::fclose(f);
+    const uint64_t hash = XXH3_64bits(code.data(), code.size() * 4);
+    SpirvShader shader(std::string(argv[2]) == "vs" ? rex::graphics::xenos::ShaderType::kVertex
+                                                   : rex::graphics::xenos::ShaderType::kPixel,
+                       hash, code.data(), uint32_t(code.size()), std::endian::native);
+    rex::string::StringBuffer disassembly;
+    shader.AnalyzeUcode(disassembly);
+    std::printf("%s\n", shader.ucode_disassembly().c_str());
+    return 0;
+  }
   if (argc == 3 && std::string(argv[1]) == "--inspect") {
     SpirvShaderLibrary library;
     if (!library.Open(argv[2])) return 1;
