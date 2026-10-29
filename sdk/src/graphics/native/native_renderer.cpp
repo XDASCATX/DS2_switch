@@ -152,6 +152,8 @@ REXCVAR_DEFINE_INT32(ds2_native_msaa_min_draws, 8, "GPU",
                      "draws in this or the previous frame (DS2 clears in 4x and draws at 1x elsewhere)");
 REXCVAR_DEFINE_BOOL(ds2_native_shadow_face_clear, true, "GPU",
                     "RC74: clear the whole viewport of a shadow face drawn after a depth-only clear rectangle");
+REXCVAR_DEFINE_BOOL(ds2_native_constant_reuse, true, "GPU",
+                    "RC78: a constant buffer equal to the previous draw's reuses its upload");
 REXCVAR_DEFINE_BOOL(ds2_native_persistent_texture_sets, true, "GPU",
                     "RC77: keep texture descriptor sets across frames (dropped when a view they use is destroyed)");
 REXCVAR_DEFINE_BOOL(ds2_native_fast_untile, true, "GPU",
@@ -803,6 +805,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t us_fence_wait = 0, us_draws = 0, us_textures = 0, us_pipelines = 0, us_copies = 0, us_frame = 0;
     uint64_t us_constants = 0, us_descriptors = 0, us_geometry = 0, us_commands = 0;
     uint64_t texture_sets_reused = 0, texture_sets_created = 0, texture_sets_kept = 0, texture_sets_dropped = 0;
+    uint64_t constant_uploads_reused = 0, us_prelude = 0, us_translate = 0, us_pipeline_sync = 0, pipelines_sync = 0;
     uint64_t constant_sets_reused = 0, constant_sets_created = 0, resolve_image_barriers = 0;
     uint64_t native_vertex_draws = 0, legacy_vertex_draws = 0;
     uint64_t content_hits = 0, content_saved_bytes = 0;
@@ -990,6 +993,12 @@ class NativeCommandProcessor final : public CommandProcessor {
   std::vector<uint32_t> native_indices_;
   std::vector<VkWriteDescriptorSet> descriptor_writes_;
   std::vector<uint64_t> descriptor_key_;
+  struct LastConstantUpload {
+    std::vector<uint8_t> data;
+    VkDeviceSize offset = 0;
+    uint64_t frame = UINT64_MAX;
+  };
+  LastConstantUpload last_constant_uploads_[SpirvShaderTranslator::kConstantBufferCount];
   // RC77: texture descriptor sets kept across frames (keyed by layout, views, samplers), dropped when a view they
   // use is destroyed. Per-frame sets (slot().texture_sets) remain the fallback when the pools are full.
   struct KeyVectorHash {
@@ -1033,6 +1042,7 @@ class NativeCommandProcessor final : public CommandProcessor {
   // Hitch report: the counters at the previous swap.
   uint64_t hitch_prev_[6] = {};
   uint64_t hitch_prev_pipelines_ = 0;
+  uint64_t hitch_prev_extra_[4] = {};
 
   // Occlusion queries: last measured sample count per guest result address; the active query index or -1.
   struct OcclusionResult {
@@ -2772,6 +2782,8 @@ VkPipeline NativeCommandProcessor::GetPipeline(const PipelineKey& key, VulkanSha
     // Needed now (full-screen pass). RC77: if the worker has not started it yet, it is taken out of the queue and
     // created here instead of waiting behind every job queued before it (up to ~1 s on entering an area).
     ScopedUs timer(stats_.us_pipelines);
+    ScopedUs sync_timer(stats_.us_pipeline_sync);
+    ++stats_.pipelines_sync;
     std::unique_lock<std::mutex> lock(pipeline_mutex_);
     if (REXCVAR_GET(ds2_native_pipeline_steal)) {
       for (auto jit = pipeline_jobs_.begin(); jit != pipeline_jobs_.end(); ++jit) {
@@ -2820,6 +2832,8 @@ VkPipeline NativeCommandProcessor::GetPipeline(const PipelineKey& key, VulkanSha
     }
   }
   ScopedUs timer(stats_.us_pipelines);
+  ScopedUs sync_timer(stats_.us_pipeline_sync);
+  ++stats_.pipelines_sync;
   VkPipeline pipeline = CreatePipelineObject(key, vsm, psm, layout);
   ++stats_.pipelines;
   pipelines_.emplace(hash, pipeline);
@@ -3628,6 +3642,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   const xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) return IssueCopy();
   ScopedUs draw_timer(stats_.us_draws);
+  const uint64_t draw_start_us = NowUs();
+  const uint64_t draw_start_textures = stats_.us_textures, draw_start_pipelines = stats_.us_pipelines;
   ++stats_.prim_counts[uint32_t(prim_type) & 31];
   if (!frame_open_ && !BeginFrame()) return false;
 
@@ -3825,6 +3841,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (vst->is_valid()) vst->GetOrCreateShaderModule();
   }
   stats_.us_pipelines += NowUs() - translate_start;
+  stats_.us_translate += NowUs() - translate_start;
   if (!vst->is_valid() || !vst->shader_module() || (pst && (!pst->is_valid() || !pst->shader_module()))) {
     ++stats_.draws_failed;
     return true;
@@ -4105,6 +4122,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   const uint64_t draw_frame = frame_;
   // Vertex data: copy every vertex buffer the shader fetches into the upload buffer, patch its fetch constant.
   const uint64_t geometry_start = NowUs();
+  stats_.us_prelude += (geometry_start - draw_start_us) - (stats_.us_textures - draw_start_textures) -
+                       (stats_.us_pipelines - draw_start_pipelines);
   VkDeviceSize native_vertex_offsets[8] = {};
   uint32_t fetch_constants[6 * 32];
   std::memcpy(fetch_constants, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(fetch_constants));
@@ -4359,10 +4378,24 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   const uint64_t constants_start = NowUs();
   const VkDeviceSize ub_align = std::max<VkDeviceSize>(device()->properties().minUniformBufferOffsetAlignment, 16);
   VkDescriptorBufferInfo cbuf[SpirvShaderTranslator::kConstantBufferCount];
+  const bool reuse_constants = REXCVAR_GET(ds2_native_constant_reuse);
   auto put = [&](uint32_t index, const void* data, size_t size) -> bool {
+    // RC77+: the same bytes as the previous draw's buffer of this kind (in this upload buffer) reuse its upload.
+    LastConstantUpload& last = last_constant_uploads_[index];
+    if (reuse_constants && last.frame == frame_ && last.data.size() == size &&
+        std::memcmp(last.data.data(), data, size) == 0) {
+      cbuf[index] = {slot().upload, last.offset, size};
+      ++stats_.constant_uploads_reused;
+      return true;
+    }
     VkDeviceSize off;
     if (!UploadImmutable(data, size, ub_align, index, off)) return false;
     cbuf[index] = {slot().upload, off, size};
+    if (reuse_constants) {
+      last.data.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
+      last.offset = off;
+      last.frame = frame_;
+    }
     return true;
   };
   auto put_float = [&](uint32_t index, const Shader& shader, uint32_t first_register) -> bool {
@@ -5252,14 +5285,22 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     if (hitch_ms > 0 && frame_us > uint64_t(hitch_ms) * 1000 && draws_this_frame_ > 0) {
       REXGPU_WARN("[native] hitch: frame took {:.1f} ms ({} draws): waiting for the GPU {:.1f}, draws {:.1f} "
                   "(textures {:.1f}, {} uploads; shaders+pipelines {:.1f}), resolves {:.1f}; outside the command "
-                  "processor {:.1f} ms",
+                  "processor {:.1f} ms | shaders {:.1f} ms, {} pipelines created at once {:.1f} ms, texture texels "
+                  "{:.1f} MB",
                   frame_us / 1000.0, draws_this_frame_, (cur[0] - hitch_prev_[0]) / 1000.0,
                   (cur[1] - hitch_prev_[1]) / 1000.0, (cur[2] - hitch_prev_[2]) / 1000.0, cur[5] - hitch_prev_[5],
                   (cur[3] - hitch_prev_[3]) / 1000.0, (cur[4] - hitch_prev_[4]) / 1000.0,
                   (int64_t(frame_us) - int64_t(cur[0] - hitch_prev_[0]) - int64_t(cur[1] - hitch_prev_[1]) -
-                   int64_t(cur[4] - hitch_prev_[4])) / 1000.0);
+                   int64_t(cur[4] - hitch_prev_[4])) / 1000.0,
+                  (stats_.us_translate - hitch_prev_extra_[0]) / 1000.0, stats_.pipelines_sync - hitch_prev_extra_[1],
+                  (stats_.us_pipeline_sync - hitch_prev_extra_[2]) / 1000.0,
+                  (stats_.texture_upload_bytes - hitch_prev_extra_[3]) / 1048576.0);
     }
     std::memcpy(hitch_prev_, cur, sizeof(cur));
+    hitch_prev_extra_[0] = stats_.us_translate;
+    hitch_prev_extra_[1] = stats_.pipelines_sync;
+    hitch_prev_extra_[2] = stats_.us_pipeline_sync;
+    hitch_prev_extra_[3] = stats_.texture_upload_bytes;
   }
   msaa_heavy_last_frame_.swap(msaa_heavy_this_frame_);
   msaa_heavy_this_frame_.clear();
@@ -5698,6 +5739,11 @@ void NativeCommandProcessor::LogStats() {
               stats_.texture_sets_dropped / n, persistent_texture_sets_.size());
   REXGPU_INFO("[native] constant sets/frame: {:.1f} reused, {:.1f} created | image resolve barriers/frame {:.1f}",
               stats_.constant_sets_reused / n, stats_.constant_sets_created / n, stats_.resolve_image_barriers / n);
+  REXGPU_INFO("[native] draw setup ms/frame {:.2f} (before geometry, without textures and shaders) | constant "
+              "uploads reused/frame {:.1f} | in the interval: shaders translated or restored {:.1f} ms, {} pipelines "
+              "created at once {:.1f} ms",
+              stats_.us_prelude / n / 1000.0, stats_.constant_uploads_reused / n, stats_.us_translate / 1000.0,
+              stats_.pipelines_sync, stats_.us_pipeline_sync / 1000.0);
   REXGPU_INFO("[native] immutable uploads/frame: {:.1f} hits, {:.2f} MB saved",
               stats_.content_hits / n, stats_.content_saved_bytes / n / 1048576.0);
   REXGPU_INFO("[native] vertex draws/frame: {:.1f} hardware inputs, {:.1f} legacy fetch",
@@ -5737,6 +5783,7 @@ void NativeCommandProcessor::LogStats() {
   const uint64_t pipelines = stats_.pipelines, swaps = stats_.swaps, presented = stats_.swaps_presented;
   stats_ = Stats();
   std::memset(hitch_prev_, 0, sizeof(hitch_prev_));
+  std::memset(hitch_prev_extra_, 0, sizeof(hitch_prev_extra_));
   stats_.pipelines = pipelines;
   stats_.swaps = swaps;
   stats_.swaps_presented = presented;
