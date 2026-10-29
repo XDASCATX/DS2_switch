@@ -16,6 +16,9 @@ class SpirvShaderLibrary {
   // short by a power-off); valid_size() is where the valid records end.
   bool Open(const std::filesystem::path& path, uint64_t expected_signature = 0, bool tolerate_tail = false);
   uint64_t valid_size() const { return valid_size_; }
+  // RC68: with tolerate_tail the file is opened for update when possible (Horizon refuses a second handle that
+  // writes to a file already open), so the learned cache appends through this same handle.
+  FILE* writable_file() const { return writable_ ? file_ : nullptr; }
   bool Contains(uint64_t ucode_hash, uint64_t modification, uint64_t signature, uint64_t type) const {
     return entries_.count(Key{ucode_hash, modification, signature, type}) != 0;
   }
@@ -31,6 +34,7 @@ class SpirvShaderLibrary {
   using Key = std::array<uint64_t, 4>;
   bool ReadIndex(const std::filesystem::path& path);
   FILE* file_ = nullptr;
+  bool writable_ = false;
   uint64_t file_size_ = 0;
   uint64_t valid_size_ = 0;
   bool indexed_ = false;

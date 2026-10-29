@@ -59,9 +59,15 @@ bool SpirvShaderLibrary::Open(const std::filesystem::path& path, uint64_t expect
   valid_size_ = 0;
   indexed_ = false;
   entries_.clear();
-  FILE* file = rex::filesystem::OpenFile(path, "rb");
+  writable_ = false;
+  FILE* file = tolerate_tail ? rex::filesystem::OpenFile(path, "r+b") : nullptr;
+  if (file) {
+    writable_ = true;
+  } else {
+    file = rex::filesystem::OpenFile(path, "rb");
+  }
   if (!file) return false;
-  auto fail = [&]() { fclose(file); entries_.clear(); return false; };
+  auto fail = [&]() { fclose(file); entries_.clear(); writable_ = false; return false; };
   if (fseek(file, 0, SEEK_END)) return fail();
   const long file_size = ftell(file);
   if (file_size < long(sizeof(kHeader)) || fseek(file, 0, SEEK_SET)) return fail();
@@ -264,6 +270,8 @@ struct LearnedCache {
   std::mutex mutex;
   SpirvShaderLibrary library;
   FILE* append = nullptr;
+  bool append_shared = false;  // append is the library's own read handle (opened for update)
+  long append_offset = -1;     // where the next record goes (-1: the current position)
   bool initialized = false, opened = false;
   uint64_t hits = 0, misses = 0, appended = 0, appended_bytes = 0;
   std::set<std::array<uint64_t, 4>> written;
@@ -285,9 +293,12 @@ void InitLearned(LearnedCache& c, uint64_t signature) {
   const auto start = std::chrono::steady_clock::now();
   c.opened = c.library.Open(full_path, signature, true);
   if (c.opened) {
-    c.append = rex::filesystem::OpenFile(full_path, "r+b");
-    if (c.append && fseek(c.append, long(c.library.valid_size()), SEEK_SET)) {
-      fclose(c.append);
+    c.append_offset = long(c.library.valid_size());
+    c.append = c.library.writable_file();
+    c.append_shared = c.append != nullptr;
+    if (!c.append) c.append = rex::filesystem::OpenFile(full_path, "r+b");
+    if (c.append && fseek(c.append, c.append_offset, SEEK_SET)) {
+      if (!c.append_shared) fclose(c.append);
       c.append = nullptr;
     }
   } else {
@@ -314,15 +325,23 @@ void RecordConfiguredSpirvCache(const Shader::Translation& translation, uint64_t
   const std::array<uint64_t, 4> key = {shader.ucode_data_hash(), translation.modification(), signature,
                                        uint64_t(shader.type())};
   if (c.library.Contains(key[0], key[1], key[2], key[3]) || !c.written.insert(key).second) return;
-  const long before = ftell(c.append);
-  if (!SpirvShaderLibrary::Append(c.append, translation, signature) || fflush(c.append)) {
-    REXGPU_WARN("[shader cache] append failed; disabled for this session");
-    fclose(c.append);
+  // The handle may be shared with the reads of the cache: position it at the end of the valid records.
+  if (c.append_offset >= 0 && fseek(c.append, c.append_offset, SEEK_SET)) {
+    REXGPU_WARN("[shader cache] seek failed; appending disabled for this session");
+    if (!c.append_shared) fclose(c.append);
     c.append = nullptr;
     return;
   }
+  const long before = ftell(c.append);
+  if (!SpirvShaderLibrary::Append(c.append, translation, signature) || fflush(c.append)) {
+    REXGPU_WARN("[shader cache] append failed; disabled for this session");
+    if (!c.append_shared) fclose(c.append);
+    c.append = nullptr;
+    return;
+  }
+  c.append_offset = ftell(c.append);
   ++c.appended;
-  c.appended_bytes += uint64_t(ftell(c.append) - before);
+  c.appended_bytes += uint64_t(c.append_offset - before);
   if (c.appended <= 4 || c.appended % 128 == 0) {
     REXGPU_INFO("[shader cache] {} new variants appended this session ({:.1f} MB)", c.appended,
                 c.appended_bytes / 1048576.0);

@@ -1327,6 +1327,30 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
         if_rt_write_mask_not_empty.makeEndIf();
         if_fsi_color_written.makeEndIf();
       } else {
+        // 7e3 render targets are stored as RGBA16F on the host: emulate the Xenos range
+        // [0, 31.875] (alpha [0, 1]), also turning NaN into 0 (NClamp), so HDR overflow
+        // or NaN doesn't reach luminance averaging, bloom and blending.
+        {
+          spv::Id is_7e3 = builder_->createBinOp(
+              spv::OpINotEqual, type_bool_,
+              builder_->createBinOp(
+                  spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
+                  builder_->makeUintConstant(kSysFlag_ClampColor0To7e3 << color_target_index)),
+              const_uint_0_);
+          SpirvBuilder::IfBuilder if_7e3(is_7e3, spv::SelectionControlDontFlattenMask, *builder_);
+          spv::Id max_7e3 = builder_->makeFloatConstant(31.875f);
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(max_7e3);
+          id_vector_temp_.push_back(max_7e3);
+          id_vector_temp_.push_back(max_7e3);
+          id_vector_temp_.push_back(const_float_1_);
+          spv::Id color_max = builder_->makeCompositeConstant(type_float4_, id_vector_temp_);
+          spv::Id color_clamped =
+              builder_->createTriBuiltinCall(type_float4_, ext_inst_glsl_std_450_, GLSLstd450NClamp,
+                                             color, const_float4_0_, color_max);
+          if_7e3.makeEndIf();
+          color = if_7e3.createMergePhi(color_clamped, color);
+        }
         // Convert to gamma space - this is incorrect, since it must be done
         // after blending on the Xbox 360, but this is just one of many blending
         // issues in the host render target path.

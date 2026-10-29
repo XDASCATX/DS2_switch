@@ -201,6 +201,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSysFlag_FSIDepthWrite = 1u << kSysFlag_FSIDepthWrite_Shift,
     kSysFlag_FSIStencilTest = 1u << kSysFlag_FSIStencilTest_Shift,
     kSysFlag_FSIDepthStencilEarlyWrite = 1u << kSysFlag_FSIDepthStencilEarlyWrite_Shift,
+    // RC68, host render target path only (the FSI bits are free there): clamp the color output of
+    // render target N to the Xenos 7e3 range [0, 31.875] (alpha [0, 1], NaN -> 0) for
+    // k_2_10_10_10_FLOAT render targets stored as RGBA16F. Bits N..N+3 from kSysFlag_ClampColor0To7e3.
+    kSysFlag_ClampColor0To7e3 = 1u << kSysFlag_FSIDepthStencil_Shift,
   };
   static_assert(kSysFlag_Count <= 32, "Too many flags in the system constants");
 

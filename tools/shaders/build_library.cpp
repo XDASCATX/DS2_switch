@@ -310,6 +310,12 @@ int main(int argc, char** argv) {
       mod.pixel.alpha_test_always = 1;
       modifications.insert(mod.value);
     }
+    // With learned patterns, keep only them and the default variant (the generic RC60 enumeration never hit).
+    if (!learned_patterns.empty()) {
+      modifications.clear();
+      modifications.insert(vertex ? translator.GetDefaultVertexShaderModification(register_count)
+                                  : translator.GetDefaultPixelShaderModification(register_count));
+    }
     for (const auto& [type, pattern] : learned_patterns) {
       if (type != uint32_t(shader.type())) continue;
       SpirvShaderTranslator::Modification mod(pattern);

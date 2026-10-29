@@ -92,9 +92,17 @@ REXCVAR_DEFINE_BOOL(ds2_native_gamma_ramp, true, "GPU",
                     "DS2 native renderer: apply the game's 256-entry gamma ramp when presenting (as the emulation)");
 REXCVAR_DEFINE_BOOL(ds2_native_textures_1d, true, "GPU",
                     "DS2 native renderer: sample 1D textures (false = white, as before RC63)");
+REXCVAR_DEFINE_BOOL(ds2_native_clamp_7e3, true, "GPU",
+                    "Clamp pixel shader color output for k_2_10_10_10_FLOAT render targets to the "
+                    "Xenos 7e3 range [0, 31.875] (NaN -> 0), as the guest render target would store it");
 REXCVAR_DEFINE_BOOL(ds2_native_7e3_as_r11g11b10, false, "GPU",
                     "DS2 native renderer (RC67 test): store k_2_10_10_10_FLOAT render targets as B10G11R11_UFLOAT "
                     "instead of RGBA16F (half the bandwidth, no alpha); restart");
+REXCVAR_DEFINE_BOOL(ds2_native_resolve_depth_only, true, "GPU",
+                    "Depth resolves copy only the depth plane (textures never sample the stencil of a resolve)");
+REXCVAR_DEFINE_BOOL(ds2_native_state_filter, true, "GPU",
+                    "Skip vkCmd* state calls (pipeline, descriptor sets, viewport, scissor, depth bias, blend "
+                    "constants, stencil) that repeat what the command buffer already has");
 REXCVAR_DEFINE_BOOL(ds2_native_barrier_elision, true, "GPU",
                     "DS2 native renderer: skip a pipeline barrier when no GPU work was recorded since the previous one "
                     "(each barrier is a GPU wait-for-idle on NVK)");
@@ -735,6 +743,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t texture_1d = 0, texture_white_dimension = 0, texture_cube = 0, cube_faces_from_resolves = 0;
     uint64_t depth_decoded_fetches = 0, depth_decodes = 0;
     uint64_t barriers_issued = 0, barriers_elided = 0;
+    uint64_t state_calls = 0, state_calls_skipped = 0;
     uint64_t upload_bytes = 0, pipelines = 0, render_passes_begun = 0;
     uint64_t prim_counts[32] = {};
     uint64_t conversions = 0, texture_levels = 0, texture_upload_bytes = 0, submits = 0;
@@ -797,6 +806,22 @@ class NativeCommandProcessor final : public CommandProcessor {
   void LogGammaRamp();
   uint64_t last_gamma_ramp_hash_ = 0;
   bool work_since_barrier_ = true;  // RC66: GPU work recorded since the last pipeline barrier
+  // RC68: the draw state last recorded in the command buffer, to skip redundant vkCmd* calls (NVK re-emits the
+  // state of every bound pipeline and dynamic state at the next draw).
+  struct DrawStateCache {
+    bool valid = false;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkDescriptorSet sets[4] = {};
+    uint32_t offset_count = 0;
+    uint32_t offsets[SpirvShaderTranslator::kConstantBufferCount] = {};
+    VkViewport viewport = {};
+    VkRect2D scissor = {};
+    float bias[2] = {};
+    float blend[4] = {};
+    uint32_t stencil[6] = {};
+  } draw_state_;
+  void InvalidateDrawState() { draw_state_.valid = false; }
   void DumpImages();
   void EvictTextures();
   // GPU profile: a timestamp that ends the current segment and starts one labelled `label`.
@@ -1250,6 +1275,7 @@ bool NativeCommandProcessor::BeginFrame() {
   VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   if (dfn().vkBeginCommandBuffer(s.cmd, &bi) != VK_SUCCESS) return false;
+  InvalidateDrawState();
   frame_open_ = true;
   work_since_barrier_ = true;
   s.queries = 0;
@@ -1991,6 +2017,7 @@ bool NativeCommandProcessor::Convert(ConvertMode mode, NativeImage& src, NativeI
   bi.framebuffer = fb;
   bi.renderArea = {{0, 0}, {dst.width, dst.height}};
   work_since_barrier_ = true;
+  InvalidateDrawState();
   dfn().vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
   dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
   dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, convert_layout_[layout_index], 0, 1, &set, 0,
@@ -3488,6 +3515,11 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (ci.color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
       flags |= SpirvShaderTranslator::kSysFlag_ConvertColor0ToGamma << i;
     }
+    if (REXCVAR_GET(ds2_native_clamp_7e3) &&
+        (ci.color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+         ci.color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16)) {
+      flags |= SpirvShaderTranslator::kSysFlag_ClampColor0To7e3 << i;
+    }
   }
   flags |= index_load_flags;
   sc.flags = flags;
@@ -3732,6 +3764,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     bi.framebuffer = fb;
     bi.renderArea = {{0, 0}, {rt_width, rt_height}};
     work_since_barrier_ = true;
+    InvalidateDrawState();
     dfn().vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
     in_render_pass_ = true;
     if (Tracing()) {
@@ -3810,10 +3843,31 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   } else {
     ++stats_.legacy_vertex_draws;
   }
-  dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-  dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout->layout, 0, 4, sets,
-                              dynamic_ubo ? SpirvShaderTranslator::kConstantBufferCount : 0,
-                              dynamic_ubo ? constant_offsets : nullptr);
+  // RC68: redundant state calls are skipped (ds2_native_state_filter); the cache is reset with every command
+  // buffer, render pass and foreign pipeline bind.
+  DrawStateCache& ds = draw_state_;
+  const bool filter = REXCVAR_GET(ds2_native_state_filter) && ds.valid;
+  const uint32_t offset_count = dynamic_ubo ? uint32_t(SpirvShaderTranslator::kConstantBufferCount) : 0;
+  if (!filter || ds.pipeline != pipeline) {
+    dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    ds.pipeline = pipeline;
+    ++stats_.state_calls;
+  } else {
+    ++stats_.state_calls_skipped;
+  }
+  if (!filter || ds.layout != layout->layout || std::memcmp(ds.sets, sets, sizeof(ds.sets)) ||
+      ds.offset_count != offset_count ||
+      (offset_count && std::memcmp(ds.offsets, constant_offsets, sizeof(uint32_t) * offset_count))) {
+    dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout->layout, 0, 4, sets, offset_count,
+                                  offset_count ? constant_offsets : nullptr);
+    ds.layout = layout->layout;
+    std::memcpy(ds.sets, sets, sizeof(ds.sets));
+    ds.offset_count = offset_count;
+    if (offset_count) std::memcpy(ds.offsets, constant_offsets, sizeof(uint32_t) * offset_count);
+    ++stats_.state_calls;
+  } else {
+    ++stats_.state_calls_skipped;
+  }
   VkViewport vp;
   vp.x = float(viewport.xy_offset[0]);
   vp.y = float(viewport.xy_offset[1]);
@@ -3821,32 +3875,67 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   vp.height = float(std::max(viewport.xy_extent[1], 1u));
   vp.minDepth = viewport.z_min;
   vp.maxDepth = viewport.z_max;
-  dfn().vkCmdSetViewport(cmd, 0, 1, &vp);
+  if (!filter || std::memcmp(&ds.viewport, &vp, sizeof(vp))) {
+    dfn().vkCmdSetViewport(cmd, 0, 1, &vp);
+    ds.viewport = vp;
+    ++stats_.state_calls;
+  } else {
+    ++stats_.state_calls_skipped;
+  }
   VkRect2D sr;
   sr.offset.x = int32_t(std::min(scissor.offset[0], rt_width));
   sr.offset.y = int32_t(std::min(scissor.offset[1], rt_height));
   sr.extent.width = std::min(scissor.extent[0], rt_width - uint32_t(sr.offset.x));
   sr.extent.height = std::min(scissor.extent[1], rt_height - uint32_t(sr.offset.y));
-  dfn().vkCmdSetScissor(cmd, 0, 1, &sr);
+  if (!filter || std::memcmp(&ds.scissor, &sr, sizeof(sr))) {
+    dfn().vkCmdSetScissor(cmd, 0, 1, &sr);
+    ds.scissor = sr;
+    ++stats_.state_calls;
+  } else {
+    ++stats_.state_calls_skipped;
+  }
   float bias_const = 0.0f, bias_slope = 0.0f;
   if (polygonal && (sc_mode.poly_offset_front_enable || sc_mode.poly_offset_back_enable)) {
     bias_slope = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE) * xenos::kPolygonOffsetScaleSubpixelUnit;
     bias_const = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET) * float(1 << 24);
   }
-  dfn().vkCmdSetDepthBias(cmd, bias_const, 0.0f, bias_slope);
+  const float bias[2] = {bias_const, bias_slope};
+  if (!filter || std::memcmp(ds.bias, bias, sizeof(bias))) {
+    dfn().vkCmdSetDepthBias(cmd, bias_const, 0.0f, bias_slope);
+    std::memcpy(ds.bias, bias, sizeof(bias));
+    ++stats_.state_calls;
+  } else {
+    ++stats_.state_calls_skipped;
+  }
   const float blend_constants[4] = {regs.Get<float>(XE_GPU_REG_RB_BLEND_RED), regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
                                     regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE),
                                     regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA)};
-  dfn().vkCmdSetBlendConstants(cmd, blend_constants);
+  if (!filter || std::memcmp(ds.blend, blend_constants, sizeof(blend_constants))) {
+    dfn().vkCmdSetBlendConstants(cmd, blend_constants);
+    std::memcpy(ds.blend, blend_constants, sizeof(blend_constants));
+    ++stats_.state_calls;
+  } else {
+    ++stats_.state_calls_skipped;
+  }
   const auto srm = regs.Get<reg::RB_STENCILREFMASK>();
   const auto srm_bf = regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF);
   const bool bf = polygonal && depth_control.backface_enable;
-  dfn().vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_BIT, srm.stencilmask);
-  dfn().vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_BACK_BIT, bf ? srm_bf.stencilmask : srm.stencilmask);
-  dfn().vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_BIT, srm.stencilwritemask);
-  dfn().vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_BACK_BIT, bf ? srm_bf.stencilwritemask : srm.stencilwritemask);
-  dfn().vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_BIT, srm.stencilref);
-  dfn().vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_BACK_BIT, bf ? srm_bf.stencilref : srm.stencilref);
+  const uint32_t stencil[6] = {srm.stencilmask, bf ? srm_bf.stencilmask : srm.stencilmask, srm.stencilwritemask,
+                               bf ? srm_bf.stencilwritemask : srm.stencilwritemask, srm.stencilref,
+                               bf ? srm_bf.stencilref : srm.stencilref};
+  if (!filter || std::memcmp(ds.stencil, stencil, sizeof(stencil))) {
+    dfn().vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_BIT, stencil[0]);
+    dfn().vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_BACK_BIT, stencil[1]);
+    dfn().vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_BIT, stencil[2]);
+    dfn().vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_BACK_BIT, stencil[3]);
+    dfn().vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_BIT, stencil[4]);
+    dfn().vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_BACK_BIT, stencil[5]);
+    std::memcpy(ds.stencil, stencil, sizeof(stencil));
+    ++stats_.state_calls;
+  } else {
+    ++stats_.state_calls_skipped;
+  }
+  ds.valid = true;
   if (use_indices) {
     dfn().vkCmdBindIndexBuffer(cmd, slot().upload, index_offset, index_type);
     work_since_barrier_ = true;
@@ -3896,6 +3985,7 @@ bool NativeCommandProcessor::ClearRect(NativeImage& rt, const VkClearValue& valu
   bi.renderArea = {{0, 0}, {rt.width, rt.height}};
   VkCommandBuffer cmd = slot().cmd;
   work_since_barrier_ = true;
+  InvalidateDrawState();
   dfn().vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
   VkClearAttachment ca = {};
   ca.aspectMask = rt.depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
@@ -4150,7 +4240,10 @@ bool NativeCommandProcessor::IssueCopy() {
     }
     ResolveBarrier(*copy_src, r.image, true);
     VkImageCopy c = {};
-    c.srcSubresource = {VkImageAspectFlags(is_depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+    // RC68: textures sample only the depth of a depth resolve; the stencil plane is not copied by default.
+    c.srcSubresource = {VkImageAspectFlags(is_depth ? (REXCVAR_GET(ds2_native_resolve_depth_only)
+                                                           ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                                           : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
                                                     : VK_IMAGE_ASPECT_COLOR_BIT),
                         0, 0, 1};
     c.dstSubresource = c.srcSubresource;
@@ -4322,6 +4415,7 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           rbi.framebuffer = fb;
           rbi.renderArea = {{0, 0}, {w, h}};
           work_since_barrier_ = true;
+          InvalidateDrawState();
           dfn().vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
           dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, present_pipeline_);
           dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, present_layout_, 0, 1, &set, 0,
@@ -4600,8 +4694,9 @@ void NativeCommandProcessor::LogStats() {
       stats_.texture_from_resolve / n, stats_.texture_unsupported / n, stats_.upload_bytes / n / 1048576.0,
       pipelines_.size(), render_targets_.size(), textures_.size(), resolved_.size(), stats_.swaps_presented,
       stats_.swaps);
-  REXGPU_INFO("[native] barriers/frame: {:.1f} issued, {:.1f} elided", stats_.barriers_issued / n,
-              stats_.barriers_elided / n);
+  REXGPU_INFO("[native] barriers/frame: {:.1f} issued, {:.1f} elided | draw state groups/frame: {:.1f} recorded, "
+              "{:.1f} skipped as redundant", stats_.barriers_issued / n, stats_.barriers_elided / n,
+              stats_.state_calls / n, stats_.state_calls_skipped / n);
   REXGPU_INFO("[native] texture fetches/frame: {:.1f} 1D, {:.1f} cube ({:.2f} faces copied from resolves), "
               "{:.1f} white (3D/unsupported cube/other dimension), {:.1f} depth from 8888 ({:.2f} decodes)",
               stats_.texture_1d / n, stats_.texture_cube / n, stats_.cube_faces_from_resolves / n,
