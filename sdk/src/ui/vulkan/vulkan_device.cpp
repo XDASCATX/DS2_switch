@@ -226,6 +226,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_maintenance1, 1, 1)
     // #141.
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_shader_stencil_export)
+    // #144. DS2 native renderer (RC71): host 4x MSAA with the Xenos ordered-grid sample positions.
+    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_sample_locations)
     // #148.
     XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_image_format_list, 1, 2)
     if (get_physical_device_properties2_supported) {

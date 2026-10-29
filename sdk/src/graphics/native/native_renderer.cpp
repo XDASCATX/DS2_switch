@@ -143,7 +143,12 @@ REXCVAR_DEFINE_INT32(ds2_native_hitch_ms, 100, "GPU",
                      "DS2 native renderer (v55): log what a frame spent its time on when it takes longer than this "
                      "(0 = never)")
     .range(0, 100000);
-REXCVAR_DEFINE_BOOL(ds2_native_resolve_clip_to_dest, true, "GPU",
+REXCVAR_DEFINE_BOOL(ds2_native_msaa_host, true, "GPU",
+                    "RC71: draw 4x MSAA passes with color targets into real 4x MSAA images (pixel shaders once per "
+                    "pixel as on the Xbox 360) instead of the 2x2 sample-space image; false = sample space as before");
+REXCVAR_DEFINE_BOOL(ds2_native_msaa_skip_clear_import, true, "GPU",
+                    "RC71: a 4x pass that starts with a full clear draw does not import the previous contents");
+REXCVAR_DEFINE_BOOL(ds2_native_resolve_clip_to_dest, false, "GPU",
                     "RC70: clip a 1x resolve rectangle to the destination texture size (no logical-size copies)");
 REXCVAR_DEFINE_BOOL(ds2_native_capture_resolves, true, "GPU",
                     "RC70: during an L3+R3 capture also write every color resolve at its point in the frame (snap_*)");
@@ -467,6 +472,7 @@ struct NativeImage {
   uint32_t layers = 1;  // 6 for a cube
   bool cube = false;
   bool depth = false;
+  uint32_t samples = 1;      // RC71: 4 for the host MSAA copies of 4x render targets
   bool initialized = false;  // transitioned to GENERAL
 };
 
@@ -648,6 +654,8 @@ struct PipelineKey {
   uint32_t color_count;
   uint32_t has_ps;
   uint32_t depth_clamp;
+  uint32_t samples;           // RC71: 4 for host 4x MSAA passes, else 0 (1x)
+  uint32_t samples_reserved;  // keeps the key free of padding
   uint32_t texture_layout;  // texture/sampler counts for the pipeline layout
   uint32_t native_binding_count, native_attribute_count;
   VkVertexInputBindingDescription native_bindings[8];
@@ -751,6 +759,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t depth_decoded_fetches = 0, depth_decodes = 0;
     uint64_t barriers_issued = 0, barriers_elided = 0;
     uint64_t state_calls = 0, state_calls_skipped = 0;
+    uint64_t msaa_draws = 0, msaa_imports = 0, msaa_imports_skipped = 0, msaa_exports = 0;
     uint64_t upload_bytes = 0, pipelines = 0, render_passes_begun = 0;
     uint64_t prim_counts[32] = {};
     uint64_t conversions = 0, texture_levels = 0, texture_upload_bytes = 0, submits = 0;
@@ -783,11 +792,31 @@ class NativeCommandProcessor final : public CommandProcessor {
   void ResolveBarrier(NativeImage& src, NativeImage& dst, bool before);
   void EndRenderPass();
   bool CreateImage(NativeImage& img, VkFormat format, uint32_t w, uint32_t h, bool depth, VkImageUsageFlags usage,
-                   uint32_t levels = 1, bool cube = false);
+                   uint32_t levels = 1, bool cube = false, uint32_t samples = 1);
   void DestroyImage(NativeImage& img, bool deferred);
   void EnsureGeneral(NativeImage& img);
   NativeImage* GetRenderTarget(uint32_t base, uint32_t pitch, uint32_t format, bool depth, uint32_t height_hint);
-  VkRenderPass GetRenderPass(const VkFormat* color_formats, uint32_t color_count, VkFormat depth_format);
+  VkRenderPass GetRenderPass(const VkFormat* color_formats, uint32_t color_count, VkFormat depth_format,
+                             uint32_t samples = 1);
+  // RC71: host 4x MSAA. A 4x render target keeps its sample-space image (the EDRAM view every other pass, resolve
+  // and conversion uses) and gets a 4x image of half the size for the passes drawn in 4x MSAA: pixel shaders run
+  // once per pixel there, as on the Xbox 360, instead of once per sample. Contents move between the two only
+  // when the other one is needed.
+  struct MsaaShadow {
+    NativeImage image;
+    bool valid = false;  // holds the current contents (imported, or drawn after a full clear)
+    bool newer = false;  // drawn since the last export to the sample-space image
+  };
+  std::unordered_map<VkImage, MsaaShadow> msaa_shadows_;
+  bool msaa_supported_ = false;
+  bool msaa_lookup_ = false;  // GetRenderTarget calls of a 4x pass: no export
+  std::unordered_map<uint64_t, VkPipeline> msaa_pipelines_;
+  VkShaderModule msaa_fs_[6] = {};
+  NativeImage* GetMsaaShadow(NativeImage& rt, bool import);
+  void ExportMsaaShadow(NativeImage& rt, bool invalidate);
+  void ExportAllMsaaShadows();
+  bool MsaaTransfer(NativeImage& rt, NativeImage& ms, bool to_ms);
+  VkPipeline GetMsaaPipeline(uint32_t mode, VkFormat format, bool ms, VkRenderPass pass);
   const PipelineLayoutEntry* GetPipelineLayout(uint32_t tv, uint32_t sv, uint32_t tp, uint32_t sp);
   VkDescriptorSetLayout GetTextureSetLayout(bool vertex, uint32_t textures, uint32_t samplers);
   VkPipeline GetPipeline(const PipelineKey& key, VulkanShader::VulkanTranslation* vs,
@@ -1163,6 +1192,14 @@ bool NativeCommandProcessor::SetupContext() {
   if (!SetupConversions()) {
     REXGPU_WARN("[native] format reinterpretation passes unavailable");
   }
+  msaa_supported_ = vulkan_device_->extensions().ext_EXT_sample_locations && convert_vs_ &&
+                    (props.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) &&
+                    (props.framebufferDepthSampleCounts & VK_SAMPLE_COUNT_4_BIT) &&
+                    (props.sampledImageDepthSampleCounts & VK_SAMPLE_COUNT_4_BIT) &&
+                    (props.sampledImageStencilSampleCounts & VK_SAMPLE_COUNT_4_BIT);
+  REXGPU_INFO("[native] host 4x MSAA: {} (sample locations {}, cvar {})", msaa_supported_ ? "available" : "unavailable",
+              vulkan_device_->extensions().ext_EXT_sample_locations ? "yes" : "no",
+              REXCVAR_GET(ds2_native_msaa_host));
   REXGPU_INFO("[native] DS2 native renderer ready: {} shared memory binding(s), geometry shaders {}",
               shared_memory_bindings_, props.geometryShader ? "yes" : "no");
   return true;
@@ -1193,6 +1230,14 @@ void NativeCommandProcessor::ShutdownContext() {
   DestroyImage(white_cube_, false);
   DestroyImage(color_resolve_scratch_, false);
   for (auto& [k, p] : convert_pipelines_) dfn().vkDestroyPipeline(dev, p, nullptr);
+  for (auto& [k, p] : msaa_pipelines_) {
+    if (p) dfn().vkDestroyPipeline(dev, p, nullptr);
+  }
+  for (VkShaderModule m : msaa_fs_) {
+    if (m) dfn().vkDestroyShaderModule(dev, m, nullptr);
+  }
+  for (auto& [k, sh] : msaa_shadows_) DestroyImage(sh.image, false);
+  msaa_shadows_.clear();
   for (uint32_t i = 0; i < 2; ++i) {
     if (convert_layout_[i]) dfn().vkDestroyPipelineLayout(dev, convert_layout_[i], nullptr);
     if (convert_set_layout_[i]) dfn().vkDestroyDescriptorSetLayout(dev, convert_set_layout_[i], nullptr);
@@ -1544,7 +1589,7 @@ void NativeCommandProcessor::EndRenderPass() {
 }
 
 bool NativeCommandProcessor::CreateImage(NativeImage& img, VkFormat format, uint32_t w, uint32_t h, bool depth,
-                                         VkImageUsageFlags usage, uint32_t levels, bool cube) {
+                                         VkImageUsageFlags usage, uint32_t levels, bool cube, uint32_t samples) {
   VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   ci.imageType = VK_IMAGE_TYPE_2D;
   if (cube) ci.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
@@ -1552,7 +1597,10 @@ bool NativeCommandProcessor::CreateImage(NativeImage& img, VkFormat format, uint
   ci.extent = {std::max(w, 1u), std::max(h, 1u), 1};
   ci.mipLevels = std::max(levels, 1u);
   ci.arrayLayers = cube ? 6 : 1;
-  ci.samples = VK_SAMPLE_COUNT_1_BIT;
+  ci.samples = VkSampleCountFlagBits(samples);
+  if (samples > 1 && depth && vulkan_device_->extensions().ext_EXT_sample_locations) {
+    ci.flags |= VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
+  }
   ci.tiling = VK_IMAGE_TILING_OPTIMAL;
   ci.usage = usage;
   ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -1589,6 +1637,7 @@ bool NativeCommandProcessor::CreateImage(NativeImage& img, VkFormat format, uint
   img.layers = ci.arrayLayers;
   img.cube = cube;
   img.depth = depth;
+  img.samples = samples;
   img.initialized = false;
   return true;
 }
@@ -1669,11 +1718,19 @@ NativeImage* NativeCommandProcessor::GetRenderTarget(uint32_t base, uint32_t pit
   if (it != render_targets_.end()) {
     if (it->second.height >= height) {
       AdoptRenderTarget(base, pitch, key, it->second);
+      // RC71: any use other than a host 4x MSAA pass sees the sample-space image: bring the 4x contents back
+      // first, and the 4x copy is stale once this image may be written.
+      if (!msaa_lookup_) ExportMsaaShadow(it->second, true);
       return &it->second;
     }
     // Taller than before: recreate (the old contents are lost - logged, rare).
     REXGPU_WARN("[native] render target {}@{} grows {} -> {} rows", format, base, it->second.height, height);
     EndRenderPass();
+    auto sit = msaa_shadows_.find(it->second.image);
+    if (sit != msaa_shadows_.end()) {
+      DestroyImage(sit->second.image, true);
+      msaa_shadows_.erase(sit);
+    }
     DestroyImage(it->second, true);
     render_targets_.erase(it);
   }
@@ -1734,6 +1791,9 @@ void NativeCommandProcessor::AdoptRenderTarget(uint32_t base, uint32_t pitch, ui
     mode = kConvertUnorm10ToFloat7e3;
   }
   if (mode == kConvertModeCount) return;
+  // RC71: the conversion reads the owner's sample-space image and writes this one.
+  ExportMsaaShadow(owner, true);
+  ExportMsaaShadow(img, true);
   const VkRect2D rect = {{0, 0}, {std::min(owner.width, img.width), std::min(owner.height, img.height)}};
   if (Tracing() && mode == kConvertDepthToRgba8) {
     REXGPU_INFO("[native trace]   convert depth->8888 at {}: before depth {:08X} stencil {:02X} color {:08X}", base,
@@ -2061,9 +2121,296 @@ bool NativeCommandProcessor::Convert(ConvertMode mode, NativeImage& src, NativeI
   return true;
 }
 
+// --- RC71: host 4x MSAA ------------------------------------------------------------------------------------------
+
+// Sample s of pixel (x, y) of the 4x image is pixel (2x + (s & 1), 2y + (s >> 1)) of the sample-space image (the
+// pipelines place the 4 samples at the Xenos ordered-grid positions, so both hold the same values).
+enum MsaaTransferMode : uint32_t {
+  kMsaaColorToMs,
+  kMsaaColorFromMs,
+  kMsaaDepthToMs,
+  kMsaaDepthFromMs,
+  kMsaaStencilToMs,
+  kMsaaStencilFromMs,
+  kMsaaTransferModeCount,
+};
+
+constexpr const char* kMsaaHeader = R"(#version 450
+layout(push_constant) uniform P { int bit; } pc;
+ivec2 SampleSpaceCoord() { return ivec2(gl_FragCoord.xy) * 2 + ivec2(gl_SampleID & 1, gl_SampleID >> 1); }
+int SampleOfPixel(ivec2 q) { return (q.x & 1) | ((q.y & 1) << 1); }
+)";
+
+constexpr const char* kMsaaBodies[kMsaaTransferModeCount] = {
+    R"(layout(set = 0, binding = 0) uniform sampler2D t;
+layout(location = 0) out vec4 o;
+void main() { o = texelFetch(t, SampleSpaceCoord(), 0); }
+)",
+    R"(layout(set = 0, binding = 0) uniform sampler2DMS t;
+layout(location = 0) out vec4 o;
+void main() { ivec2 q = ivec2(gl_FragCoord.xy); o = texelFetch(t, q >> 1, SampleOfPixel(q)); }
+)",
+    R"(layout(set = 0, binding = 0) uniform sampler2D t;
+void main() { gl_FragDepth = texelFetch(t, SampleSpaceCoord(), 0).r; }
+)",
+    R"(layout(set = 0, binding = 0) uniform sampler2DMS t;
+void main() { ivec2 q = ivec2(gl_FragCoord.xy); gl_FragDepth = texelFetch(t, q >> 1, SampleOfPixel(q)).r; }
+)",
+    R"(layout(set = 0, binding = 0) uniform usampler2D t;
+void main() { if (((texelFetch(t, SampleSpaceCoord(), 0).r >> uint(pc.bit)) & 1u) == 0u) discard; }
+)",
+    R"(layout(set = 0, binding = 0) uniform usampler2DMS t;
+void main() {
+  ivec2 q = ivec2(gl_FragCoord.xy);
+  if (((texelFetch(t, q >> 1, SampleOfPixel(q)).r >> uint(pc.bit)) & 1u) == 0u) discard;
+}
+)",
+};
+
+VkPipeline NativeCommandProcessor::GetMsaaPipeline(uint32_t mode, VkFormat format, bool ms, VkRenderPass pass) {
+  const uint64_t key = uint64_t(mode) | (uint64_t(format) << 8) | (uint64_t(ms) << 40);
+  auto it = msaa_pipelines_.find(key);
+  if (it != msaa_pipelines_.end()) return it->second;
+  const VkDevice dev = vulkan_device_->device();
+  if (!msaa_fs_[mode]) {
+    std::vector<uint32_t> spirv;
+    std::string error;
+    if (!CompileGlsl(EShLangFragment, std::string(kMsaaHeader) + kMsaaBodies[mode], spirv, error)) {
+      REXGPU_ERROR("[native] MSAA transfer shader {}: {}", mode, error);
+      msaa_pipelines_.emplace(key, VK_NULL_HANDLE);
+      return VK_NULL_HANDLE;
+    }
+    msaa_fs_[mode] = ui::vulkan::util::CreateShaderModule(vulkan_device_, spirv.data(), spirv.size() * 4);
+  }
+  VkPipelineShaderStageCreateInfo stages[2] = {};
+  stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  stages[0].module = convert_vs_;
+  stages[0].pName = "main";
+  stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  stages[1].module = msaa_fs_[mode];
+  stages[1].pName = "main";
+  VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  vp.viewportCount = vp.scissorCount = 1;
+  VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  rs.polygonMode = VK_POLYGON_MODE_FILL;
+  rs.cullMode = VK_CULL_MODE_NONE;
+  rs.lineWidth = 1.0f;
+  static const VkSampleLocationEXT kXenosLocations[4] = {{0.25f, 0.25f}, {0.75f, 0.25f}, {0.25f, 0.75f},
+                                                        {0.75f, 0.75f}};
+  VkPipelineSampleLocationsStateCreateInfoEXT msl = {
+      VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT};
+  VkPipelineMultisampleStateCreateInfo msi = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  msi.rasterizationSamples = ms ? VK_SAMPLE_COUNT_4_BIT : VK_SAMPLE_COUNT_1_BIT;
+  if (ms) {
+    msi.sampleShadingEnable = VK_TRUE;
+    msi.minSampleShading = 1.0f;
+    msl.sampleLocationsEnable = VK_TRUE;
+    msl.sampleLocationsInfo.sType = VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT;
+    msl.sampleLocationsInfo.sampleLocationsPerPixel = VK_SAMPLE_COUNT_4_BIT;
+    msl.sampleLocationsInfo.sampleLocationGridSize = {1, 1};
+    msl.sampleLocationsInfo.sampleLocationsCount = 4;
+    msl.sampleLocationsInfo.pSampleLocations = kXenosLocations;
+    msi.pNext = &msl;
+  }
+  const bool color = mode == kMsaaColorToMs || mode == kMsaaColorFromMs;
+  const bool stencil = mode == kMsaaStencilToMs || mode == kMsaaStencilFromMs;
+  VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+  if (!color && !stencil) {
+    ds.depthTestEnable = VK_TRUE;
+    ds.depthWriteEnable = VK_TRUE;
+    ds.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+  }
+  if (stencil) {
+    ds.stencilTestEnable = VK_TRUE;
+    ds.front.failOp = ds.front.depthFailOp = VK_STENCIL_OP_KEEP;
+    ds.front.passOp = VK_STENCIL_OP_REPLACE;
+    ds.front.compareOp = VK_COMPARE_OP_ALWAYS;
+    ds.back = ds.front;
+  }
+  VkPipelineColorBlendAttachmentState ba = {};
+  ba.colorWriteMask = 0xF;
+  VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  cb.attachmentCount = color ? 1 : 0;
+  cb.pAttachments = &ba;
+  VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+                          VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE};
+  VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+  dy.dynamicStateCount = stencil ? 5 : 2;
+  dy.pDynamicStates = dyn;
+  VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  ci.stageCount = 2;
+  ci.pStages = stages;
+  ci.pVertexInputState = &vi;
+  ci.pInputAssemblyState = &ia;
+  ci.pViewportState = &vp;
+  ci.pRasterizationState = &rs;
+  ci.pMultisampleState = &msi;
+  ci.pDepthStencilState = color ? nullptr : &ds;
+  ci.pColorBlendState = &cb;
+  ci.pDynamicState = &dy;
+  ci.layout = convert_layout_[0];
+  ci.renderPass = pass;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  if (dfn().vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline) != VK_SUCCESS) {
+    REXGPU_ERROR("[native] MSAA transfer pipeline {} format {} failed", mode, uint32_t(format));
+    pipeline = VK_NULL_HANDLE;
+  }
+  msaa_pipelines_.emplace(key, pipeline);
+  return pipeline;
+}
+
+bool NativeCommandProcessor::MsaaTransfer(NativeImage& rt, NativeImage& ms, bool to_ms) {
+  NativeImage& dst = to_ms ? ms : rt;
+  NativeImage& src = to_ms ? rt : ms;
+  const VkDevice dev = vulkan_device_->device();
+  const VkFormat format = dst.format;
+  const uint32_t samples = to_ms ? 4 : 1;
+  VkRenderPass pass = dst.depth ? GetRenderPass(nullptr, 0, format, samples) : GetRenderPass(&format, 1,
+                                                                                          VK_FORMAT_UNDEFINED, samples);
+  if (!pass) return false;
+  const uint32_t main_mode = dst.depth ? (to_ms ? kMsaaDepthToMs : kMsaaDepthFromMs)
+                                       : (to_ms ? kMsaaColorToMs : kMsaaColorFromMs);
+  VkPipeline main_pipeline = GetMsaaPipeline(main_mode, format, to_ms, pass);
+  VkPipeline stencil_pipeline =
+      dst.depth ? GetMsaaPipeline(to_ms ? kMsaaStencilToMs : kMsaaStencilFromMs, format, to_ms, pass) : VK_NULL_HANDLE;
+  if (!main_pipeline || (dst.depth && !stencil_pipeline)) return false;
+  VkDescriptorSet sets[2] = {};
+  VkImageView views[2] = {dst.depth ? src.depth_view : src.view, src.stencil_view};
+  const uint32_t set_count = dst.depth ? 2 : 1;
+  for (uint32_t i = 0; i < set_count; ++i) {
+    VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = slot().descriptor_pool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &convert_set_layout_[0];
+    if (dfn().vkAllocateDescriptorSets(dev, &ai, &sets[i]) != VK_SUCCESS) return false;
+    VkDescriptorImageInfo ii = {convert_sampler_, views[i], VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = sets[i];
+    w.dstBinding = 0;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w.pImageInfo = &ii;
+    dfn().vkUpdateDescriptorSets(dev, 1, &w, 0, nullptr);
+  }
+  uint64_t fb_key = (reinterpret_cast<uint64_t>(pass) * 1000003u + reinterpret_cast<uint64_t>(dst.view)) * 31 +
+                    dst.width * 4099 + dst.height;
+  VkFramebuffer fb;
+  auto fit = framebuffers_.find(fb_key);
+  if (fit != framebuffers_.end()) {
+    fb = fit->second;
+  } else {
+    VkFramebufferCreateInfo fci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fci.renderPass = pass;
+    fci.attachmentCount = 1;
+    fci.pAttachments = &dst.view;
+    fci.width = dst.width;
+    fci.height = dst.height;
+    fci.layers = 1;
+    if (dfn().vkCreateFramebuffer(dev, &fci, nullptr, &fb) != VK_SUCCESS) return false;
+    framebuffers_.emplace(fb_key, fb);
+    fb_by_view_.emplace(dst.view, fb_key);
+  }
+  EndRenderPass();
+  Barrier();
+  if (profiling_) Mark(fmt::format("msaa {} {} {}x{}", to_ms ? "import" : "export", dst.depth ? "depth" : "color",
+                                   dst.width, dst.height));
+  VkCommandBuffer cmd = slot().cmd;
+  VkRenderPassBeginInfo bi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+  bi.renderPass = pass;
+  bi.framebuffer = fb;
+  bi.renderArea = {{0, 0}, {dst.width, dst.height}};
+  work_since_barrier_ = true;
+  InvalidateDrawState();
+  dfn().vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
+  const VkViewport vp = {0.0f, 0.0f, float(dst.width), float(dst.height), 0.0f, 1.0f};
+  const VkRect2D sr = {{0, 0}, {dst.width, dst.height}};
+  dfn().vkCmdSetViewport(cmd, 0, 1, &vp);
+  dfn().vkCmdSetScissor(cmd, 0, 1, &sr);
+  int32_t pc[4] = {};
+  dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, main_pipeline);
+  dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, convert_layout_[0], 0, 1, &sets[0], 0, nullptr);
+  dfn().vkCmdPushConstants(cmd, convert_layout_[0], VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), pc);
+  dfn().vkCmdDraw(cmd, 3, 1, 0, 0);
+  if (dst.depth) {
+    // No stencil export on NVK: clear the stencil, then set it bit by bit (the shader keeps the samples that have
+    // the bit, the stencil test replaces with 0xFF through a one-bit write mask).
+    VkClearAttachment ca = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, {}};
+    ca.clearValue.depthStencil.stencil = 0;
+    VkClearRect cr = {sr, 0, 1};
+    dfn().vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
+    dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, stencil_pipeline);
+    dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, convert_layout_[0], 0, 1, &sets[1], 0,
+                                  nullptr);
+    dfn().vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 0xFF);
+    dfn().vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 0xFF);
+    for (int32_t bit = 0; bit < 8; ++bit) {
+      pc[0] = bit;
+      dfn().vkCmdPushConstants(cmd, convert_layout_[0], VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), pc);
+      dfn().vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 1u << bit);
+      dfn().vkCmdDraw(cmd, 3, 1, 0, 0);
+    }
+  }
+  dfn().vkCmdEndRenderPass(cmd);
+  work_since_barrier_ = true;
+  Barrier();
+  InvalidateDrawState();
+  if (to_ms) {
+    ++stats_.msaa_imports;
+  } else {
+    ++stats_.msaa_exports;
+  }
+  return true;
+}
+
+NativeImage* NativeCommandProcessor::GetMsaaShadow(NativeImage& rt, bool import) {
+  MsaaShadow& sh = msaa_shadows_[rt.image];
+  if (!sh.image.image) {
+    const VkImageUsageFlags usage =
+        VK_IMAGE_USAGE_SAMPLED_BIT |
+        (rt.depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    if (!CreateImage(sh.image, rt.format, rt.width / 2, rt.height / 2, rt.depth, usage, 1, false, 4)) {
+      DestroyImage(sh.image, false);
+      msaa_shadows_.erase(rt.image);
+      return nullptr;
+    }
+    EnsureGeneral(sh.image);
+    sh.valid = false;
+    sh.newer = false;
+  }
+  if (!sh.valid) {
+    if (import) {
+      if (!MsaaTransfer(rt, sh.image, true)) return nullptr;
+    } else {
+      ++stats_.msaa_imports_skipped;
+    }
+    sh.valid = true;
+  }
+  return &sh.image;
+}
+
+void NativeCommandProcessor::ExportMsaaShadow(NativeImage& rt, bool invalidate) {
+  if (msaa_shadows_.empty()) return;
+  auto it = msaa_shadows_.find(rt.image);
+  if (it == msaa_shadows_.end()) return;
+  MsaaShadow& sh = it->second;
+  if (sh.newer) {
+    MsaaTransfer(rt, sh.image, false);
+    sh.newer = false;
+  }
+  if (invalidate) sh.valid = false;
+}
+
+void NativeCommandProcessor::ExportAllMsaaShadows() {
+  for (auto& [k, rt] : render_targets_) ExportMsaaShadow(rt, false);
+}
+
 VkRenderPass NativeCommandProcessor::GetRenderPass(const VkFormat* color_formats, uint32_t color_count,
-                                                   VkFormat depth_format) {
-  uint64_t key = uint64_t(depth_format) | (uint64_t(color_count) << 10);
+                                                   VkFormat depth_format, uint32_t samples) {
+  uint64_t key = uint64_t(depth_format) | (uint64_t(color_count) << 10) | (uint64_t(samples) << 14);
   for (uint32_t i = 0; i < color_count; ++i) key = key * 1000003u + uint64_t(color_formats[i]);
   auto it = render_passes_.find(key);
   if (it != render_passes_.end()) return it->second;
@@ -2073,7 +2420,7 @@ VkRenderPass NativeCommandProcessor::GetRenderPass(const VkFormat* color_formats
   uint32_t n = 0;
   for (uint32_t i = 0; i < color_count; ++i) {
     att[n].format = color_formats[i];
-    att[n].samples = VK_SAMPLE_COUNT_1_BIT;
+    att[n].samples = VkSampleCountFlagBits(samples);
     att[n].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     att[n].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     att[n].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
@@ -2085,7 +2432,7 @@ VkRenderPass NativeCommandProcessor::GetRenderPass(const VkFormat* color_formats
   }
   if (depth_format != VK_FORMAT_UNDEFINED) {
     att[n].format = depth_format;
-    att[n].samples = VK_SAMPLE_COUNT_1_BIT;
+    att[n].samples = VkSampleCountFlagBits(samples);
     att[n].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     att[n].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     att[n].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -2294,6 +2641,21 @@ VkPipeline NativeCommandProcessor::CreatePipelineObject(const PipelineKey& key, 
   rs.lineWidth = 1.0f;
   VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
   ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  // RC71: Xenos 4x MSAA samples sit on an ordered 2x2 grid (the sample-space image has them as pixel centers).
+  static const VkSampleLocationEXT kXenosLocations[4] = {{0.25f, 0.25f}, {0.75f, 0.25f}, {0.25f, 0.75f},
+                                                        {0.75f, 0.75f}};
+  VkPipelineSampleLocationsStateCreateInfoEXT msl = {
+      VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT};
+  if (key.samples == 4) {
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_4_BIT;
+    msl.sampleLocationsEnable = VK_TRUE;
+    msl.sampleLocationsInfo.sType = VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT;
+    msl.sampleLocationsInfo.sampleLocationsPerPixel = VK_SAMPLE_COUNT_4_BIT;
+    msl.sampleLocationsInfo.sampleLocationGridSize = {1, 1};
+    msl.sampleLocationsInfo.sampleLocationsCount = 4;
+    msl.sampleLocationsInfo.pSampleLocations = kXenosLocations;
+    ms.pNext = &msl;
+  }
   VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
   ds.depthTestEnable = key.depth_test ? VK_TRUE : VK_FALSE;
   ds.depthWriteEnable = key.depth_write ? VK_TRUE : VK_FALSE;
@@ -3183,11 +3545,16 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // MSAA render targets live in sample space: a 4x 640x360 target is a 1280x720 image, so the 1x and 4x views of the
   // same EDRAM range (DS2 renders shadow maps and half-resolution passes that way) are the same image. Draws into
   // them are rasterized at the sample resolution (like a 2x2 resolution scale).
-  const uint32_t sx = surface_info.msaa_samples >= xenos::MsaaSamples::k4X ? 2 : 1;
-  const uint32_t sy = surface_info.msaa_samples >= xenos::MsaaSamples::k2X ? 2 : 1;
+  uint32_t sx = surface_info.msaa_samples >= xenos::MsaaSamples::k4X ? 2 : 1;
+  uint32_t sy = surface_info.msaa_samples >= xenos::MsaaSamples::k2X ? 2 : 1;
   const uint32_t sample_pitch = surface_info.surface_pitch * sx;
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
+  const draw_util::Scissor scissor_pixels = scissor;
+  // RC71: host 4x MSAA candidates (the lookups below then leave the 4x copies as they are).
+  const bool msaa_candidate = msaa_supported_ && REXCVAR_GET(ds2_native_msaa_host) &&
+                              surface_info.msaa_samples == xenos::MsaaSamples::k4X;
+  msaa_lookup_ = msaa_candidate;
   scissor.offset[0] *= sx;
   scissor.extent[0] *= sx;
   scissor.offset[1] *= sy;
@@ -3207,6 +3574,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     const auto ci = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
     NativeImage* rt = GetRenderTarget(ci.color_base, sample_pitch, uint32_t(ci.color_format), false, height_hint);
     if (!rt) {
+      msaa_lookup_ = false;
       ++stats_.draws_failed;
       return true;
     }
@@ -3228,13 +3596,82 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       rt_height = std::min(rt_height, depth_rt->height);
     }
   }
+  msaa_lookup_ = false;
+  // RC71: a 4x pass with color targets (or a 4x pass on a depth buffer whose 4x copy is current) is drawn into the
+  // 4x MSAA copies. Anything else uses the sample-space images, so their 4x copies are exported first.
+  bool host_msaa = false;
+  if (msaa_candidate) {
+    if (color_count) {
+      host_msaa = true;
+    } else if (depth_rt) {
+      auto sit = msaa_shadows_.find(depth_rt->image);
+      host_msaa = sit != msaa_shadows_.end() && sit->second.valid;
+    }
+    if (host_msaa) {
+      for (uint32_t i = 0; i < color_count; ++i) {
+        if (color_rts[i]->width < 2 || color_rts[i]->height < 2) host_msaa = false;
+      }
+    }
+    if (!host_msaa) {
+      for (uint32_t i = 0; i < color_count; ++i) ExportMsaaShadow(*color_rts[i], true);
+      if (depth_rt) ExportMsaaShadow(*depth_rt, true);
+    }
+  }
+  if (host_msaa) {
+    // A full clear draw (rectangle, depth always written, stencil fully replaced, all color channels written
+    // without blending) makes importing the old contents unnecessary.
+    bool full_clear = REXCVAR_GET(ds2_native_msaa_skip_clear_import) &&
+                      prim_type == xenos::PrimitiveType::kRectangleList;
+    if (full_clear && depth_rt) {
+      const auto srm_clear = regs.Get<reg::RB_STENCILREFMASK>();
+      full_clear = depth_control.z_enable && depth_control.z_write_enable &&
+                   depth_control.zfunc == xenos::CompareFunction::kAlways && depth_control.stencil_enable &&
+                   depth_control.stencilfunc == xenos::CompareFunction::kAlways &&
+                   depth_control.stencilzpass == xenos::StencilOp::kReplace && srm_clear.stencilwritemask == 0xFF;
+    }
+    for (uint32_t i = 0; i < color_count && full_clear; ++i) {
+      full_clear = ((write_mask >> (4 * i)) & 0xF) == 0xF && blend[i] == 0x00010001u;
+    }
+    NativeImage* shadows[5] = {};
+    for (uint32_t i = 0; i < color_count && host_msaa; ++i) {
+      shadows[i] = GetMsaaShadow(*color_rts[i], !full_clear);
+      if (!shadows[i]) host_msaa = false;
+    }
+    if (host_msaa && depth_rt) {
+      shadows[4] = GetMsaaShadow(*depth_rt, !full_clear);
+      if (!shadows[4]) host_msaa = false;
+    }
+    if (host_msaa) {
+      rt_width = rt_height = UINT32_MAX;
+      for (uint32_t i = 0; i < color_count; ++i) {
+        msaa_shadows_[color_rts[i]->image].newer = true;
+        color_rts[i] = shadows[i];
+        rt_width = std::min(rt_width, shadows[i]->width);
+        rt_height = std::min(rt_height, shadows[i]->height);
+      }
+      if (depth_rt) {
+        msaa_shadows_[depth_rt->image].newer = true;
+        depth_rt = shadows[4];
+        rt_width = std::min(rt_width, depth_rt->width);
+        rt_height = std::min(rt_height, depth_rt->height);
+      }
+      // Pixel space from here on (viewport, scissor, point sizes).
+      sx = sy = 1;
+      scissor = scissor_pixels;
+      ++stats_.msaa_draws;
+    } else {
+      for (uint32_t i = 0; i < color_count; ++i) ExportMsaaShadow(*color_rts[i], true);
+      if (depth_rt) ExportMsaaShadow(*depth_rt, true);
+    }
+  }
   if (!color_count && !depth_rt) {
     ++stats_.draws_skipped;
     ++stats_.skip_no_target;
     if (occlusion_active_ >= 0) occlusion_unmeasured_ = true;  // every sample would pass: not measurable here
     return true;
   }
-  VkRenderPass pass = GetRenderPass(color_formats, color_count, depth_rt ? depth_rt->format : VK_FORMAT_UNDEFINED);
+  VkRenderPass pass = GetRenderPass(color_formats, color_count, depth_rt ? depth_rt->format : VK_FORMAT_UNDEFINED,
+                                    host_msaa ? 4 : 1);
   if (!pass) {
     ++stats_.draws_failed;
     return true;
@@ -3314,6 +3751,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   key.color_count = color_count;
   key.has_ps = ps ? 1 : 0;
   key.depth_clamp = regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable ? 1 : 0;
+  key.samples = host_msaa ? 4 : 0;
   if (native_vertex) {
     key.native_binding_count = uint32_t(native_plan.bindings.size());
     key.native_attribute_count = uint32_t(native_plan.words.size());
@@ -4592,6 +5030,7 @@ void NativeCommandProcessor::EvictTextures() {
 }
 
 void NativeCommandProcessor::DumpImages() {
+  ExportAllMsaaShadows();
   std::vector<std::pair<std::string, NativeImage*>> list;
   for (auto& [k, img] : render_targets_) {
     list.emplace_back(fmt::format("rt_{:04}_{}_f{}_{}x{}", uint32_t(k & 0xFFF), img.depth ? "d" : "c",

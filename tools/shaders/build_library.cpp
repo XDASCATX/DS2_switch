@@ -202,25 +202,44 @@ int main(int argc, char** argv) {
   // the console actually used (runtime-learned cache), adapted to the shader (register count, interpolators,
   // early-Z eligibility). The RC60/61 pack never matched them (0 hits).
   std::vector<std::pair<uint32_t, uint64_t>> learned_patterns;  // (shader type, modification)
-  if (argc == 5 && std::string(argv[1]) == "--learned") {
-    FILE* f = std::fopen(argv[2], "rb");
-    if (!f) return 2;
-    std::array<uint32_t, 4> header;
-    if (std::fread(header.data(), 1, sizeof(header), f) != sizeof(header)) return 2;
+  // RC71: several --learned caches; the microcode stored in them is also added as source shaders (the console
+  // meets shaders the old dump manifest does not have).
+  struct CachedSource {
+    uint32_t type;
+    uint64_t hash;
+    std::vector<uint32_t> dwords;  // host order
+  };
+  std::vector<CachedSource> cached_sources;
+  {
     std::set<std::pair<uint32_t, uint64_t>> unique;
-    for (;;) {
-      std::array<uint64_t, 10> r;
-      if (std::fread(r.data(), 1, sizeof(r), f) != sizeof(r)) break;
-      const uint64_t payload = r[4] * 4 + r[5] + (r[6] + r[7]) * 4;
-      if (r[3] > 1 || payload > (8u << 20)) break;
-      unique.emplace(uint32_t(r[3]), r[1]);
-      if (std::fseek(f, long(payload), SEEK_CUR)) break;
+    std::set<std::pair<uint64_t, uint32_t>> unique_sources;
+    while (argc >= 5 && std::string(argv[1]) == "--learned") {
+      FILE* f = std::fopen(argv[2], "rb");
+      if (!f) return 2;
+      std::array<uint32_t, 4> header;
+      if (std::fread(header.data(), 1, sizeof(header), f) != sizeof(header)) return 2;
+      for (;;) {
+        std::array<uint64_t, 10> r;
+        if (std::fread(r.data(), 1, sizeof(r), f) != sizeof(r)) break;
+        const uint64_t payload = r[4] * 4 + r[5] + (r[6] + r[7]) * 4;
+        if (r[3] > 1 || payload > (8u << 20) || !r[4] || r[4] > 262144) break;
+        unique.emplace(uint32_t(r[3]), r[1]);
+        std::vector<uint32_t> dwords(static_cast<size_t>(r[4]));
+        if (std::fread(dwords.data(), 4, dwords.size(), f) != dwords.size()) break;
+        if (unique_sources.emplace(r[0], uint32_t(r[3])).second) {
+          cached_sources.push_back({uint32_t(r[3]), r[0], std::move(dwords)});
+        }
+        if (std::fseek(f, long(payload - r[4] * 4), SEEK_CUR)) break;
+      }
+      std::fclose(f);
+      argv += 2;
+      argc -= 2;
     }
-    std::fclose(f);
     learned_patterns.assign(unique.begin(), unique.end());
-    std::printf("learned patterns: %zu\n", learned_patterns.size());
-    argv += 2;
-    argc -= 2;
+    if (!learned_patterns.empty()) {
+      std::printf("learned patterns: %zu, cached source shaders: %zu\n", learned_patterns.size(),
+                  cached_sources.size());
+    }
   }
   if (argc != 3) {
     std::fprintf(stderr, "usage: rex-shader-library [--learned <cache.spvlib>] <manifest.txt> <new-output.spvlib>\n");
@@ -263,6 +282,23 @@ int main(int argc, char** argv) {
     }
     inputs.push_back(std::move(input));
   }
+  size_t cached_added = 0;
+  for (auto& cs : cached_sources) {
+    const auto type = cs.type ? rex::graphics::xenos::ShaderType::kPixel : rex::graphics::xenos::ShaderType::kVertex;
+    if (!seen.emplace(cs.hash, uint32_t(type)).second) continue;
+    Input input;
+    input.shader = std::make_unique<SpirvShader>(type, cs.hash, cs.dwords.data(), cs.dwords.size(),
+                                                 std::endian::native);
+    input.shader->AnalyzeUcode(disassembly);
+    if (type == rex::graphics::xenos::ShaderType::kPixel) {
+      uint32_t param_gen;
+      input.input_mask = input.shader->GetInterpolatorInputMask(reg::SQ_PROGRAM_CNTL{0}, reg::SQ_CONTEXT_MISC{0}, param_gen);
+      masks.insert(input.input_mask);
+    }
+    inputs.push_back(std::move(input));
+    ++cached_added;
+  }
+  if (cached_added) std::printf("source shaders added from the caches: %zu\n", cached_added);
   if (inputs.empty()) return 2;
   SpirvShaderTranslator translator(SpirvShaderTranslator::Features(true), false, false, false);
   const uint64_t signature = translator.ShaderLibrarySignature();
