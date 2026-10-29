@@ -146,6 +146,13 @@ REXCVAR_DEFINE_INT32(ds2_native_hitch_ms, 100, "GPU",
 REXCVAR_DEFINE_BOOL(ds2_native_msaa_host, true, "GPU",
                     "RC71: draw 4x MSAA passes with color targets into real 4x MSAA images (pixel shaders once per "
                     "pixel as on the Xbox 360) instead of the 2x2 sample-space image; false = sample space as before");
+REXCVAR_DEFINE_INT32(ds2_native_msaa_min_draws, 8, "GPU",
+                     "RC72: a 4x color target uses the host 4x copy only with at least this many non-rectangle 4x "
+                     "draws in this or the previous frame (DS2 clears in 4x and draws at 1x elsewhere)");
+REXCVAR_DEFINE_BOOL(ds2_native_bias_sample_scale, true, "GPU",
+                    "RC72: scale the slope-scaled depth bias by the sample-space factor of 4x targets");
+REXCVAR_DEFINE_INT32(ds2_native_shader_profile_groups, 0, "GPU",
+                     "RC72: shader groups timed per profiled command buffer (0 = 64/96/32 by pass kind)");
 REXCVAR_DEFINE_BOOL(ds2_native_msaa_skip_clear_import, true, "GPU",
                     "RC71: a 4x pass that starts with a full clear draw does not import the previous contents");
 REXCVAR_DEFINE_BOOL(ds2_native_resolve_clip_to_dest, false, "GPU",
@@ -806,7 +813,12 @@ class NativeCommandProcessor final : public CommandProcessor {
     NativeImage image;
     bool valid = false;  // holds the current contents (imported, or drawn after a full clear)
     bool newer = false;  // drawn since the last export to the sample-space image
+    uint32_t dirty_rows = 0;  // RC72: rows (of the 4x image) drawn since the last export
   };
+  // RC72: 4x passes with real geometry (not clear rectangles) per color target, this and the previous frame.
+  // Only targets with enough of them use the 4x copies (DS2 also clears with 4x rectangles and then draws at 1x:
+  // a 4x copy there costs an export every frame and saves nothing).
+  std::unordered_map<VkImage, uint32_t> msaa_heavy_this_frame_, msaa_heavy_last_frame_;
   std::unordered_map<VkImage, MsaaShadow> msaa_shadows_;
   bool msaa_supported_ = false;
   bool msaa_lookup_ = false;  // GetRenderTarget calls of a 4x pass: no export
@@ -815,7 +827,7 @@ class NativeCommandProcessor final : public CommandProcessor {
   NativeImage* GetMsaaShadow(NativeImage& rt, bool import);
   void ExportMsaaShadow(NativeImage& rt, bool invalidate);
   void ExportAllMsaaShadows();
-  bool MsaaTransfer(NativeImage& rt, NativeImage& ms, bool to_ms);
+  bool MsaaTransfer(NativeImage& rt, NativeImage& ms, bool to_ms, uint32_t rows = 0);
   VkPipeline GetMsaaPipeline(uint32_t mode, VkFormat format, bool ms, VkRenderPass pass);
   const PipelineLayoutEntry* GetPipelineLayout(uint32_t tv, uint32_t sv, uint32_t tp, uint32_t sp);
   VkDescriptorSetLayout GetTextureSetLayout(bool vertex, uint32_t textures, uint32_t samplers);
@@ -2263,7 +2275,7 @@ VkPipeline NativeCommandProcessor::GetMsaaPipeline(uint32_t mode, VkFormat forma
   return pipeline;
 }
 
-bool NativeCommandProcessor::MsaaTransfer(NativeImage& rt, NativeImage& ms, bool to_ms) {
+bool NativeCommandProcessor::MsaaTransfer(NativeImage& rt, NativeImage& ms, bool to_ms, uint32_t rows) {
   NativeImage& dst = to_ms ? ms : rt;
   NativeImage& src = to_ms ? rt : ms;
   const VkDevice dev = vulkan_device_->device();
@@ -2319,15 +2331,17 @@ bool NativeCommandProcessor::MsaaTransfer(NativeImage& rt, NativeImage& ms, bool
   if (profiling_) Mark(fmt::format("msaa {} {} {}x{}", to_ms ? "import" : "export", dst.depth ? "depth" : "color",
                                    dst.width, dst.height));
   VkCommandBuffer cmd = slot().cmd;
+  // RC72: only the rows that changed (the whole image when unknown).
+  const uint32_t dst_rows = rows ? std::min(rows, dst.height) : dst.height;
   VkRenderPassBeginInfo bi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
   bi.renderPass = pass;
   bi.framebuffer = fb;
-  bi.renderArea = {{0, 0}, {dst.width, dst.height}};
+  bi.renderArea = {{0, 0}, {dst.width, dst_rows}};
   work_since_barrier_ = true;
   InvalidateDrawState();
   dfn().vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
   const VkViewport vp = {0.0f, 0.0f, float(dst.width), float(dst.height), 0.0f, 1.0f};
-  const VkRect2D sr = {{0, 0}, {dst.width, dst.height}};
+  const VkRect2D sr = {{0, 0}, {dst.width, dst_rows}};
   dfn().vkCmdSetViewport(cmd, 0, 1, &vp);
   dfn().vkCmdSetScissor(cmd, 0, 1, &sr);
   int32_t pc[4] = {};
@@ -2398,8 +2412,9 @@ void NativeCommandProcessor::ExportMsaaShadow(NativeImage& rt, bool invalidate) 
   if (it == msaa_shadows_.end()) return;
   MsaaShadow& sh = it->second;
   if (sh.newer) {
-    MsaaTransfer(rt, sh.image, false);
+    MsaaTransfer(rt, sh.image, false, sh.dirty_rows ? sh.dirty_rows * 2 : 0);
     sh.newer = false;
+    sh.dirty_rows = 0;
   }
   if (invalidate) sh.valid = false;
 }
@@ -3602,7 +3617,13 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   bool host_msaa = false;
   if (msaa_candidate) {
     if (color_count) {
-      host_msaa = true;
+      const VkImage key_image = color_rts[0]->image;
+      if (prim_type != xenos::PrimitiveType::kRectangleList) ++msaa_heavy_this_frame_[key_image];
+      const uint32_t min_draws = uint32_t(std::max(REXCVAR_GET(ds2_native_msaa_min_draws), 0));
+      auto lit = msaa_heavy_last_frame_.find(key_image);
+      auto tit = msaa_heavy_this_frame_.find(key_image);
+      host_msaa = (lit != msaa_heavy_last_frame_.end() && lit->second >= min_draws) ||
+                  (tit != msaa_heavy_this_frame_.end() && tit->second >= min_draws);
     } else if (depth_rt) {
       auto sit = msaa_shadows_.find(depth_rt->image);
       host_msaa = sit != msaa_shadows_.end() && sit->second.valid;
@@ -3643,14 +3664,19 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
     if (host_msaa) {
       rt_width = rt_height = UINT32_MAX;
+      const uint32_t drawn_rows = scissor_pixels.offset[1] + scissor_pixels.extent[1];
       for (uint32_t i = 0; i < color_count; ++i) {
-        msaa_shadows_[color_rts[i]->image].newer = true;
+        MsaaShadow& csh = msaa_shadows_[color_rts[i]->image];
+        csh.newer = true;
+        csh.dirty_rows = std::max(csh.dirty_rows, drawn_rows);
         color_rts[i] = shadows[i];
         rt_width = std::min(rt_width, shadows[i]->width);
         rt_height = std::min(rt_height, shadows[i]->height);
       }
       if (depth_rt) {
-        msaa_shadows_[depth_rt->image].newer = true;
+        MsaaShadow& dsh = msaa_shadows_[depth_rt->image];
+        dsh.newer = true;
+        dsh.dirty_rows = std::max(dsh.dirty_rows, drawn_rows);
         depth_rt = shadows[4];
         rt_width = std::min(rt_width, depth_rt->width);
         rt_height = std::min(rt_height, depth_rt->height);
@@ -4283,7 +4309,10 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   const uint32_t shader_phase = color_count && (color_formats[0] == VK_FORMAT_R16G16B16A16_SFLOAT ||
                                                 color_formats[0] == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
                                     ? 1 : (color_count && depth_rt ? 0 : 2);
-  constexpr uint32_t phase_limits[3] = {64, 96, 32};
+  uint32_t phase_limits[3] = {64, 96, 32};
+  if (const int32_t g = REXCVAR_GET(ds2_native_shader_profile_groups); g > 0) {
+    phase_limits[0] = phase_limits[1] = phase_limits[2] = uint32_t(g);
+  }
   if (sample_shader && pipeline != profile_shader_pipeline_) {
     if (profile_shader_phase_groups_[shader_phase] < phase_limits[shader_phase]) {
       Mark(fmt::format("shader VS {:016X} PS {:016X}", key.vs_hash, key.ps_hash));
@@ -4358,6 +4387,9 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   float bias_const = 0.0f, bias_slope = 0.0f;
   if (polygonal && (sc_mode.poly_offset_front_enable || sc_mode.poly_offset_back_enable)) {
     bias_slope = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE) * xenos::kPolygonOffsetScaleSubpixelUnit;
+    // RC72: a 4x target drawn in sample space has twice the pixels per axis, so depth changes half as much per
+    // pixel and the slope-scaled bias would be halved (shadow acne: stripes in the torch light).
+    if (REXCVAR_GET(ds2_native_bias_sample_scale)) bias_slope *= float(std::max(sx, sy));
     bias_const = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET) * float(1 << 24);
   }
   const float bias[2] = {bias_const, bias_slope};
@@ -4808,6 +4840,8 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     }
     std::memcpy(hitch_prev_, cur, sizeof(cur));
   }
+  msaa_heavy_last_frame_.swap(msaa_heavy_this_frame_);
+  msaa_heavy_this_frame_.clear();
 #if REX_PLATFORM_SWITCH
   RexSwitchPerfCount(0);
 #endif
@@ -5203,6 +5237,9 @@ void NativeCommandProcessor::LogStats() {
   REXGPU_INFO("[native] barriers/frame: {:.1f} issued, {:.1f} elided | draw state groups/frame: {:.1f} recorded, "
               "{:.1f} skipped as redundant", stats_.barriers_issued / n, stats_.barriers_elided / n,
               stats_.state_calls / n, stats_.state_calls_skipped / n);
+  REXGPU_INFO("[native] host 4x MSAA/frame: {:.1f} draws, {:.2f} imports ({:.2f} skipped after a clear), {:.2f} exports",
+              stats_.msaa_draws / n, stats_.msaa_imports / n, stats_.msaa_imports_skipped / n,
+              stats_.msaa_exports / n);
   REXGPU_INFO("[native] texture fetches/frame: {:.1f} 1D, {:.1f} cube ({:.2f} faces copied from resolves), "
               "{:.1f} white (3D/unsupported cube/other dimension), {:.1f} depth from 8888 ({:.2f} decodes)",
               stats_.texture_1d / n, stats_.texture_cube / n, stats_.cube_faces_from_resolves / n,
