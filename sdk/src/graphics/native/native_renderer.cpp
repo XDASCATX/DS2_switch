@@ -152,6 +152,13 @@ REXCVAR_DEFINE_INT32(ds2_native_msaa_min_draws, 8, "GPU",
                      "draws in this or the previous frame (DS2 clears in 4x and draws at 1x elsewhere)");
 REXCVAR_DEFINE_BOOL(ds2_native_shadow_face_clear, true, "GPU",
                     "RC74: clear the whole viewport of a shadow face drawn after a depth-only clear rectangle");
+REXCVAR_DEFINE_BOOL(ds2_native_persistent_texture_sets, true, "GPU",
+                    "RC77: keep texture descriptor sets across frames (dropped when a view they use is destroyed)");
+REXCVAR_DEFINE_BOOL(ds2_native_fast_untile, true, "GPU",
+                    "RC77: untile 2D textures 16 bytes at a time with the offset computed inline");
+REXCVAR_DEFINE_BOOL(ds2_native_pipeline_steal, true, "GPU",
+                    "RC77: a pipeline needed at once that is still queued for the worker is created on the command "
+                    "thread instead of waiting for the whole queue");
 REXCVAR_DEFINE_BOOL(ds2_native_depth_bias_absolute, true, "GPU",
                     "RC76: absolute constant depth bias as on the Xenos (VK_EXT_depth_bias_control unorm24 units), "
                     "polygon offset of the drawn face; false = RC75 (relative to the depth exponent, front only)");
@@ -789,13 +796,13 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t upload_bytes = 0, pipelines = 0, render_passes_begun = 0;
     uint64_t prim_counts[32] = {};
     uint64_t conversions = 0, texture_levels = 0, texture_upload_bytes = 0, submits = 0;
-    uint64_t early_z_draws = 0, draws_pipeline_pending = 0, pipelines_async = 0;
+    uint64_t early_z_draws = 0, draws_pipeline_pending = 0, pipelines_async = 0, pipelines_stolen = 0;
     uint64_t skip_no_vs = 0, skip_no_raster = 0, skip_no_pitch = 0, skip_no_target = 0;
     uint64_t occlusion_begins = 0, occlusion_ends = 0, occlusion_lost = 0, occlusion_visible = 0;
     // CPU time on the command processor thread, microseconds.
     uint64_t us_fence_wait = 0, us_draws = 0, us_textures = 0, us_pipelines = 0, us_copies = 0, us_frame = 0;
     uint64_t us_constants = 0, us_descriptors = 0, us_geometry = 0, us_commands = 0;
-    uint64_t texture_sets_reused = 0, texture_sets_created = 0;
+    uint64_t texture_sets_reused = 0, texture_sets_created = 0, texture_sets_kept = 0, texture_sets_dropped = 0;
     uint64_t constant_sets_reused = 0, constant_sets_created = 0, resolve_image_barriers = 0;
     uint64_t native_vertex_draws = 0, legacy_vertex_draws = 0;
     uint64_t content_hits = 0, content_saved_bytes = 0;
@@ -919,7 +926,8 @@ class NativeCommandProcessor final : public CommandProcessor {
   const VulkanDevice* vulkan_device_ = nullptr;
   PFN_vkCmdBlitImage cmd_blit_image_ = nullptr;
   PFN_vkCmdCopyImage cmd_copy_image_ = nullptr;
-  PFN_vkCmdSetDepthBias2EXT cmd_set_depth_bias2_ = nullptr;  // RC76: absolute (unorm24) constant depth bias
+  PFN_vkCmdSetDepthBias2EXT cmd_set_depth_bias2_ = nullptr;
+  PFN_vkFreeDescriptorSets free_descriptor_sets_ = nullptr;  // RC76: absolute (unorm24) constant depth bias
   std::unique_ptr<SpirvShaderTranslator> translator_;
   string::StringBuffer ucode_disasm_buffer_;
   std::unordered_map<uint64_t, std::unique_ptr<VulkanShader>> shaders_;
@@ -982,6 +990,22 @@ class NativeCommandProcessor final : public CommandProcessor {
   std::vector<uint32_t> native_indices_;
   std::vector<VkWriteDescriptorSet> descriptor_writes_;
   std::vector<uint64_t> descriptor_key_;
+  // RC77: texture descriptor sets kept across frames (keyed by layout, views, samplers), dropped when a view they
+  // use is destroyed. Per-frame sets (slot().texture_sets) remain the fallback when the pools are full.
+  struct KeyVectorHash {
+    size_t operator()(const std::vector<uint64_t>& k) const {
+      return size_t(XXH3_64bits(k.data(), k.size() * sizeof(uint64_t)));
+    }
+  };
+  struct PersistentSet {
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+  };
+  std::unordered_map<std::vector<uint64_t>, PersistentSet, KeyVectorHash> persistent_texture_sets_;
+  std::unordered_map<VkImageView, std::vector<std::vector<uint64_t>>> persistent_sets_by_view_;
+  std::vector<VkDescriptorPool> persistent_pools_;
+  bool AllocatePersistentSet(VkDescriptorSetLayout layout, PersistentSet& out);
+  void DestroyView(VkImageView view);
 
   SpirvShaderTranslator::SystemConstants system_constants_ = {};
   Stats stats_;
@@ -1076,6 +1100,9 @@ bool NativeCommandProcessor::SetupContext() {
     REXGPU_ERROR("[native] vkCmdBlitImage / vkCmdCopyImage not available");
     return false;
   }
+  free_descriptor_sets_ =
+      reinterpret_cast<PFN_vkFreeDescriptorSets>(ifn.vkGetDeviceProcAddr(dev, "vkFreeDescriptorSets"));
+  if (!free_descriptor_sets_) REXCVAR_SET(ds2_native_persistent_texture_sets, false);
   if (vulkan_device_->extensions().ext_EXT_depth_bias_control && props.depthBiasControl &&
       props.leastRepresentableValueForceUnormRepresentation) {
     cmd_set_depth_bias2_ =
@@ -1266,12 +1293,12 @@ void NativeCommandProcessor::ShutdownContext() {
   }
   for (auto& [k, img] : render_targets_) DestroyImage(img, false);
   for (auto& [k, t] : textures_) {
-    for (auto& [s, v] : t.swizzle_views) dfn().vkDestroyImageView(dev, v, nullptr);
+    for (auto& [s, v] : t.swizzle_views) DestroyView(v);
     DestroyImage(t.image, false);
   }
   for (auto& [k, r] : resolved_) {
     DestroyResolveLogicalImages(r, false);
-    for (auto& [s, v] : r.swizzle_views) dfn().vkDestroyImageView(dev, v, nullptr);
+    for (auto& [s, v] : r.swizzle_views) DestroyView(v);
     DestroyImage(r.image, false);
   }
   DestroyImage(white_, false);
@@ -1310,9 +1337,13 @@ void NativeCommandProcessor::ShutdownContext() {
   for (auto& [k, s] : samplers_) dfn().vkDestroySampler(dev, s, nullptr);
   for (auto& [k, l] : pipeline_layouts_) dfn().vkDestroyPipelineLayout(dev, l.layout, nullptr);
   for (auto& [k, l] : texture_set_layouts_) dfn().vkDestroyDescriptorSetLayout(dev, l, nullptr);
+  persistent_texture_sets_.clear();
+  persistent_sets_by_view_.clear();
+  for (VkDescriptorPool pool : persistent_pools_) dfn().vkDestroyDescriptorPool(dev, pool, nullptr);
+  persistent_pools_.clear();
   for (FrameSlot& s : slots_) {
     for (VkFramebuffer fb : s.deferred_framebuffers) dfn().vkDestroyFramebuffer(dev, fb, nullptr);
-    for (VkImageView v : s.deferred_views) dfn().vkDestroyImageView(dev, v, nullptr);
+    for (VkImageView v : s.deferred_views) DestroyView(v);
     for (auto& [i, m] : s.deferred_destroy) {
       dfn().vkDestroyImage(dev, i, nullptr);
       dfn().vkFreeMemory(dev, m, nullptr);
@@ -1356,7 +1387,7 @@ bool NativeCommandProcessor::BeginFrame() {
   s.occlusion_used = 0;
   for (VkFramebuffer fb : s.deferred_framebuffers) dfn().vkDestroyFramebuffer(dev, fb, nullptr);
   s.deferred_framebuffers.clear();
-  for (VkImageView v : s.deferred_views) dfn().vkDestroyImageView(dev, v, nullptr);
+  for (VkImageView v : s.deferred_views) DestroyView(v);
   s.deferred_views.clear();
   for (auto& [i, m] : s.deferred_destroy) {
     dfn().vkDestroyImage(dev, i, nullptr);
@@ -1713,7 +1744,7 @@ void NativeCommandProcessor::DestroyImage(NativeImage& img, bool deferred) {
     if (deferred) {
       slot().deferred_views.push_back(v);
     } else {
-      dfn().vkDestroyImageView(dev, v, nullptr);
+      DestroyView(v);
     }
   }
   if (deferred && img.image) {
@@ -2526,6 +2557,53 @@ bool NativeCommandProcessor::QuantizeDepthFloat24(NativeImage& src, NativeImage&
   return true;
 }
 
+void NativeCommandProcessor::DestroyView(VkImageView view) {
+  if (!view) return;
+  auto it = persistent_sets_by_view_.find(view);
+  if (it != persistent_sets_by_view_.end()) {
+    // The view was retired a full frame ring ago (or the GPU is idle): no pending work uses these sets.
+    for (const auto& key : it->second) {
+      auto sit = persistent_texture_sets_.find(key);
+      if (sit == persistent_texture_sets_.end()) continue;
+      free_descriptor_sets_(vulkan_device_->device(), sit->second.pool, 1, &sit->second.set);
+      persistent_texture_sets_.erase(sit);
+      ++stats_.texture_sets_dropped;
+    }
+    persistent_sets_by_view_.erase(it);
+  }
+  dfn().vkDestroyImageView(vulkan_device_->device(), view, nullptr);
+}
+
+bool NativeCommandProcessor::AllocatePersistentSet(VkDescriptorSetLayout layout, PersistentSet& out) {
+  const VkDevice dev = vulkan_device_->device();
+  VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  ai.descriptorSetCount = 1;
+  ai.pSetLayouts = &layout;
+  for (size_t i = persistent_pools_.size(); i-- > 0;) {
+    ai.descriptorPool = persistent_pools_[i];
+    if (dfn().vkAllocateDescriptorSets(dev, &ai, &out.set) == VK_SUCCESS) {
+      out.pool = persistent_pools_[i];
+      return true;
+    }
+  }
+  if (persistent_pools_.size() >= 16) return false;
+  constexpr uint32_t kSets = 4096;
+  const VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kSets * 6},
+                                         {VK_DESCRIPTOR_TYPE_SAMPLER, kSets * 6}};
+  VkDescriptorPoolCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  ci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+  ci.maxSets = kSets;
+  ci.poolSizeCount = 2;
+  ci.pPoolSizes = sizes;
+  VkDescriptorPool pool = VK_NULL_HANDLE;
+  if (dfn().vkCreateDescriptorPool(dev, &ci, nullptr, &pool) != VK_SUCCESS) return false;
+  persistent_pools_.push_back(pool);
+  ai.descriptorPool = pool;
+  if (dfn().vkAllocateDescriptorSets(dev, &ai, &out.set) != VK_SUCCESS) return false;
+  out.pool = pool;
+  return true;
+}
+
 NativeImage* NativeCommandProcessor::GetMsaaShadow(NativeImage& rt, bool import, uint32_t import_rows) {
   MsaaShadow& sh = msaa_shadows_[rt.image];
   if (!sh.image.image) {
@@ -2691,9 +2769,24 @@ VkPipeline NativeCommandProcessor::GetPipeline(const PipelineKey& key, VulkanSha
       pending_out = true;
       return VK_NULL_HANDLE;
     }
-    // Needed now (full-screen pass): wait for the worker.
+    // Needed now (full-screen pass). RC77: if the worker has not started it yet, it is taken out of the queue and
+    // created here instead of waiting behind every job queued before it (up to ~1 s on entering an area).
     ScopedUs timer(stats_.us_pipelines);
     std::unique_lock<std::mutex> lock(pipeline_mutex_);
+    if (REXCVAR_GET(ds2_native_pipeline_steal)) {
+      for (auto jit = pipeline_jobs_.begin(); jit != pipeline_jobs_.end(); ++jit) {
+        if (jit->hash != hash) continue;
+        const PipelineJob job = *jit;
+        pipeline_jobs_.erase(jit);
+        lock.unlock();
+        VkPipeline pipeline = CreatePipelineObject(job.key, job.vs, job.ps, job.layout);
+        ++stats_.pipelines;
+        ++stats_.pipelines_stolen;
+        pipelines_[hash] = pipeline;
+        pipeline_pending_.erase(hash);
+        return pipeline;
+      }
+    }
     for (;;) {
       for (const auto& [h, p] : pipeline_done_) {
         pipelines_[h] = p;
@@ -2976,7 +3069,7 @@ void NativeCommandProcessor::DestroyResolveLogicalImages(ResolvedEntry& entry, b
       if (deferred) {
         slot().deferred_views.push_back(view);
       } else {
-        dfn().vkDestroyImageView(vulkan_device_->device(), view, nullptr);
+        DestroyView(view);
       }
     }
     DestroyImage(logical.image, deferred);
@@ -2987,7 +3080,7 @@ void NativeCommandProcessor::DestroyResolveLogicalImages(ResolvedEntry& entry, b
       if (deferred) {
         slot().deferred_views.push_back(view);
       } else {
-        dfn().vkDestroyImageView(vulkan_device_->device(), view, nullptr);
+        DestroyView(view);
       }
     }
     DestroyImage(decoded.image, deferred);
@@ -3153,7 +3246,8 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
     return GetSwizzleView(t.swizzle_views, t.image, fetch.swizzle | (fi.host_swizzle << 12));
   }
   ScopedUs texture_timer(stats_.us_textures);
-  t.last_check_frame = frame_;
+  // RC77: textures created together (entering an area) are rehashed on different frames, not all every 30th.
+  t.last_check_frame = frame_ - (t.image.image ? 0 : std::min<uint64_t>(frame_, key % 29));
   texture_util::TextureGuestLayout layout = {};
   const uint8_t* guest_mips = nullptr;
   if (levels > 1) {
@@ -3196,7 +3290,38 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
     const VkDeviceSize row_bytes = VkDeviceSize(lbw) * fi.bytes_per_block;
     for (uint32_t y = 0; y < lbh; ++y) {
       uint8_t* row = dst + row_bytes * y;
-      if (fetch.tiled) {
+      if (fetch.tiled && REXCVAR_GET(ds2_native_fast_untile)) {
+        // RC77: the tiled layout keeps 16 bytes of a row contiguous (4 blocks of 4 bytes, 2 of 8, 1 of 16), so
+        // the offset is computed once per 16 bytes, inline (GetTiledOffset2D, same arithmetic).
+        const uint32_t run = bpb_log2 ? std::max<uint32_t>(16u >> bpb_log2, 1u) : 1u;
+        const uint32_t run_bytes = run * fi.bytes_per_block;
+        const int32_t yy = int32_t(y + oy);
+        const int32_t pitch32 = int32_t(rex::align<uint32_t>(tiled_pitch_blocks, 32) >> 5);
+        auto tiled = [&](int32_t xx) -> int32_t {
+          int32_t macro = ((xx >> 5) + (yy >> 5) * pitch32) << (bpb_log2 + 7);
+          int32_t micro = ((xx & 7) + ((yy & 0xE) << 2)) << bpb_log2;
+          int32_t offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + ((yy & 1) << 4);
+          return ((offset & ~0x1FF) << 3) + ((yy & 16) << 7) + ((offset & 0x1C0) << 2) +
+                 (((((yy & 8) >> 2) + (xx >> 3)) & 3) << 6) + (offset & 0x3F);
+        };
+        uint32_t x = 0;
+        while (x < lbw) {
+          const int32_t xx = int32_t(x + ox);
+          const int32_t o = tiled(xx);
+          uint8_t* d = row + size_t(x) * fi.bytes_per_block;
+          if ((uint32_t(xx) % run) == 0 && x + run <= lbw && o >= 0 && size_t(o) + run_bytes <= src_size) {
+            std::memcpy(d, src + o, run_bytes);
+            x += run;
+            continue;
+          }
+          if (o < 0 || size_t(o) + fi.bytes_per_block > src_size) {
+            std::memset(d, 0, fi.bytes_per_block);
+          } else {
+            std::memcpy(d, src + o, fi.bytes_per_block);
+          }
+          ++x;
+        }
+      } else if (fetch.tiled) {
         for (uint32_t x = 0; x < lbw; ++x) {
           const int32_t o = texture_util::GetTiledOffset2D(int32_t(x + ox), int32_t(y + oy), tiled_pitch_blocks,
                                                            bpb_log2);
@@ -4286,6 +4411,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   const VkDevice dev = vulkan_device_->device();
   VkDescriptorSet sets[4] = {slot().shared_memory_set};
   const bool reuse_texture_sets = REXCVAR_GET(ds2_native_texture_sets);
+  const bool persistent_sets = reuse_texture_sets && REXCVAR_GET(ds2_native_persistent_texture_sets);
   const bool dynamic_ubo = REXCVAR_GET(ds2_native_dynamic_ubo);
   std::array<VkDeviceSize, SpirvShaderTranslator::kConstantBufferCount> constant_ranges;
   uint32_t constant_offsets[SpirvShaderTranslator::kConstantBufferCount];
@@ -4327,11 +4453,54 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
   size_t img_i = 0;
+  std::vector<std::vector<uint64_t>> new_persistent;
   auto texture_set = [&](VkDescriptorSetLayout set_layout, size_t textures, size_t samplers,
                          VkDescriptorSet& set) -> bool {
     const size_t count = textures + samplers;
     std::vector<uint64_t> local_key;
-    auto& key = REXCVAR_GET(ds2_native_cpu_cache) ? descriptor_key_ : local_key;
+    auto& key = (REXCVAR_GET(ds2_native_cpu_cache) || persistent_sets) ? descriptor_key_ : local_key;
+    key.clear();
+    if (persistent_sets) {
+      key.reserve(1 + count * 3);
+      key.push_back(reinterpret_cast<uint64_t>(set_layout));
+      for (size_t i = 0; i < count; ++i) {
+        const auto& info = image_infos[img_i + i];
+        key.push_back(reinterpret_cast<uint64_t>(info.imageView));
+        key.push_back(reinterpret_cast<uint64_t>(info.sampler));
+        key.push_back(uint64_t(info.imageLayout));
+      }
+      auto found = persistent_texture_sets_.find(key);
+      if (found != persistent_texture_sets_.end()) {
+        set = found->second.set;
+        img_i += count;
+        ++stats_.texture_sets_reused;
+        ++stats_.texture_sets_kept;
+        return true;
+      }
+      PersistentSet ps;
+      if (AllocatePersistentSet(set_layout, ps)) {
+        set = ps.set;
+        for (size_t i = 0; i < count; ++i) {
+          VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+          w.dstSet = set;
+          w.dstBinding = uint32_t(i);
+          w.descriptorCount = 1;
+          w.descriptorType = i < textures ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER;
+          w.pImageInfo = &image_infos[img_i + i];
+          writes.push_back(w);
+          if (i < textures && image_infos[img_i + i].imageView) {
+            auto& keys = persistent_sets_by_view_[image_infos[img_i + i].imageView];
+            if (keys.empty() || keys.back() != key) keys.push_back(key);
+          }
+        }
+        img_i += count;
+        persistent_texture_sets_.emplace(key, ps);
+        new_persistent.push_back(key);
+        ++stats_.texture_sets_created;
+        return true;
+      }
+      // Pools full: per-frame set below.
+    }
     key.clear();
     if (reuse_texture_sets) {
       key.reserve(1 + count * 3);
@@ -4369,6 +4538,12 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       !texture_set(layout->textures_pixel, ps_textures.size(), ps_samplers.size(), sets[3])) {
     // A failed allocation must not leave cached sets whose writes were never applied.
     slot().texture_sets.clear();
+    for (const auto& k : new_persistent) {
+      auto pit = persistent_texture_sets_.find(k);
+      if (pit == persistent_texture_sets_.end()) continue;
+      free_descriptor_sets_(dev, pit->second.pool, 1, &pit->second.set);
+      persistent_texture_sets_.erase(pit);
+    }
     ++stats_.draws_failed;
     return true;
   }
@@ -5498,9 +5673,9 @@ void NativeCommandProcessor::LogStats() {
     if (stats_.prim_counts[i]) prims += fmt::format(" {}:{:.0f}", i, stats_.prim_counts[i] / n);
   }
   REXGPU_INFO("[native] early-z draws per frame: {:.0f} | pipelines: {} new on the worker ({:.1f} ms of compile), "
-              "{:.1f} draws per frame skipped waiting for one",
+              "{:.1f} draws per frame skipped waiting for one, {} needed at once taken from the queue",
               stats_.early_z_draws / n, stats_.pipelines_async, pipeline_async_us_.exchange(0) / 1000.0,
-              stats_.draws_pipeline_pending / n);
+              stats_.draws_pipeline_pending / n, stats_.pipelines_stolen);
   REXGPU_INFO("[native] primitive types per frame:{} | skipped: no vertex shader {:.1f}, no rasterization {:.1f}, "
               "no pitch {:.1f}, no target {:.1f}",
               prims, stats_.skip_no_vs / n, stats_.skip_no_raster / n, stats_.skip_no_pitch / n,
@@ -5515,10 +5690,12 @@ void NativeCommandProcessor::LogStats() {
               stats_.occlusion_begins / n, stats_.occlusion_ends / n, stats_.occlusion_visible / n,
               stats_.occlusion_lost / n);
   REXGPU_INFO("[native] draw detail ms/frame: geometry {:.2f}, constants {:.2f}, descriptors {:.2f}, commands {:.2f} | "
-              "texture descriptor sets/frame: {:.1f} reused, {:.1f} created",
+              "texture descriptor sets/frame: {:.1f} reused ({:.1f} kept across frames), {:.1f} created, "
+              "{:.2f} dropped | {} kept",
               stats_.us_geometry / n / 1000.0, stats_.us_constants / n / 1000.0,
               stats_.us_descriptors / n / 1000.0, stats_.us_commands / n / 1000.0,
-              stats_.texture_sets_reused / n, stats_.texture_sets_created / n);
+              stats_.texture_sets_reused / n, stats_.texture_sets_kept / n, stats_.texture_sets_created / n,
+              stats_.texture_sets_dropped / n, persistent_texture_sets_.size());
   REXGPU_INFO("[native] constant sets/frame: {:.1f} reused, {:.1f} created | image resolve barriers/frame {:.1f}",
               stats_.constant_sets_reused / n, stats_.constant_sets_created / n, stats_.resolve_image_barriers / n);
   REXGPU_INFO("[native] immutable uploads/frame: {:.1f} hits, {:.2f} MB saved",
