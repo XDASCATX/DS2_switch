@@ -157,6 +157,8 @@ REXCVAR_DECLARE(std::string, ds2_shader_library);
 REXCVAR_DEFINE_STRING(ds2_native_halfres_ps, "70FC5FED5D6D2178", "GPU",
                       "RC82: pixel shaders (hex hashes) of additive particle draws drawn at half resolution and added "
                       "to the target (bonfire fog); empty = off");
+REXCVAR_DEFINE_DOUBLE(ds2_native_halfres_strength, 0.75, "GPU",
+                      "RC83: brightness of the half-resolution particles when added (bonfire fog); 1 = as the game");
 REXCVAR_DEFINE_INT32(ds2_native_halfres_vpos_const, 215, "GPU",
                      "RC82: pixel shader float constant whose zw scale the pixel position (doubled for half resolution)");
 REXCVAR_DEFINE_BOOL(ds2_native_fast_registers, true, "GPU",
@@ -2700,9 +2702,9 @@ bool NativeCommandProcessor::CompositeHalfRes(NativeImage& rt, NativeImage& half
   if (!halfres_composite_pipeline_) {
     static const char* kFs = R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D t;
-layout(push_constant) uniform P { vec2 inv_size; } pc;
+layout(push_constant) uniform P { vec2 inv_size; float scale; } pc;
 layout(location = 0) out vec4 o;
-void main() { o = texture(t, gl_FragCoord.xy * pc.inv_size); }
+void main() { o = texture(t, gl_FragCoord.xy * pc.inv_size) * pc.scale; }
 )";
     std::vector<uint32_t> spirv;
     std::string error;
@@ -2810,7 +2812,8 @@ void main() { o = texture(t, gl_FragCoord.xy * pc.inv_size); }
   const VkViewport vp = {0.0f, 0.0f, float(rt.width), float(rt.height), 0.0f, 1.0f};
   dfn().vkCmdSetViewport(cmd, 0, 1, &vp);
   dfn().vkCmdSetScissor(cmd, 0, 1, &rect);
-  const float pc[4] = {1.0f / float(rt.width), 1.0f / float(rt.height), 0.0f, 0.0f};
+  const float pc[4] = {1.0f / float(rt.width), 1.0f / float(rt.height),
+                       float(std::clamp(REXCVAR_GET(ds2_native_halfres_strength), 0.0, 4.0)), 0.0f};
   dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, halfres_composite_pipeline_);
   dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, convert_layout_[0], 0, 1, &set, 0, nullptr);
   dfn().vkCmdPushConstants(cmd, convert_layout_[0], VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), pc);
