@@ -158,6 +158,9 @@ REXCVAR_DEFINE_BOOL(ds2_native_occlusion_queries, false, "GPU",
                     "frames late. false = a fixed 'visible' result as in the emulation (query_occlusion_fake_sample_"
                     "count): glows and flares then show through walls");
 
+REXCVAR_DEFINE_INT32(ds2_native_occlusion_hold, 2, "GPU",
+                     "RC69: an occlusion query reports 'hidden' only after this many consecutive zero measurements "
+                     "(otherwise the largest recent count), so a late result cannot make an object blink; 1 = raw");
 REXCVAR_DECLARE(int32_t, query_occlusion_fake_sample_count);
 
 #if REX_PLATFORM_SWITCH
@@ -933,7 +936,22 @@ class NativeCommandProcessor final : public CommandProcessor {
   uint64_t hitch_prev_pipelines_ = 0;
 
   // Occlusion queries: last measured sample count per guest result address; the active query index or -1.
-  std::unordered_map<uint32_t, uint32_t> occlusion_results_;
+  struct OcclusionResult {
+    uint32_t samples = 0;      // latest measurement
+    uint32_t max_recent = 0;   // largest measurement since the last zero streak began
+    uint32_t zero_streak = 0;  // consecutive zero measurements
+  };
+  std::unordered_map<uint32_t, OcclusionResult> occlusion_results_;
+  void NoteOcclusionResult(uint32_t address, uint32_t samples) {
+    OcclusionResult& r = occlusion_results_[address];
+    r.samples = samples;
+    if (samples) {
+      r.zero_streak = 0;
+      r.max_recent = samples;
+    } else {
+      ++r.zero_streak;
+    }
+  }
   int32_t occlusion_active_ = -1;
   bool occlusion_unmeasured_ = false;
   void EndOcclusionQuery(uint32_t result_address);
@@ -1232,7 +1250,7 @@ bool NativeCommandProcessor::BeginFrame() {
       uint64_t samples = 0;
       if (dfn().vkGetQueryPoolResults(dev, s.occlusion_pool, index, 1, sizeof(samples), &samples, sizeof(samples),
                                       VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
-        occlusion_results_[address] = uint32_t(std::min<uint64_t>(samples, 0xFFFFFFFFu));
+        NoteOcclusionResult(address, uint32_t(std::min<uint64_t>(samples, 0xFFFFFFFFu)));
       }
     }
   }
@@ -4037,8 +4055,12 @@ bool NativeCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuff
   // The newest measured result of this query (its memory is fixed per Direct3D query object); a query not
   // measured yet reports visible, as the emulation does.
   auto it = occlusion_results_.find(address);
-  const uint32_t samples = it != occlusion_results_.end() ? it->second
-                                                          : uint32_t(std::max(REXCVAR_GET(query_occlusion_fake_sample_count), 0));
+  uint32_t samples = uint32_t(std::max(REXCVAR_GET(query_occlusion_fake_sample_count), 0));
+  if (it != occlusion_results_.end()) {
+    const OcclusionResult& r = it->second;
+    const uint32_t hold = uint32_t(std::max(REXCVAR_GET(ds2_native_occlusion_hold), 1));
+    samples = r.samples ? r.samples : (r.zero_streak >= hold ? 0 : r.max_recent);
+  }
   if (samples) ++stats_.occlusion_visible;
   counts->ZPass_A = samples;
   counts->Total_A = samples;
@@ -4052,7 +4074,7 @@ void NativeCommandProcessor::EndOcclusionQuery(uint32_t result_address) {
   dfn().vkCmdEndQuery(s.cmd, s.occlusion_pool, uint32_t(occlusion_active_));
   if (result_address) {
     if (occlusion_unmeasured_) {
-      occlusion_results_[result_address] = uint32_t(std::max(REXCVAR_GET(query_occlusion_fake_sample_count), 1));
+      NoteOcclusionResult(result_address, uint32_t(std::max(REXCVAR_GET(query_occlusion_fake_sample_count), 1)));
     } else {
       s.occlusion_pending.emplace_back(result_address, uint32_t(occlusion_active_));
     }
