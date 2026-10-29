@@ -36,6 +36,7 @@
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/pipeline/shader/native_vertex_layout.h>
+#include <rex/graphics/pipeline/shader/spirv_library.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/registers.h>
@@ -152,6 +153,9 @@ REXCVAR_DEFINE_INT32(ds2_native_msaa_min_draws, 8, "GPU",
                      "draws in this or the previous frame (DS2 clears in 4x and draws at 1x elsewhere)");
 REXCVAR_DEFINE_BOOL(ds2_native_shadow_face_clear, true, "GPU",
                     "RC74: clear the whole viewport of a shadow face drawn after a depth-only clear rectangle");
+REXCVAR_DECLARE(std::string, ds2_shader_library);
+REXCVAR_DEFINE_BOOL(ds2_native_async_shader_restore, true, "GPU",
+                    "RC79: restore shaders from the pack on a worker; draws wait for them (skipped) instead of the frame");
 REXCVAR_DEFINE_BOOL(ds2_native_constant_reuse, true, "GPU",
                     "RC78: a constant buffer equal to the previous draw's reuses its upload");
 REXCVAR_DEFINE_BOOL(ds2_native_persistent_texture_sets, true, "GPU",
@@ -806,6 +810,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t us_constants = 0, us_descriptors = 0, us_geometry = 0, us_commands = 0;
     uint64_t texture_sets_reused = 0, texture_sets_created = 0, texture_sets_kept = 0, texture_sets_dropped = 0;
     uint64_t constant_uploads_reused = 0, us_prelude = 0, us_translate = 0, us_pipeline_sync = 0, pipelines_sync = 0;
+    uint64_t shader_restores_async = 0, draws_shader_pending = 0;
     uint64_t constant_sets_reused = 0, constant_sets_created = 0, resolve_image_barriers = 0;
     uint64_t native_vertex_draws = 0, legacy_vertex_draws = 0;
     uint64_t content_hits = 0, content_saved_bytes = 0;
@@ -932,6 +937,24 @@ class NativeCommandProcessor final : public CommandProcessor {
   PFN_vkCmdSetDepthBias2EXT cmd_set_depth_bias2_ = nullptr;
   PFN_vkFreeDescriptorSets free_descriptor_sets_ = nullptr;  // RC76: absolute (unorm24) constant depth bias
   std::unique_ptr<SpirvShaderTranslator> translator_;
+  // RC79: shader pack restores (SD reads, ~10 ms each) on a worker. A draw whose shader is still being restored is
+  // skipped (as with a pipeline still compiling); rectangles and full-screen passes still restore at once.
+  std::mutex restore_mutex_;
+  std::condition_variable restore_cv_;
+  std::deque<Shader::Translation*> restore_jobs_;
+  std::vector<std::pair<Shader::Translation*, bool>> restore_done_;
+  std::unordered_set<Shader::Translation*> restore_pending_;
+  std::unordered_map<const Shader*, uint32_t> restore_pending_shaders_;
+  std::unordered_set<Shader::Translation*> restore_failed_;
+  pthread_t restore_thread_ = {};
+  bool restore_thread_started_ = false, restore_quit_ = false;
+  uint64_t restore_signature_ = 0;
+  std::atomic<uint64_t> restore_us_{0}, restore_count_{0};
+  static void* RestoreThreadMain(void* param);
+  void DrainRestores(bool wait_for_shader, const Shader* shader);
+  void StopRestoreThread();
+  // Returns true when the translation is ready to use now; false when it is being restored (the draw waits).
+  bool PrepareTranslation(VulkanShader::VulkanTranslation* t, bool allow_async);
   string::StringBuffer ucode_disasm_buffer_;
   std::unordered_map<uint64_t, std::unique_ptr<VulkanShader>> shaders_;
 
@@ -1339,6 +1362,7 @@ void NativeCommandProcessor::ShutdownContext() {
     if (m) dfn().vkDestroyShaderModule(dev, m, nullptr);
   }
   StopPipelineThread();
+  StopRestoreThread();
   for (auto& [k, p] : pipelines_) {
     if (p) dfn().vkDestroyPipeline(dev, p, nullptr);
   }
@@ -2863,6 +2887,97 @@ void* NativeCommandProcessor::PipelineThreadMain(void* param) {
   }
 }
 
+void* NativeCommandProcessor::RestoreThreadMain(void* param) {
+  auto* self = static_cast<NativeCommandProcessor*>(param);
+  for (;;) {
+    Shader::Translation* job;
+    {
+      std::unique_lock<std::mutex> lock(self->restore_mutex_);
+      self->restore_cv_.wait(lock, [self] { return self->restore_quit_ || !self->restore_jobs_.empty(); });
+      if (self->restore_quit_) return nullptr;
+      job = self->restore_jobs_.front();
+      self->restore_jobs_.pop_front();
+    }
+    const uint64_t start = NowUs();
+    const bool restored = RestoreConfiguredSpirvLibrary(*job, self->restore_signature_);
+    self->restore_us_.fetch_add(NowUs() - start, std::memory_order_relaxed);
+    self->restore_count_.fetch_add(1, std::memory_order_relaxed);
+    {
+      std::lock_guard<std::mutex> lock(self->restore_mutex_);
+      self->restore_done_.emplace_back(job, restored);
+    }
+    self->restore_cv_.notify_all();
+  }
+}
+
+void NativeCommandProcessor::DrainRestores(bool wait_for_shader, const Shader* shader) {
+  std::unique_lock<std::mutex> lock(restore_mutex_);
+  for (;;) {
+    for (const auto& [t, restored] : restore_done_) {
+      restore_pending_.erase(t);
+      auto it = restore_pending_shaders_.find(&t->shader());
+      if (it != restore_pending_shaders_.end() && --it->second == 0) restore_pending_shaders_.erase(it);
+      if (!restored) restore_failed_.insert(t);
+    }
+    restore_done_.clear();
+    if (!wait_for_shader || !restore_pending_shaders_.count(shader)) return;
+    restore_cv_.wait_for(lock, std::chrono::milliseconds(1));
+  }
+}
+
+void NativeCommandProcessor::StopRestoreThread() {
+  if (!restore_thread_started_) return;
+  {
+    std::lock_guard<std::mutex> lock(restore_mutex_);
+    restore_quit_ = true;
+    restore_jobs_.clear();
+  }
+  restore_cv_.notify_all();
+  pthread_join(restore_thread_, nullptr);
+  restore_thread_started_ = false;
+}
+
+bool NativeCommandProcessor::PrepareTranslation(VulkanShader::VulkanTranslation* t, bool allow_async) {
+  if (!t) return true;
+  if (restore_pending_.count(t)) {
+    if (allow_async) return false;
+    DrainRestores(true, &t->shader());
+  }
+  if (t->is_translated()) {
+    if (t->is_valid() && !t->shader_module()) t->GetOrCreateShaderModule();
+    return true;
+  }
+  const bool async = allow_async && REXCVAR_GET(ds2_native_async_shader_restore) && !restore_failed_.count(t) &&
+                     !REXCVAR_GET(ds2_shader_library).empty();
+  if (async) {
+    if (!restore_thread_started_) {
+      restore_signature_ = translator_->ShaderLibrarySignature();
+      pthread_attr_t attr;
+      pthread_attr_init(&attr);
+      pthread_attr_setstacksize(&attr, 1 << 20);
+      restore_thread_started_ = pthread_create(&restore_thread_, &attr, &RestoreThreadMain, this) == 0;
+      pthread_attr_destroy(&attr);
+    }
+    if (restore_thread_started_) {
+      {
+        std::lock_guard<std::mutex> lock(restore_mutex_);
+        restore_jobs_.push_back(t);
+      }
+      restore_cv_.notify_all();
+      restore_pending_.insert(t);
+      ++restore_pending_shaders_[&t->shader()];
+      ++stats_.shader_restores_async;
+      return false;
+    }
+  }
+  // At once (or the pack has no such variant): no restore of this shader may run on the worker meanwhile.
+  if (restore_pending_shaders_.count(&t->shader())) DrainRestores(true, &t->shader());
+  if (!translator_->TranslateAnalyzedShader(*t) || !t->GetOrCreateShaderModule()) {
+    REXGPU_ERROR("[native] shader {:016X} translation failed", t->shader().ucode_data_hash());
+  }
+  return true;
+}
+
 void NativeCommandProcessor::StopPipelineThread() {
   if (!pipeline_thread_started_) return;
   {
@@ -3823,14 +3938,17 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     vst = static_cast<VulkanShader::VulkanTranslation*>(vs->GetOrCreateTranslation(vs_mod.value));
   }
   uint64_t translate_start = NowUs();
-  if (!vst->is_translated()) {
-    if (!translator_->TranslateAnalyzedShader(*vst) || !vst->GetOrCreateShaderModule()) {
-      REXGPU_ERROR("[native] vertex shader {:016X} translation failed", vs->ucode_data_hash());
-    }
-  }
-  if (pst && !pst->is_translated()) {
-    if (!translator_->TranslateAnalyzedShader(*pst) || !pst->GetOrCreateShaderModule()) {
-      REXGPU_ERROR("[native] pixel shader {:016X} translation failed", ps->ucode_data_hash());
+  if (!restore_done_.empty() || !restore_pending_.empty()) DrainRestores(false, nullptr);
+  {
+    const bool shader_async = !native_vertex && prim_type != xenos::PrimitiveType::kRectangleList && index_count > 6;
+    const bool vs_ready = PrepareTranslation(vst, shader_async);
+    const bool ps_ready = PrepareTranslation(pst, shader_async);
+    if (!vs_ready || !ps_ready) {
+      stats_.us_pipelines += NowUs() - translate_start;
+      stats_.us_translate += NowUs() - translate_start;
+      ++stats_.draws_skipped;
+      ++stats_.draws_shader_pending;
+      return true;
     }
   }
   if (native_vertex && (!vst->is_valid() || !vst->shader_module())) {
@@ -5744,6 +5862,13 @@ void NativeCommandProcessor::LogStats() {
               "created at once {:.1f} ms",
               stats_.us_prelude / n / 1000.0, stats_.constant_uploads_reused / n, stats_.us_translate / 1000.0,
               stats_.pipelines_sync, stats_.us_pipeline_sync / 1000.0);
+  {
+    const uint64_t rc = restore_count_.exchange(0), rus = restore_us_.exchange(0);
+    REXGPU_INFO("[native] shader pack restores on the worker in the interval: {} queued, {} done, {:.1f} ms ({:.2f} "
+                "ms each), {:.1f} draws per frame skipped waiting for one",
+                stats_.shader_restores_async, rc, rus / 1000.0, rc ? rus / 1000.0 / rc : 0.0,
+                stats_.draws_shader_pending / n);
+  }
   REXGPU_INFO("[native] immutable uploads/frame: {:.1f} hits, {:.2f} MB saved",
               stats_.content_hits / n, stats_.content_saved_bytes / n / 1048576.0);
   REXGPU_INFO("[native] vertex draws/frame: {:.1f} hardware inputs, {:.1f} legacy fetch",
