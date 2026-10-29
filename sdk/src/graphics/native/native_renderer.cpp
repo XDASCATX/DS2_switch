@@ -154,6 +154,11 @@ REXCVAR_DEFINE_INT32(ds2_native_msaa_min_draws, 8, "GPU",
 REXCVAR_DEFINE_BOOL(ds2_native_shadow_face_clear, true, "GPU",
                     "RC74: clear the whole viewport of a shadow face drawn after a depth-only clear rectangle");
 REXCVAR_DECLARE(std::string, ds2_shader_library);
+REXCVAR_DEFINE_STRING(ds2_native_halfres_ps, "70FC5FED5D6D2178", "GPU",
+                      "RC82: pixel shaders (hex hashes) of additive particle draws drawn at half resolution and added "
+                      "to the target (bonfire fog); empty = off");
+REXCVAR_DEFINE_INT32(ds2_native_halfres_vpos_const, 215, "GPU",
+                     "RC82: pixel shader float constant whose zw scale the pixel position (doubled for half resolution)");
 REXCVAR_DEFINE_BOOL(ds2_native_fast_registers, true, "GPU",
                     "RC81: plain register writes only store the value (no register info lookup and side-effect switch)");
 REXCVAR_DEFINE_BOOL(ds2_native_texture_scratch, true, "GPU",
@@ -850,7 +855,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t us_constants = 0, us_descriptors = 0, us_geometry = 0, us_commands = 0;
     uint64_t texture_sets_reused = 0, texture_sets_created = 0, texture_sets_kept = 0, texture_sets_dropped = 0;
     uint64_t constant_uploads_reused = 0, us_prelude = 0, us_translate = 0, us_pipeline_sync = 0, pipelines_sync = 0;
-    uint64_t shader_restores_async = 0, draws_shader_pending = 0;
+    uint64_t shader_restores_async = 0, draws_shader_pending = 0, halfres_draws = 0;
     uint64_t constant_sets_reused = 0, constant_sets_created = 0, resolve_image_barriers = 0;
     uint64_t native_vertex_draws = 0, legacy_vertex_draws = 0;
     uint64_t content_hits = 0, content_saved_bytes = 0;
@@ -1057,6 +1062,19 @@ class NativeCommandProcessor final : public CommandProcessor {
   std::vector<VkWriteDescriptorSet> descriptor_writes_;
   std::vector<uint64_t> descriptor_key_;
   std::vector<uint8_t> texture_row_scratch_;
+  // RC82: additive particle draws listed in ds2_native_halfres_ps are drawn into a half-resolution copy and added to
+  // the target (bonfire fog: one draw of 16 full-screen quads took 47-64 ms of GPU time).
+  struct HalfResTarget {
+    NativeImage image;
+  };
+  std::unordered_map<VkImage, HalfResTarget> halfres_targets_;
+  VkPipeline halfres_composite_pipeline_ = VK_NULL_HANDLE;
+  VkShaderModule halfres_composite_fs_ = VK_NULL_HANDLE;
+  VkSampler linear_sampler_ = VK_NULL_HANDLE;
+  bool halfres_draw_ = false;
+  uint32_t halfres_vpos_register_ = UINT32_MAX;
+  bool IsHalfResPixelShader(uint64_t hash);
+  bool CompositeHalfRes(NativeImage& rt, NativeImage& half, const VkRect2D& rect);
   struct LastConstantUpload {
     std::vector<uint8_t> data;
     VkDeviceSize offset = 0;
@@ -1392,6 +1410,11 @@ void NativeCommandProcessor::ShutdownContext() {
   }
   for (auto& [k, sh] : msaa_shadows_) DestroyImage(sh.image, false);
   msaa_shadows_.clear();
+  for (auto& [k, h] : halfres_targets_) DestroyImage(h.image, false);
+  halfres_targets_.clear();
+  if (halfres_composite_pipeline_) dfn().vkDestroyPipeline(dev, halfres_composite_pipeline_, nullptr);
+  if (halfres_composite_fs_) dfn().vkDestroyShaderModule(dev, halfres_composite_fs_, nullptr);
+  if (linear_sampler_) dfn().vkDestroySampler(dev, linear_sampler_, nullptr);
   for (uint32_t i = 0; i < 2; ++i) {
     if (convert_layout_[i]) dfn().vkDestroyPipelineLayout(dev, convert_layout_[i], nullptr);
     if (convert_set_layout_[i]) dfn().vkDestroyDescriptorSetLayout(dev, convert_set_layout_[i], nullptr);
@@ -2653,6 +2676,150 @@ bool NativeCommandProcessor::QuantizeDepthFloat24(NativeImage& src, NativeImage&
   Barrier();
   InvalidateDrawState();
   ++stats_.depth_float24_quantized;
+  return true;
+}
+
+bool NativeCommandProcessor::IsHalfResPixelShader(uint64_t hash) {
+  const std::string& list = REXCVAR_GET(ds2_native_halfres_ps);
+  if (list.empty()) return false;
+  const std::string h = fmt::format("{:016X}", hash);
+  return list.find(h) != std::string::npos;
+}
+
+bool NativeCommandProcessor::CompositeHalfRes(NativeImage& rt, NativeImage& half, const VkRect2D& rect) {
+  const VkDevice dev = vulkan_device_->device();
+  VkFormat format = rt.format;
+  VkRenderPass pass = GetRenderPass(&format, 1, VK_FORMAT_UNDEFINED, 1);
+  if (!pass) return false;
+  if (!linear_sampler_) {
+    VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (dfn().vkCreateSampler(dev, &sci, nullptr, &linear_sampler_) != VK_SUCCESS) return false;
+  }
+  if (!halfres_composite_pipeline_) {
+    static const char* kFs = R"(#version 450
+layout(set = 0, binding = 0) uniform sampler2D t;
+layout(push_constant) uniform P { vec2 inv_size; } pc;
+layout(location = 0) out vec4 o;
+void main() { o = texture(t, gl_FragCoord.xy * pc.inv_size); }
+)";
+    std::vector<uint32_t> spirv;
+    std::string error;
+    if (!CompileGlsl(EShLangFragment, kFs, spirv, error)) {
+      REXGPU_ERROR("[native] half-resolution composite shader: {}", error);
+      return false;
+    }
+    halfres_composite_fs_ = ui::vulkan::util::CreateShaderModule(vulkan_device_, spirv.data(), spirv.size() * 4);
+    VkPipelineShaderStageCreateInfo stages[2] = {};
+    stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = convert_vs_;
+    stages[0].pName = "main";
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = halfres_composite_fs_;
+    stages[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vps = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vps.viewportCount = vps.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo msi = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    msi.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState ba = {};
+    ba.blendEnable = VK_TRUE;
+    ba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    ba.colorBlendOp = VK_BLEND_OP_ADD;
+    ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    ba.alphaBlendOp = VK_BLEND_OP_ADD;
+    ba.colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1;
+    cb.pAttachments = &ba;
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dy.dynamicStateCount = 2;
+    dy.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    ci.stageCount = 2;
+    ci.pStages = stages;
+    ci.pVertexInputState = &vi;
+    ci.pInputAssemblyState = &ia;
+    ci.pViewportState = &vps;
+    ci.pRasterizationState = &rs;
+    ci.pMultisampleState = &msi;
+    ci.pColorBlendState = &cb;
+    ci.pDynamicState = &dy;
+    ci.layout = convert_layout_[0];
+    ci.renderPass = pass;
+    if (dfn().vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &ci, nullptr, &halfres_composite_pipeline_) !=
+        VK_SUCCESS) {
+      halfres_composite_pipeline_ = VK_NULL_HANDLE;
+      return false;
+    }
+  }
+  VkDescriptorSet set = VK_NULL_HANDLE;
+  VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  ai.descriptorPool = slot().descriptor_pool;
+  ai.descriptorSetCount = 1;
+  ai.pSetLayouts = &convert_set_layout_[0];
+  if (dfn().vkAllocateDescriptorSets(dev, &ai, &set) != VK_SUCCESS) return false;
+  VkDescriptorImageInfo ii = {linear_sampler_, half.view, VK_IMAGE_LAYOUT_GENERAL};
+  VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  w.dstSet = set;
+  w.dstBinding = 0;
+  w.descriptorCount = 1;
+  w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  w.pImageInfo = &ii;
+  dfn().vkUpdateDescriptorSets(dev, 1, &w, 0, nullptr);
+  uint64_t fb_key = (reinterpret_cast<uint64_t>(pass) * 1000003u + reinterpret_cast<uint64_t>(rt.view)) * 31 +
+                    rt.width * 4099 + rt.height;
+  VkFramebuffer fb;
+  auto fit = framebuffers_.find(fb_key);
+  if (fit != framebuffers_.end()) {
+    fb = fit->second;
+  } else {
+    VkFramebufferCreateInfo fci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fci.renderPass = pass;
+    fci.attachmentCount = 1;
+    fci.pAttachments = &rt.view;
+    fci.width = rt.width;
+    fci.height = rt.height;
+    fci.layers = 1;
+    if (dfn().vkCreateFramebuffer(dev, &fci, nullptr, &fb) != VK_SUCCESS) return false;
+    framebuffers_.emplace(fb_key, fb);
+    fb_by_view_.emplace(rt.view, fb_key);
+  }
+  EndRenderPass();
+  Barrier();
+  if (profiling_) Mark("half-resolution composite");
+  VkCommandBuffer cmd = slot().cmd;
+  VkRenderPassBeginInfo bi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+  bi.renderPass = pass;
+  bi.framebuffer = fb;
+  bi.renderArea = rect;
+  work_since_barrier_ = true;
+  InvalidateDrawState();
+  dfn().vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
+  const VkViewport vp = {0.0f, 0.0f, float(rt.width), float(rt.height), 0.0f, 1.0f};
+  dfn().vkCmdSetViewport(cmd, 0, 1, &vp);
+  dfn().vkCmdSetScissor(cmd, 0, 1, &rect);
+  const float pc[4] = {1.0f / float(rt.width), 1.0f / float(rt.height), 0.0f, 0.0f};
+  dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, halfres_composite_pipeline_);
+  dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, convert_layout_[0], 0, 1, &set, 0, nullptr);
+  dfn().vkCmdPushConstants(cmd, convert_layout_[0], VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), pc);
+  dfn().vkCmdDraw(cmd, 3, 1, 0, 0);
+  dfn().vkCmdEndRenderPass(cmd);
+  work_since_barrier_ = true;
+  Barrier();
+  InvalidateDrawState();
+  ++stats_.halfres_draws;
   return true;
 }
 
@@ -4193,6 +4360,36 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (occlusion_active_ >= 0) occlusion_unmeasured_ = true;  // every sample would pass: not measurable here
     return true;
   }
+  // RC82: half-resolution additive particles (see halfres_targets_).
+  NativeImage* halfres_full_rt = nullptr;
+  halfres_draw_ = false;
+  if (ps && color_count == 1 && !host_msaa && sx == 1 && sy == 1 && !msaa_force_clear_ &&
+      color_rts[0]->format == VK_FORMAT_R16G16B16A16_SFLOAT && color_rts[0]->width >= 4 &&
+      color_rts[0]->height >= 4 && (blend[0] & 0x1F00u) == 0x0100u && ((blend[0] >> 5) & 7u) == 0 &&
+      ((blend[0] >> 16) & 0x1Fu) == 0 && ((blend[0] >> 24) & 0x1Fu) == 1 &&
+      IsHalfResPixelShader(ps->ucode_data_hash())) {
+    HalfResTarget& h = halfres_targets_[color_rts[0]->image];
+    if (!h.image.image) {
+      if (!CreateImage(h.image, color_rts[0]->format, color_rts[0]->width / 2, color_rts[0]->height / 2, false,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
+        DestroyImage(h.image, false);
+        halfres_targets_.erase(color_rts[0]->image);
+      } else {
+        EnsureGeneral(h.image);
+      }
+    }
+    auto hit = halfres_targets_.find(color_rts[0]->image);
+    if (hit != halfres_targets_.end() && hit->second.image.image) {
+      VkClearValue zero = {};
+      ClearRect(hit->second.image, zero, {{0, 0}, {hit->second.image.width, hit->second.image.height}}, false);
+      halfres_full_rt = color_rts[0];
+      color_rts[0] = &hit->second.image;
+      depth_rt = nullptr;
+      rt_width = hit->second.image.width;
+      rt_height = hit->second.image.height;
+      halfres_draw_ = true;
+    }
+  }
   VkRenderPass pass = GetRenderPass(color_formats, color_count, depth_rt ? depth_rt->format : VK_FORMAT_UNDEFINED,
                                     host_msaa ? 4 : 1);
   if (!pass) {
@@ -4604,6 +4801,13 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       while (rex::bit_scan_forward(bits, &c)) {
         bits &= ~(uint64_t(1) << c);
         std::memcpy(w, &regs[first_register + (i << 8) + (c << 2)], sizeof(float) * 4);
+        if (halfres_draw_ && first_register == XE_GPU_REG_SHADER_CONSTANT_256_X &&
+            int32_t(i * 64 + c) == REXCVAR_GET(ds2_native_halfres_vpos_const)) {
+          // RC82: the pixel position is half of the guest one; its scale to texture coordinates is doubled.
+          float* f = reinterpret_cast<float*>(w);
+          f[2] *= 2.0f;
+          f[3] *= 2.0f;
+        }
         w += sizeof(float) * 4;
       }
     }
@@ -4988,6 +5192,17 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   vp.y = float(viewport.xy_offset[1]);
   vp.width = float(std::max(viewport.xy_extent[0], 1u));
   vp.height = float(std::max(viewport.xy_extent[1], 1u));
+  const draw_util::Scissor full_scissor = scissor;
+  if (halfres_draw_) {
+    vp.x *= 0.5f;
+    vp.y *= 0.5f;
+    vp.width *= 0.5f;
+    vp.height *= 0.5f;
+    scissor.offset[0] /= 2;
+    scissor.offset[1] /= 2;
+    scissor.extent[0] = (scissor.extent[0] + 1) / 2;
+    scissor.extent[1] = (scissor.extent[1] + 1) / 2;
+  }
   vp.minDepth = viewport.z_min;
   vp.maxDepth = viewport.z_max;
   if (!filter || std::memcmp(&ds.viewport, &vp, sizeof(vp))) {
@@ -5088,6 +5303,15 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   ++stats_.draws;
   ++draws_this_frame_;
   if (profiling_ && !slot().seg_draws.empty()) ++slot().seg_draws.back();
+  if (halfres_draw_ && halfres_full_rt) {
+    halfres_draw_ = false;
+    const uint32_t fx = std::min(full_scissor.offset[0], halfres_full_rt->width);
+    const uint32_t fy = std::min(full_scissor.offset[1], halfres_full_rt->height);
+    const VkRect2D rect = {{int32_t(fx), int32_t(fy)},
+                           {std::min(full_scissor.extent[0], halfres_full_rt->width - fx),
+                            std::min(full_scissor.extent[1], halfres_full_rt->height - fy)}};
+    if (rect.extent.width && rect.extent.height) CompositeHalfRes(*halfres_full_rt, *color_rts[0], rect);
+  }
   if (msaa_replay_clear_ && !msaa_force_clear_) {
     msaa_replay_clear_ = false;
     msaa_force_clear_ = true;
@@ -5924,6 +6148,7 @@ void NativeCommandProcessor::LogStats() {
               " | shadow face clears/frame {:.1f}",
               stats_.msaa_draws / n, stats_.msaa_imports / n, stats_.msaa_imports_skipped / n,
               stats_.msaa_exports / n, stats_.face_clears / n);
+  REXGPU_INFO("[native] half-resolution particle draws/frame: {:.2f}", stats_.halfres_draws / n);
   REXGPU_INFO("[native] texture fetches/frame: {:.1f} 1D, {:.1f} cube ({:.2f} faces copied from resolves), "
               "{:.1f} white (3D/unsupported cube/other dimension), {:.1f} depth from 8888 ({:.2f} decodes), "
               "{:.2f} float24 depth resolves",
