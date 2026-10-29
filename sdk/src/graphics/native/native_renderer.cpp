@@ -822,9 +822,11 @@ class NativeCommandProcessor final : public CommandProcessor {
   std::unordered_map<VkImage, MsaaShadow> msaa_shadows_;
   bool msaa_supported_ = false;
   bool msaa_lookup_ = false;  // GetRenderTarget calls of a 4x pass: no export
+  bool msaa_force_clear_ = false;   // RC73: replaying a 4x clear rectangle into the 4x copies
+  bool msaa_replay_clear_ = false;  // RC73: the current clear rectangle is to be replayed into the 4x copies
   std::unordered_map<uint64_t, VkPipeline> msaa_pipelines_;
   VkShaderModule msaa_fs_[6] = {};
-  NativeImage* GetMsaaShadow(NativeImage& rt, bool import);
+  NativeImage* GetMsaaShadow(NativeImage& rt, bool import, uint32_t import_rows = 0);
   void ExportMsaaShadow(NativeImage& rt, bool invalidate);
   void ExportAllMsaaShadows();
   bool MsaaTransfer(NativeImage& rt, NativeImage& ms, bool to_ms, uint32_t rows = 0);
@@ -2289,7 +2291,10 @@ bool NativeCommandProcessor::MsaaTransfer(NativeImage& rt, NativeImage& ms, bool
   VkPipeline main_pipeline = GetMsaaPipeline(main_mode, format, to_ms, pass);
   VkPipeline stencil_pipeline =
       dst.depth ? GetMsaaPipeline(to_ms ? kMsaaStencilToMs : kMsaaStencilFromMs, format, to_ms, pass) : VK_NULL_HANDLE;
-  if (!main_pipeline || (dst.depth && !stencil_pipeline)) return false;
+  if (!main_pipeline || (dst.depth && !stencil_pipeline)) {
+    REXGPU_WARN("[native] host 4x MSAA: transfer pipeline unavailable (mode {})", main_mode);
+    return false;
+  }
   VkDescriptorSet sets[2] = {};
   VkImageView views[2] = {dst.depth ? src.depth_view : src.view, src.stencil_view};
   const uint32_t set_count = dst.depth ? 2 : 1;
@@ -2298,7 +2303,10 @@ bool NativeCommandProcessor::MsaaTransfer(NativeImage& rt, NativeImage& ms, bool
     ai.descriptorPool = slot().descriptor_pool;
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &convert_set_layout_[0];
-    if (dfn().vkAllocateDescriptorSets(dev, &ai, &sets[i]) != VK_SUCCESS) return false;
+    if (dfn().vkAllocateDescriptorSets(dev, &ai, &sets[i]) != VK_SUCCESS) {
+      REXGPU_WARN("[native] host 4x MSAA: transfer descriptor set unavailable");
+      return false;
+    }
     VkDescriptorImageInfo ii = {convert_sampler_, views[i], VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     w.dstSet = sets[i];
@@ -2380,7 +2388,7 @@ bool NativeCommandProcessor::MsaaTransfer(NativeImage& rt, NativeImage& ms, bool
   return true;
 }
 
-NativeImage* NativeCommandProcessor::GetMsaaShadow(NativeImage& rt, bool import) {
+NativeImage* NativeCommandProcessor::GetMsaaShadow(NativeImage& rt, bool import, uint32_t import_rows) {
   MsaaShadow& sh = msaa_shadows_[rt.image];
   if (!sh.image.image) {
     const VkImageUsageFlags usage =
@@ -2397,7 +2405,11 @@ NativeImage* NativeCommandProcessor::GetMsaaShadow(NativeImage& rt, bool import)
   }
   if (!sh.valid) {
     if (import) {
-      if (!MsaaTransfer(rt, sh.image, true)) return nullptr;
+      if (!MsaaTransfer(rt, sh.image, true, import_rows)) {
+        REXGPU_WARN("[native] host 4x MSAA: import of a {}x{} {} target failed; sample space used", rt.width,
+                    rt.height, rt.depth ? "depth" : "color");
+        return nullptr;
+      }
     } else {
       ++stats_.msaa_imports_skipped;
     }
@@ -3348,6 +3360,7 @@ Shader* NativeCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
 bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info, bool major_mode_explicit) {
   (void)major_mode_explicit;
+  if (!msaa_force_clear_) msaa_replay_clear_ = false;
   const RegisterFile& regs = *register_file_;
   const xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) return IssueCopy();
@@ -3615,15 +3628,33 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // RC71: a 4x pass with color targets (or a 4x pass on a depth buffer whose 4x copy is current) is drawn into the
   // 4x MSAA copies. Anything else uses the sample-space images, so their 4x copies are exported first.
   bool host_msaa = false;
+  // A full clear draw (rectangle, depth always written, stencil fully replaced, all color channels written
+  // without blending) makes importing the old contents unnecessary.
+  bool full_clear = msaa_candidate && REXCVAR_GET(ds2_native_msaa_skip_clear_import) &&
+                    prim_type == xenos::PrimitiveType::kRectangleList;
+  if (full_clear && depth_rt) {
+    const auto srm_clear = regs.Get<reg::RB_STENCILREFMASK>();
+    full_clear = depth_control.z_enable && depth_control.z_write_enable &&
+                 depth_control.zfunc == xenos::CompareFunction::kAlways && depth_control.stencil_enable &&
+                 depth_control.stencilfunc == xenos::CompareFunction::kAlways &&
+                 depth_control.stencilzpass == xenos::StencilOp::kReplace && srm_clear.stencilwritemask == 0xFF;
+  }
+  for (uint32_t i = 0; i < color_count && full_clear; ++i) {
+    full_clear = ((write_mask >> (4 * i)) & 0xF) == 0xF && blend[i] == 0x00010001u;
+  }
   if (msaa_candidate) {
     if (color_count) {
-      const VkImage key_image = color_rts[0]->image;
-      if (prim_type != xenos::PrimitiveType::kRectangleList) ++msaa_heavy_this_frame_[key_image];
-      const uint32_t min_draws = uint32_t(std::max(REXCVAR_GET(ds2_native_msaa_min_draws), 0));
-      auto lit = msaa_heavy_last_frame_.find(key_image);
-      auto tit = msaa_heavy_this_frame_.find(key_image);
-      host_msaa = (lit != msaa_heavy_last_frame_.end() && lit->second >= min_draws) ||
-                  (tit != msaa_heavy_this_frame_.end() && tit->second >= min_draws);
+      // RC73: geometry always goes to the 4x copies. A clear rectangle does too while the 4x copy is current;
+      // otherwise it stays in sample space (DS2 also clears in 4x and then draws at 1x: a 4x copy for a lone
+      // clear would cost an export and save nothing).
+      host_msaa = true;
+      if (prim_type == xenos::PrimitiveType::kRectangleList && !msaa_force_clear_) {
+        auto sit = msaa_shadows_.find(color_rts[0]->image);
+        host_msaa = sit != msaa_shadows_.end() && sit->second.valid && sit->second.newer;
+        // A full clear outside an active 4x copy: drawn in sample space, then replayed into the 4x copies (they
+        // then match the sample-space image without an import, and need no export until geometry is drawn).
+        if (!host_msaa && full_clear) msaa_replay_clear_ = true;
+      }
     } else if (depth_rt) {
       auto sit = msaa_shadows_.find(depth_rt->image);
       host_msaa = sit != msaa_shadows_.end() && sit->second.valid;
@@ -3639,44 +3670,36 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
   if (host_msaa) {
-    // A full clear draw (rectangle, depth always written, stencil fully replaced, all color channels written
-    // without blending) makes importing the old contents unnecessary.
-    bool full_clear = REXCVAR_GET(ds2_native_msaa_skip_clear_import) &&
-                      prim_type == xenos::PrimitiveType::kRectangleList;
-    if (full_clear && depth_rt) {
-      const auto srm_clear = regs.Get<reg::RB_STENCILREFMASK>();
-      full_clear = depth_control.z_enable && depth_control.z_write_enable &&
-                   depth_control.zfunc == xenos::CompareFunction::kAlways && depth_control.stencil_enable &&
-                   depth_control.stencilfunc == xenos::CompareFunction::kAlways &&
-                   depth_control.stencilzpass == xenos::StencilOp::kReplace && srm_clear.stencilwritemask == 0xFF;
-    }
-    for (uint32_t i = 0; i < color_count && full_clear; ++i) {
-      full_clear = ((write_mask >> (4 * i)) & 0xF) == 0xF && blend[i] == 0x00010001u;
-    }
     NativeImage* shadows[5] = {};
+    // Rows of the 4x copy an import has to fill: the drawn area (8-row aligned, all of it at least once).
+    const uint32_t import_rows = rex::align<uint32_t>(scissor_pixels.offset[1] + scissor_pixels.extent[1], 8);
     for (uint32_t i = 0; i < color_count && host_msaa; ++i) {
-      shadows[i] = GetMsaaShadow(*color_rts[i], !full_clear);
+      shadows[i] = GetMsaaShadow(*color_rts[i], !full_clear, import_rows);
       if (!shadows[i]) host_msaa = false;
     }
     if (host_msaa && depth_rt) {
-      shadows[4] = GetMsaaShadow(*depth_rt, !full_clear);
+      shadows[4] = GetMsaaShadow(*depth_rt, !full_clear, import_rows);
       if (!shadows[4]) host_msaa = false;
+    }
+    if (Tracing()) {
+      REXGPU_INFO("[native trace]   host 4x MSAA: {} (full clear {}, import rows {})", host_msaa ? "on" : "failed",
+                  full_clear, import_rows);
     }
     if (host_msaa) {
       rt_width = rt_height = UINT32_MAX;
       const uint32_t drawn_rows = scissor_pixels.offset[1] + scissor_pixels.extent[1];
       for (uint32_t i = 0; i < color_count; ++i) {
         MsaaShadow& csh = msaa_shadows_[color_rts[i]->image];
-        csh.newer = true;
-        csh.dirty_rows = std::max(csh.dirty_rows, drawn_rows);
+        csh.newer = !msaa_force_clear_;
+        if (!msaa_force_clear_) csh.dirty_rows = std::max(csh.dirty_rows, drawn_rows);
         color_rts[i] = shadows[i];
         rt_width = std::min(rt_width, shadows[i]->width);
         rt_height = std::min(rt_height, shadows[i]->height);
       }
       if (depth_rt) {
         MsaaShadow& dsh = msaa_shadows_[depth_rt->image];
-        dsh.newer = true;
-        dsh.dirty_rows = std::max(dsh.dirty_rows, drawn_rows);
+        dsh.newer = !msaa_force_clear_;
+        if (!msaa_force_clear_) dsh.dirty_rows = std::max(dsh.dirty_rows, drawn_rows);
         depth_rt = shadows[4];
         rt_width = std::min(rt_width, depth_rt->width);
         rt_height = std::min(rt_height, depth_rt->height);
@@ -3832,12 +3855,18 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                   size, binding.stride_words * 4);
       if (prim_type == xenos::PrimitiveType::kRectangleList) {
         const uint32_t* vtx = memory_->TranslatePhysical<const uint32_t*>(address);
-        float f[12] = {};
-        for (int i = 0; vtx && i < 12 && uint32_t(i * 4) < size; ++i) {
-          f[i] = xenos::GpuSwap(rex::memory::Reinterpret<float>(vtx[i]), vf.endian);
+        // RC73: the first 3 words of each of the 3 vertices (x y z), at the binding stride.
+        const uint32_t stride_words = std::max<uint32_t>(binding.stride_words, 3);
+        float f[9] = {};
+        for (uint32_t v = 0; vtx && v < 3; ++v) {
+          for (uint32_t c = 0; c < 3 && (v * stride_words + c) * 4 < size; ++c) {
+            f[v * 3 + c] = xenos::GpuSwap(rex::memory::Reinterpret<float>(vtx[v * stride_words + c]), vf.endian);
+          }
         }
-        REXGPU_INFO("[native trace]     rect vertices {} {} {} | {} {} {} | {} {} {} | {} {} {}", f[0], f[1], f[2], f[3],
-                    f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11]);
+        REXGPU_INFO("[native trace]     rect vertices ({} {} {}) ({} {} {}) ({} {} {}) surface pitch {} msaa {}",
+                    f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8],
+                    uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch),
+                    uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples));
       }
     }
     if (!size) {
@@ -4440,6 +4469,13 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   ++stats_.draws;
   ++draws_this_frame_;
   if (profiling_ && !slot().seg_draws.empty()) ++slot().seg_draws.back();
+  if (msaa_replay_clear_ && !msaa_force_clear_) {
+    msaa_replay_clear_ = false;
+    msaa_force_clear_ = true;
+    IssueDraw(prim_type, index_count, index_buffer_info, major_mode_explicit);
+    msaa_force_clear_ = false;
+  }
+  msaa_replay_clear_ = false;
   return true;
 }
 
