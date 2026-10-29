@@ -164,6 +164,8 @@ REXCVAR_DEFINE_INT32(ds2_native_halfres_divisor, 2, "GPU",
                      "RC84: resolution divisor of the reduced-resolution particles (2 = half, 4 = quarter)");
 REXCVAR_DEFINE_INT32(ds2_native_halfres_vpos_const, 215, "GPU",
                      "RC82: pixel shader float constant whose zw scale the pixel position (doubled for half resolution)");
+REXCVAR_DEFINE_BOOL(ds2_native_dynamic_textures, true, "GPU",
+                    "RC86: a texture whose content changed is checked every frame for 120 frames (videos)");
 REXCVAR_DEFINE_BOOL(ds2_native_fast_registers, true, "GPU",
                     "RC81: plain register writes only store the value (no register info lookup and side-effect switch)");
 REXCVAR_DEFINE_BOOL(ds2_native_texture_scratch, true, "GPU",
@@ -816,6 +818,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t content_hash = 0;
     uint64_t last_check_frame = 0;
     uint64_t last_use_frame = 0;
+    uint64_t dynamic_until = 0;  // RC86: content changed recently (videos): checked every frame until this frame
     uint64_t resolve_signature = 0;  // cube faces copied from resolve targets: their generations
     std::unordered_map<uint32_t, VkImageView> swizzle_views;
   };
@@ -861,6 +864,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t texture_sets_reused = 0, texture_sets_created = 0, texture_sets_kept = 0, texture_sets_dropped = 0;
     uint64_t constant_uploads_reused = 0, us_prelude = 0, us_translate = 0, us_pipeline_sync = 0, pipelines_sync = 0;
     uint64_t shader_restores_async = 0, draws_shader_pending = 0, halfres_draws = 0, halfres_composites = 0;
+    uint64_t dynamic_texture_updates = 0;
     uint64_t constant_sets_reused = 0, constant_sets_created = 0, resolve_image_barriers = 0;
     uint64_t native_vertex_draws = 0, legacy_vertex_draws = 0;
     uint64_t content_hits = 0, content_saved_bytes = 0;
@@ -3629,7 +3633,8 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
   const size_t guest_size = size_t(pitch_aligned) * height_aligned * fi.bytes_per_block;
   const uint8_t* guest = memory_->TranslatePhysical<const uint8_t*>(base);
   if (!guest) return white_view_;
-  const bool need_check = !t.image.image || frame_ - t.last_check_frame >= 30;
+  const bool need_check = !t.image.image || frame_ - t.last_check_frame >= 30 ||
+                          (frame_ < t.dynamic_until && frame_ != t.last_check_frame);
   if (!need_check) {
     return GetSwizzleView(t.swizzle_views, t.image, fetch.swizzle | (fi.host_swizzle << 12));
   }
@@ -3657,6 +3662,12 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
       textures_.erase(key);
       return white_view_;
     }
+  }
+  if (t.image.image && REXCVAR_GET(ds2_native_dynamic_textures)) {
+    // RC86: the game rewrote this texture (a video frame, a texture streamed in place): check it every frame for a
+    // while instead of every 30 frames (the intro video stuttered and showed old frames).
+    t.dynamic_until = frame_ + 120;
+    ++stats_.dynamic_texture_updates;
   }
   t.content_hash = content;
   // Untile / copy every level into the upload buffer, swapping the byte order.
@@ -3859,7 +3870,9 @@ VkImageView NativeCommandProcessor::GetCubeTextureView(const xenos::xe_gpu_textu
     }
   }
   const uint32_t swz = fetch.swizzle | (fi.host_swizzle << 12);
-  const bool need_check = !t.image.image || frame_ - t.last_check_frame >= 30 || resolve_signature != t.resolve_signature;
+  const bool need_check = !t.image.image || frame_ - t.last_check_frame >= 30 ||
+                          resolve_signature != t.resolve_signature ||
+                          (frame_ < t.dynamic_until && frame_ != t.last_check_frame);
   if (!need_check) return GetSwizzleView(t.swizzle_views, t.image, swz);
   ScopedUs texture_timer(stats_.us_textures);
   t.last_check_frame = frame_;
@@ -3877,6 +3890,12 @@ VkImageView NativeCommandProcessor::GetCubeTextureView(const xenos::xe_gpu_textu
       textures_.erase(key);
       return VK_NULL_HANDLE;
     }
+  }
+  if (t.image.image && REXCVAR_GET(ds2_native_dynamic_textures)) {
+    // RC86: the game rewrote this texture (a video frame, a texture streamed in place): check it every frame for a
+    // while instead of every 30 frames (the intro video stuttered and showed old frames).
+    t.dynamic_until = frame_ + 120;
+    ++stats_.dynamic_texture_updates;
   }
   t.content_hash = content;
   t.resolve_signature = resolve_signature;
@@ -6211,8 +6230,10 @@ void NativeCommandProcessor::LogStats() {
               " | shadow face clears/frame {:.1f}",
               stats_.msaa_draws / n, stats_.msaa_imports / n, stats_.msaa_imports_skipped / n,
               stats_.msaa_exports / n, stats_.face_clears / n);
-  REXGPU_INFO("[native] reduced-resolution particle draws/frame: {:.2f} (1/{} resolution), composites/frame {:.2f}",
-              stats_.halfres_draws / n, halfres_divisor_, stats_.halfres_composites / n);
+  REXGPU_INFO("[native] reduced-resolution particle draws/frame: {:.2f} (1/{} resolution), composites/frame {:.2f} | "
+              "textures rewritten by the game/frame {:.2f}",
+              stats_.halfres_draws / n, halfres_divisor_, stats_.halfres_composites / n,
+              stats_.dynamic_texture_updates / n);
   REXGPU_INFO("[native] texture fetches/frame: {:.1f} 1D, {:.1f} cube ({:.2f} faces copied from resolves), "
               "{:.1f} white (3D/unsupported cube/other dimension), {:.1f} depth from 8888 ({:.2f} decodes), "
               "{:.2f} float24 depth resolves",
