@@ -154,6 +154,8 @@ REXCVAR_DEFINE_INT32(ds2_native_msaa_min_draws, 8, "GPU",
 REXCVAR_DEFINE_BOOL(ds2_native_shadow_face_clear, true, "GPU",
                     "RC74: clear the whole viewport of a shadow face drawn after a depth-only clear rectangle");
 REXCVAR_DECLARE(std::string, ds2_shader_library);
+REXCVAR_DEFINE_BOOL(ds2_native_fast_registers, true, "GPU",
+                    "RC81: plain register writes only store the value (no register info lookup and side-effect switch)");
 REXCVAR_DEFINE_BOOL(ds2_native_texture_scratch, true, "GPU",
                     "RC80: build texture rows in cached memory, then write them once to the uncached upload buffer");
 REXCVAR_DEFINE_INT32(ds2_native_gpu_spike_ms, 60, "GPU",
@@ -731,6 +733,32 @@ class NativeCommandProcessor final : public CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count, IndexBufferInfo* index_buffer_info,
                  bool major_mode_explicit) override;
   bool IssueCopy() override;
+  // RC81: plain register writes (all but scratch, coherency and gamma ramp registers) only store the value; the
+  // base class looked up register info and walked a switch for every one (~15 % of the command thread).
+  static bool IsSpecialRegister(uint32_t index) {
+    return (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) ||
+           index == XE_GPU_REG_COHER_STATUS_HOST || index == XE_GPU_REG_DC_LUT_RW_INDEX ||
+           index == XE_GPU_REG_DC_LUT_SEQ_COLOR || index == XE_GPU_REG_DC_LUT_PWL_DATA ||
+           index == XE_GPU_REG_DC_LUT_30_COLOR;
+  }
+  void WriteRegister(uint32_t index, uint32_t value) override {
+    if (fast_registers_ && index < RegisterFile::kRegisterCount && !IsSpecialRegister(index)) {
+      const_cast<volatile uint32_t&>(register_file_->values[index]) = value;
+      return;
+    }
+    CommandProcessor::WriteRegister(index, value);
+  }
+  void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override {
+    // Entirely above the gamma ramp registers (all constants) or below the scratch registers: no side effects.
+    if (fast_registers_ && uint64_t(start_index) + num_registers <= RegisterFile::kRegisterCount &&
+        (start_index > XE_GPU_REG_DC_LUT_30_COLOR || uint64_t(start_index) + num_registers <= XE_GPU_REG_SCRATCH_REG0)) {
+      volatile uint32_t* dst = register_file_->values + start_index;
+      for (uint32_t i = 0; i < num_registers; ++i) dst[i] = memory::load_and_swap<uint32_t>(base + i);
+      return;
+    }
+    CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);
+  }
+  bool fast_registers_ = true;
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet, uint32_t count) override;
 
  private:
@@ -1141,6 +1169,7 @@ bool NativeCommandProcessor::SetupContext() {
     return false;
   }
   vulkan_device_ = provider->vulkan_device();
+  fast_registers_ = REXCVAR_GET(ds2_native_fast_registers);
   const auto& props = vulkan_device_->properties();
   const VkDevice dev = vulkan_device_->device();
   const auto& ifn = vulkan_device_->vulkan_instance()->functions();
@@ -4633,8 +4662,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     ++stats_.draws_failed;
     return true;
   }
-  std::vector<VkWriteDescriptorSet> local_writes;
-  auto& writes = REXCVAR_GET(ds2_native_cpu_cache) ? descriptor_writes_ : local_writes;
+  auto& writes = descriptor_writes_;  // RC81: no allocation per draw
   writes.clear();
   writes.reserve(SpirvShaderTranslator::kConstantBufferCount + image_infos.size());
   if (write_constants) {
@@ -4895,7 +4923,24 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   if (sample_shader && pipeline != profile_shader_pipeline_) {
     if (profile_shader_phase_groups_[shader_phase] < phase_limits[shader_phase]) {
-      Mark(fmt::format("shader VS {:016X} PS {:016X}", key.vs_hash, key.ps_hash));
+      if (spike_frames_ > 0) {
+        // RC81: in a spike window the group name also says what the draw is (size, blending, textures).
+        std::string tex;
+        for (const auto& t : ps_textures) {
+          const auto f = regs.GetTextureFetch(t.fetch_constant);
+          tex += fmt::format(" t{}:f{} {}x{} mip{}-{} mag{} min{} an{}", t.fetch_constant, uint32_t(f.format),
+                             f.size_2d.width + 1, f.size_2d.height + 1, uint32_t(f.mip_min_level),
+                             uint32_t(f.mip_max_level), uint32_t(f.mag_filter), uint32_t(f.min_filter),
+                             uint32_t(f.aniso_filter));
+        }
+        Mark(fmt::format("shader VS {:016X} PS {:016X} | prim {} n {} vp {}x{} blend {:08X} z {}{}{} early {} |{}",
+                         key.vs_hash, key.ps_hash, uint32_t(prim_type), index_count, viewport.xy_extent[0],
+                         viewport.xy_extent[1], key.blend[0], uint32_t(depth_control.z_enable),
+                         uint32_t(depth_control.z_write_enable), uint32_t(depth_control.zfunc),
+                         ps ? uint32_t(ps_mod.pixel.depth_stencil_mode) : 0u, tex));
+      } else {
+        Mark(fmt::format("shader VS {:016X} PS {:016X}", key.vs_hash, key.ps_hash));
+      }
       profile_shader_pipeline_ = pipeline;
       profile_shader_active_ = true;
       ++profile_shader_groups_;
