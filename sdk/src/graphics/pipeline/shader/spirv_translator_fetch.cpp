@@ -1473,14 +1473,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         // k2D.
         // 3D vectors for k3DOrStacked, kCube.
         spv::Id gradients_h = spv::NoResult, gradients_v = spv::NoResult;
-        // RC69: 2D and cube fetches with shader-computed gradients use the hardware implicit LOD
-        // with the LOD as a bias: the same quad derivatives as the coarse gradients scaled by
-        // exp2(lod), but a plain sample on NVIDIA instead of the much slower sample with gradients.
-        const bool use_implicit_lod =
-            use_computed_lod && !instr.attributes.use_register_gradients &&
-            (instr.dimension == xenos::FetchOpDimension::k2D ||
-             instr.dimension == xenos::FetchOpDimension::kCube);
-        if (use_computed_lod && !use_implicit_lod) {
+        if (use_computed_lod) {
           // TODO(Triang3l): Gradient exponent adjustment is currently not done
           // in getCompTexLOD, so not doing it here too for now. Apply the
           // gradient exponent biases from the word 4 of the fetch constant in
@@ -1641,14 +1634,10 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
 
         // Sample the texture.
         spv::ImageOperandsMask image_operands_mask =
-            use_implicit_lod ? spv::ImageOperandsMaskNone
-                             : (use_computed_lod ? spv::ImageOperandsGradMask
-                                                 : spv::ImageOperandsLodMask);
+            use_computed_lod ? spv::ImageOperandsGradMask : spv::ImageOperandsLodMask;
         spv::Id sample_result_unsigned, sample_result_signed;
         if (!use_computed_lod) {
           texture_parameters.lod = lod;
-        } else if (use_implicit_lod) {
-          texture_parameters.bias = lod;
         }
         if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {
           // 3D (3 coordinate components, 3 gradient components, single fetch)
@@ -1867,7 +1856,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           sample_result_signed =
               if_data_is_3d.createMergePhi(sample_result_signed_3d, sample_result_signed_stacked);
         } else {
-          if (use_computed_lod && !use_implicit_lod) {
+          if (use_computed_lod) {
             texture_parameters.gradX = gradients_h;
             texture_parameters.gradY = gradients_v;
           }

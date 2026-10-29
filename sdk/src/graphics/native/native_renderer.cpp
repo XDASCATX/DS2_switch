@@ -143,6 +143,10 @@ REXCVAR_DEFINE_INT32(ds2_native_hitch_ms, 100, "GPU",
                      "DS2 native renderer (v55): log what a frame spent its time on when it takes longer than this "
                      "(0 = never)")
     .range(0, 100000);
+REXCVAR_DEFINE_BOOL(ds2_native_resolve_clip_to_dest, true, "GPU",
+                    "RC70: clip a 1x resolve rectangle to the destination texture size (no logical-size copies)");
+REXCVAR_DEFINE_BOOL(ds2_native_capture_resolves, true, "GPU",
+                    "RC70: during an L3+R3 capture also write every color resolve at its point in the frame (snap_*)");
 REXCVAR_DEFINE_BOOL(ds2_native_capture_combo, true, "GPU",
                     "DS2 native renderer (v55, Switch): holding L3 + R3 (both sticks pressed) for ~1 s traces the "
                     "next in-game frame into the log and writes its render targets as images under "
@@ -826,6 +830,7 @@ class NativeCommandProcessor final : public CommandProcessor {
   } draw_state_;
   void InvalidateDrawState() { draw_state_.valid = false; }
   void DumpImages();
+  void DumpImage(const std::string& name, NativeImage& image, bool alpha);
   void EvictTextures();
   // GPU profile: a timestamp that ends the current segment and starts one labelled `label`.
   void Mark(const std::string& label);
@@ -4136,6 +4141,7 @@ bool NativeCommandProcessor::IssueCopy() {
   x1 = std::min<int32_t>(x1, int32_t(src->width));
   y1 = std::min<int32_t>(y1, int32_t(src->height));
   if (x1 <= x0 || y1 <= y0) return true;
+  int32_t clear_x1 = x1, clear_y1 = y1;
   EndRenderPass();
 
   // Copy into the native texture of the destination address.
@@ -4145,6 +4151,16 @@ bool NativeCommandProcessor::IssueCopy() {
   if (dest_base && info.rb_copy_control.copy_command != xenos::CopyCommand::kNull) {
     // The resolved texture keeps the sample resolution of the source (sampled with normalized coordinates); a
     // resolve writes source pixel (x, y) to texel (x, y) of the destination.
+    // RC70: a resolve rectangle is aligned to 8-pixel EDRAM tiles (320x184 for a 320x180 texture). Clipping the
+    // copy to the destination size keeps the image at the texture size, so sampling it needs no extra
+    // "logical size" copy (2 more copies and 4 barriers for every such step of the post-processing chains).
+    const bool clip_to_dest = REXCVAR_GET(ds2_native_resolve_clip_to_dest) && sx == 1 && sy == 1 &&
+                              dest_pitch.copy_dest_pitch && dest_pitch.copy_dest_height &&
+                              x0 < int32_t(dest_pitch.copy_dest_pitch) && y0 < int32_t(dest_pitch.copy_dest_height);
+    if (clip_to_dest) {
+      x1 = std::min<int32_t>(x1, int32_t(dest_pitch.copy_dest_pitch));
+      y1 = std::min<int32_t>(y1, int32_t(dest_pitch.copy_dest_height));
+    }
     const uint32_t dw = std::max<uint32_t>(dest_pitch.copy_dest_pitch * uint32_t(sx), uint32_t(x1));
     const uint32_t dh = std::max<uint32_t>(dest_pitch.copy_dest_height * uint32_t(sy), uint32_t(y1));
     // Depth resolved into a color texture (DS2 reads its depth buffers as k_8_8_8_8 and rebuilds depth in the
@@ -4276,11 +4292,16 @@ bool NativeCommandProcessor::IssueCopy() {
     cmd_copy_image_(slot().cmd, copy_src->image, VK_IMAGE_LAYOUT_GENERAL, r.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     ResolveBarrier(*copy_src, r.image, false);
     ++r.generation;
+    // RC70: in a capture, every color resolve is also written as it is at this point of the frame (with alpha),
+    // so chains that reuse one address (blur, depth of field, sun shafts) can be followed step by step.
+    if (Tracing() && combo_dumps_ && !is_depth && REXCVAR_GET(ds2_native_capture_resolves)) {
+      DumpImage(fmt::format("snap_{:04}_{:08X}_g{}", draws_this_frame_, dest_base, r.guest_format), r.image, true);
+    }
     }
   }
 
-  // Clears.
-  const VkRect2D rect = {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
+  // Clears (of the whole resolve rectangle, also when the copy was clipped to the destination).
+  const VkRect2D rect = {{x0, y0}, {uint32_t(clear_x1 - x0), uint32_t(clear_y1 - y0)}};
   if (info.IsClearingDepth()) {
     const auto di = regs.Get<reg::RB_DEPTH_INFO>();
     NativeImage* d = GetRenderTarget(di.depth_base, sample_pitch, uint32_t(di.depth_format), true, uint32_t(y1));
@@ -4571,7 +4592,6 @@ void NativeCommandProcessor::EvictTextures() {
 }
 
 void NativeCommandProcessor::DumpImages() {
-  const VkDevice dev = vulkan_device_->device();
   std::vector<std::pair<std::string, NativeImage*>> list;
   for (auto& [k, img] : render_targets_) {
     list.emplace_back(fmt::format("rt_{:04}_{}_f{}_{}x{}", uint32_t(k & 0xFFF), img.depth ? "d" : "c",
@@ -4582,8 +4602,17 @@ void NativeCommandProcessor::DumpImages() {
     list.emplace_back(fmt::format("res_{:08X}_g{}_{}x{}", a, r.guest_format, r.image.width, r.image.height),
                       &r.image);
   }
-  for (auto& [name, img] : list) {
-    if (!img->image) continue;
+  for (auto& [name, img] : list) DumpImage(name, *img, false);
+  REXGPU_INFO("[native] dumped {} images to {}", list.size(), DumpDir());
+}
+
+// Writes one image as <name>.ppm (RGB clamped to [0, 1]); with alpha also <name>.a.pgm for formats with alpha.
+// Submits the command buffer and waits for the GPU (development captures only).
+void NativeCommandProcessor::DumpImage(const std::string& name, NativeImage& image, bool alpha) {
+  NativeImage* img = &image;
+  const VkDevice dev = vulkan_device_->device();
+  {
+    if (!img->image) return;
     const VkDeviceSize bytes = VkDeviceSize(img->width) * img->height * 8;
     VkBuffer buf;
     VkDeviceMemory mem;
@@ -4592,7 +4621,7 @@ void NativeCommandProcessor::DumpImages() {
     if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(vulkan_device_, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                                            ui::vulkan::util::MemoryPurpose::kReadback, buf, mem,
                                                            &type, &msize)) {
-      continue;
+      return;
     }
     if (!frame_open_) BeginFrame();
     VkBufferImageCopy r = {};
@@ -4608,6 +4637,11 @@ void NativeCommandProcessor::DumpImages() {
     void* map = nullptr;
     dfn().vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, &map);
     std::vector<uint8_t> rgb(size_t(img->width) * img->height * 3);
+    std::vector<uint8_t> alpha_bytes;
+    const bool has_alpha = alpha && (img->format == VK_FORMAT_R8G8B8A8_UNORM ||
+                                     img->format == VK_FORMAT_R16G16B16A16_SFLOAT ||
+                                     img->format == VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+    if (has_alpha) alpha_bytes.resize(size_t(img->width) * img->height);
     const uint8_t* p = static_cast<const uint8_t*>(map);
     auto half = [](uint16_t h) {
       const uint32_t e = (h >> 10) & 31, m = h & 1023;
@@ -4619,17 +4653,20 @@ void NativeCommandProcessor::DumpImages() {
       switch (img->format) {
         case VK_FORMAT_R8G8B8A8_UNORM:
           for (int j = 0; j < 3; ++j) c[j] = p[i * 4 + j] / 255.0f;
+          if (has_alpha) alpha_bytes[i] = p[i * 4 + 3];
           break;
         case VK_FORMAT_A2B10G10R10_UNORM_PACK32: {
           uint32_t v;
           std::memcpy(&v, p + i * 4, 4);
           for (int j = 0; j < 3; ++j) c[j] = float((v >> (10 * j)) & 1023) / 1023.0f;
+          if (has_alpha) alpha_bytes[i] = uint8_t((v >> 30) * 85);
           break;
         }
         case VK_FORMAT_R16G16B16A16_SFLOAT: {
           uint16_t v[4];
           std::memcpy(v, p + i * 8, 8);
           for (int j = 0; j < 3; ++j) c[j] = half(v[j]);
+          if (has_alpha) alpha_bytes[i] = uint8_t(std::clamp(half(v[3]), 0.0f, 1.0f) * 255.0f + 0.5f);
           break;
         }
         case VK_FORMAT_R16G16_SFLOAT: {
@@ -4698,8 +4735,16 @@ void NativeCommandProcessor::DumpImages() {
       }
       std::fclose(f);
     }
+    if (has_alpha) {
+      if (FILE* f = std::fopen((DumpDir() + "/" + name + ".a.pgm").c_str(), "wb")) {
+        std::fprintf(f, "P5\n%u %u\n255\n", ow, oh);
+        for (uint32_t y = 0; y < oh; ++y) {
+          for (uint32_t x = 0; x < ow; ++x) std::fputc(alpha_bytes[size_t(y * step) * img->width + x * step], f);
+        }
+        std::fclose(f);
+      }
+    }
   }
-  REXGPU_INFO("[native] dumped {} images to {}", list.size(), DumpDir());
 }
 
 void NativeCommandProcessor::LogStats() {
