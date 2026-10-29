@@ -152,7 +152,15 @@ REXCVAR_DEFINE_INT32(ds2_native_msaa_min_draws, 8, "GPU",
                      "draws in this or the previous frame (DS2 clears in 4x and draws at 1x elsewhere)");
 REXCVAR_DEFINE_BOOL(ds2_native_shadow_face_clear, true, "GPU",
                     "RC74: clear the whole viewport of a shadow face drawn after a depth-only clear rectangle");
-REXCVAR_DEFINE_BOOL(ds2_native_msaa_clear_replay, false, "GPU",
+REXCVAR_DEFINE_BOOL(ds2_native_depth_bias_absolute, true, "GPU",
+                    "RC76: absolute constant depth bias as on the Xenos (VK_EXT_depth_bias_control unorm24 units), "
+                    "polygon offset of the drawn face; false = RC75 (relative to the depth exponent, front only)");
+REXCVAR_DEFINE_BOOL(ds2_native_resolve_float24, true, "GPU",
+                    "RC76: D24FS8 depth resolves hold float24 depth (truncated) as on the console, not the float32 "
+                    "host depth (point-light shadow acne: striped squares on torch-lit walls)");
+REXCVAR_DEFINE_BOOL(ds2_native_float24_round, false, "GPU",
+                    "RC76: round float24 depth to nearest even in depth resolves (false = truncate, as the emulation)");
+REXCVAR_DEFINE_BOOL(ds2_native_msaa_clear_replay, true, "GPU",
                     "RC73: draw lone 4x clear rectangles in sample space and replay them into the 4x copies; false = "
                     "RC71 (4x clears go to the 4x copies)");
 REXCVAR_DEFINE_BOOL(ds2_native_bias_sample_scale, false, "GPU",
@@ -366,7 +374,11 @@ uint F24(float f) {
   } else {
     u += 0xC8000000u;
   }
-  u += 3u + ((u >> 3) & 1u);
+  // RC76: float24 = 2 truncates (toward zero, as the emulation's default depth_float24_round = false), 1 rounds to
+  // nearest even. Rounding up puts half of the stored shadow depths above the surface's own depth, so a shadow
+  // compare without a slope bias (DS2 point-light cube faces, sge in PS E94A8C3A) shadows the lit surface itself:
+  // stripes in a square on torch-lit walls, flickering as the light moves.
+  if (pc.float24 == 1) u += 3u + ((u >> 3) & 1u);
   return (u >> 3) & 0xFFFFFFu;
 }
 )";
@@ -769,7 +781,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t copies = 0, clears = 0, swaps = 0, swaps_presented = 0;
     uint64_t texture_uploads = 0, texture_unsupported = 0, texture_from_resolve = 0;
     uint64_t texture_1d = 0, texture_white_dimension = 0, texture_cube = 0, cube_faces_from_resolves = 0;
-    uint64_t depth_decoded_fetches = 0, depth_decodes = 0;
+    uint64_t depth_decoded_fetches = 0, depth_decodes = 0, depth_float24_quantized = 0;
     uint64_t barriers_issued = 0, barriers_elided = 0;
     uint64_t state_calls = 0, state_calls_skipped = 0;
     uint64_t face_clears = 0;
@@ -832,11 +844,12 @@ class NativeCommandProcessor final : public CommandProcessor {
   bool msaa_force_clear_ = false;   // RC73: replaying a 4x clear rectangle into the 4x copies
   bool msaa_replay_clear_ = false;  // RC73: the current clear rectangle is to be replayed into the 4x copies
   std::unordered_map<uint64_t, VkPipeline> msaa_pipelines_;
-  VkShaderModule msaa_fs_[6] = {};
+  VkShaderModule msaa_fs_[7] = {};
   NativeImage* GetMsaaShadow(NativeImage& rt, bool import, uint32_t import_rows = 0);
   void ExportMsaaShadow(NativeImage& rt, bool invalidate);
   void ExportAllMsaaShadows();
   bool MsaaTransfer(NativeImage& rt, NativeImage& ms, bool to_ms, uint32_t rows = 0);
+  bool QuantizeDepthFloat24(NativeImage& src, NativeImage& dst, int32_t src_x, int32_t src_y, const VkRect2D& dst_rect);
   VkPipeline GetMsaaPipeline(uint32_t mode, VkFormat format, bool ms, VkRenderPass pass);
   const PipelineLayoutEntry* GetPipelineLayout(uint32_t tv, uint32_t sv, uint32_t tp, uint32_t sp);
   VkDescriptorSetLayout GetTextureSetLayout(bool vertex, uint32_t textures, uint32_t samplers);
@@ -906,6 +919,7 @@ class NativeCommandProcessor final : public CommandProcessor {
   const VulkanDevice* vulkan_device_ = nullptr;
   PFN_vkCmdBlitImage cmd_blit_image_ = nullptr;
   PFN_vkCmdCopyImage cmd_copy_image_ = nullptr;
+  PFN_vkCmdSetDepthBias2EXT cmd_set_depth_bias2_ = nullptr;  // RC76: absolute (unorm24) constant depth bias
   std::unique_ptr<SpirvShaderTranslator> translator_;
   string::StringBuffer ucode_disasm_buffer_;
   std::unordered_map<uint64_t, std::unique_ptr<VulkanShader>> shaders_;
@@ -1062,6 +1076,13 @@ bool NativeCommandProcessor::SetupContext() {
     REXGPU_ERROR("[native] vkCmdBlitImage / vkCmdCopyImage not available");
     return false;
   }
+  if (vulkan_device_->extensions().ext_EXT_depth_bias_control && props.depthBiasControl &&
+      props.leastRepresentableValueForceUnormRepresentation) {
+    cmd_set_depth_bias2_ =
+        reinterpret_cast<PFN_vkCmdSetDepthBias2EXT>(ifn.vkGetDeviceProcAddr(dev, "vkCmdSetDepthBias2EXT"));
+  }
+  REXGPU_INFO("[native] absolute depth bias (VK_EXT_depth_bias_control, unorm24 units): {}",
+              cmd_set_depth_bias2_ && REXCVAR_GET(ds2_native_depth_bias_absolute) ? "on" : "off");
 
   translator_ = std::make_unique<SpirvShaderTranslator>(SpirvShaderTranslator::Features(vulkan_device_), false,
                                                         false, false, 1, 1);
@@ -2133,7 +2154,7 @@ bool NativeCommandProcessor::Convert(ConvertMode mode, NativeImage& src, NativeI
   dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, convert_layout_[layout_index], 0, 1, &set, 0,
                                 nullptr);
   const int32_t pc[4] = {src_x - dst_rect.offset.x, src_y - dst_rect.offset.y,
-                         src_float24 ? 1 : 0, resolve_exp_bias};
+                         src_float24 ? (REXCVAR_GET(ds2_native_float24_round) ? 1 : 2) : 0, resolve_exp_bias};
   dfn().vkCmdPushConstants(cmd, convert_layout_[layout_index], VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), pc);
   VkViewport vp = {float(dst_rect.offset.x), float(dst_rect.offset.y), float(dst_rect.extent.width),
                    float(dst_rect.extent.height), 0.0f, 1.0f};
@@ -2159,11 +2180,12 @@ enum MsaaTransferMode : uint32_t {
   kMsaaDepthFromMs,
   kMsaaStencilToMs,
   kMsaaStencilFromMs,
+  kMsaaDepthFloat24,  // RC76: 1x depth -> 1x depth rounded toward zero to float24 (depth resolves of D24FS8)
   kMsaaTransferModeCount,
 };
 
 constexpr const char* kMsaaHeader = R"(#version 450
-layout(push_constant) uniform P { int bit; } pc;
+layout(push_constant) uniform P { int bit; int dx; int dy; } pc;
 ivec2 SampleSpaceCoord() { return ivec2(gl_FragCoord.xy) * 2 + ivec2(gl_SampleID & 1, gl_SampleID >> 1); }
 int SampleOfPixel(ivec2 q) { return (q.x & 1) | ((q.y & 1) << 1); }
 )";
@@ -2190,6 +2212,39 @@ void main() { if (((texelFetch(t, SampleSpaceCoord(), 0).r >> uint(pc.bit)) & 1u
 void main() {
   ivec2 q = ivec2(gl_FragCoord.xy);
   if (((texelFetch(t, q >> 1, SampleOfPixel(q)).r >> uint(pc.bit)) & 1u) == 0u) discard;
+}
+)",
+    R"(layout(set = 0, binding = 0) uniform sampler2D t;
+// The guest stores D24FS8 depth as 20e4 float24; the host depth buffer is float32. The value a guest shader samples
+// is the float32 depth truncated to float24 (as the emulation's resolves, depth_float24_round = false).
+void main() {
+  float z = texelFetch(t, ivec2(gl_FragCoord.xy) + ivec2(pc.dx, pc.dy), 0).r;
+  uint f = 0u;
+  if (z > 0.0) {
+    uint u = floatBitsToUint(z);
+    if (u >= 0x3FFFFFF8u) {
+      f = 0xFFFFFFu;
+    } else {
+      if (u < 0x38800000u) {
+        uint sh = min(113u - (u >> 23), 24u);
+        u = (0x800000u | (u & 0x7FFFFFu)) >> sh;
+      } else {
+        u += 0xC8000000u;
+      }
+      f = (u >> 3) & 0xFFFFFFu;
+    }
+  }
+  float r = 0.0;
+  if (f != 0u) {
+    uint m = f & 0xFFFFFu, e = f >> 20;
+    if (e == 0u) {
+      uint lz = 31u - uint(findMSB(m)) - 11u;
+      e = uint(1 - int(lz));
+      m = (m << lz) & 0xFFFFFu;
+    }
+    r = uintBitsToFloat(((e + 112u) << 23) | (m << 3));
+  }
+  gl_FragDepth = r;
 }
 )",
 };
@@ -2398,6 +2453,76 @@ bool NativeCommandProcessor::MsaaTransfer(NativeImage& rt, NativeImage& ms, bool
   } else {
     ++stats_.msaa_exports;
   }
+  return true;
+}
+
+// RC76: the depth of a D24FS8 resolve as the guest texture holds it (float24, rounded toward zero), written over the
+// copied depth of dst_rect. Point-light shadow cubes compare the receiver depth to it with sge and no bias: with the
+// exact float32 depth the lit wall shadows itself at random (striped squares in torch light, flickering).
+bool NativeCommandProcessor::QuantizeDepthFloat24(NativeImage& src, NativeImage& dst, int32_t src_x, int32_t src_y,
+                                                  const VkRect2D& dst_rect) {
+  if (!src.depth || !dst.depth || !src.depth_view || !dst_rect.extent.width || !dst_rect.extent.height) return false;
+  const VkDevice dev = vulkan_device_->device();
+  VkRenderPass pass = GetRenderPass(nullptr, 0, dst.format, 1);
+  if (!pass) return false;
+  VkPipeline pipeline = GetMsaaPipeline(kMsaaDepthFloat24, dst.format, false, pass);
+  if (!pipeline) return false;
+  VkDescriptorSet set = VK_NULL_HANDLE;
+  VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  ai.descriptorPool = slot().descriptor_pool;
+  ai.descriptorSetCount = 1;
+  ai.pSetLayouts = &convert_set_layout_[0];
+  if (dfn().vkAllocateDescriptorSets(dev, &ai, &set) != VK_SUCCESS) return false;
+  VkDescriptorImageInfo ii = {convert_sampler_, src.depth_view, VK_IMAGE_LAYOUT_GENERAL};
+  VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  w.dstSet = set;
+  w.dstBinding = 0;
+  w.descriptorCount = 1;
+  w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  w.pImageInfo = &ii;
+  dfn().vkUpdateDescriptorSets(dev, 1, &w, 0, nullptr);
+  uint64_t fb_key = (reinterpret_cast<uint64_t>(pass) * 1000003u + reinterpret_cast<uint64_t>(dst.view)) * 31 +
+                    dst.width * 4099 + dst.height;
+  VkFramebuffer fb;
+  auto fit = framebuffers_.find(fb_key);
+  if (fit != framebuffers_.end()) {
+    fb = fit->second;
+  } else {
+    VkFramebufferCreateInfo fci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fci.renderPass = pass;
+    fci.attachmentCount = 1;
+    fci.pAttachments = &dst.view;
+    fci.width = dst.width;
+    fci.height = dst.height;
+    fci.layers = 1;
+    if (dfn().vkCreateFramebuffer(dev, &fci, nullptr, &fb) != VK_SUCCESS) return false;
+    framebuffers_.emplace(fb_key, fb);
+    fb_by_view_.emplace(dst.view, fb_key);
+  }
+  EndRenderPass();
+  Barrier();
+  if (profiling_) Mark(fmt::format("float24 depth {}x{}", dst_rect.extent.width, dst_rect.extent.height));
+  VkCommandBuffer cmd = slot().cmd;
+  VkRenderPassBeginInfo bi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+  bi.renderPass = pass;
+  bi.framebuffer = fb;
+  bi.renderArea = dst_rect;
+  work_since_barrier_ = true;
+  InvalidateDrawState();
+  dfn().vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
+  const VkViewport vp = {0.0f, 0.0f, float(dst.width), float(dst.height), 0.0f, 1.0f};
+  dfn().vkCmdSetViewport(cmd, 0, 1, &vp);
+  dfn().vkCmdSetScissor(cmd, 0, 1, &dst_rect);
+  const int32_t pc[4] = {0, src_x - dst_rect.offset.x, src_y - dst_rect.offset.y, 0};
+  dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+  dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, convert_layout_[0], 0, 1, &set, 0, nullptr);
+  dfn().vkCmdPushConstants(cmd, convert_layout_[0], VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), pc);
+  dfn().vkCmdDraw(cmd, 3, 1, 0, 0);
+  dfn().vkCmdEndRenderPass(cmd);
+  work_since_barrier_ = true;
+  Barrier();
+  InvalidateDrawState();
+  ++stats_.depth_float24_quantized;
   return true;
 }
 
@@ -4466,7 +4591,19 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     ++stats_.state_calls_skipped;
   }
   float bias_const = 0.0f, bias_slope = 0.0f;
-  if (polygonal && (sc_mode.poly_offset_front_enable || sc_mode.poly_offset_back_enable)) {
+  const bool bias_absolute = cmd_set_depth_bias2_ && REXCVAR_GET(ds2_native_depth_bias_absolute);
+  if (bias_absolute) {
+    // RC76: the face that is drawn (front, or back when front faces are culled), and the line/point offset, as the
+    // emulation selects it. The Xenos constant offset is absolute (Direct3D 9). The host float32 depth would take
+    // a constant factor relative to the exponent of the primitive's depth, which for reversed depth near 0 (DS2
+    // point-light cube faces) makes the bias up to hundreds of times smaller: shadow acne, striped squares on
+    // torch-lit walls. With the unorm24 representation, factor * 2^-24 is the guest offset itself.
+    float scale = 0.0f, offset = 0.0f;
+    draw_util::GetPreferredFacePolygonOffset(regs, polygonal, scale, offset);
+    bias_slope = scale * xenos::kPolygonOffsetScaleSubpixelUnit;
+    if (REXCVAR_GET(ds2_native_bias_sample_scale)) bias_slope *= float(std::max(sx, sy));
+    bias_const = offset * float(1 << 24);
+  } else if (polygonal && (sc_mode.poly_offset_front_enable || sc_mode.poly_offset_back_enable)) {
     bias_slope = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE) * xenos::kPolygonOffsetScaleSubpixelUnit;
     // RC72: a 4x target drawn in sample space has twice the pixels per axis, so depth changes half as much per
     // pixel and the slope-scaled bias would be halved (shadow acne: stripes in the torch light).
@@ -4475,7 +4612,18 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   const float bias[2] = {bias_const, bias_slope};
   if (!filter || std::memcmp(ds.bias, bias, sizeof(bias))) {
-    dfn().vkCmdSetDepthBias(cmd, bias_const, 0.0f, bias_slope);
+    if (bias_absolute) {
+      VkDepthBiasRepresentationInfoEXT rep = {VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT};
+      rep.depthBiasRepresentation = VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT;
+      rep.depthBiasExact = VK_FALSE;
+      VkDepthBiasInfoEXT bi = {VK_STRUCTURE_TYPE_DEPTH_BIAS_INFO_EXT, &rep};
+      bi.depthBiasConstantFactor = bias_const;
+      bi.depthBiasClamp = 0.0f;
+      bi.depthBiasSlopeFactor = bias_slope;
+      cmd_set_depth_bias2_(cmd, &bi);
+    } else {
+      dfn().vkCmdSetDepthBias(cmd, bias_const, 0.0f, bias_slope);
+    }
     std::memcpy(ds.bias, bias, sizeof(bias));
     ++stats_.state_calls;
   } else {
@@ -4788,7 +4936,8 @@ bool NativeCommandProcessor::IssueCopy() {
     }
     if (!r.image.image) {
       VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | (depth_as_color ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0);
+                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | (depth_as_color ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0) |
+                                (src->depth && !depth_as_color ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0);
       if (!CreateImage(r.image, resolved_format, dw, dh, src->depth && !depth_as_color, usage)) {
         resolved_.erase(dest_base);
         return true;
@@ -4852,6 +5001,12 @@ bool NativeCommandProcessor::IssueCopy() {
     work_since_barrier_ = true;
     cmd_copy_image_(slot().cmd, copy_src->image, VK_IMAGE_LAYOUT_GENERAL, r.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     ResolveBarrier(*copy_src, r.image, false);
+    if (is_depth && REXCVAR_GET(ds2_native_resolve_float24) &&
+        xenos::DepthRenderTargetFormat(regs.Get<reg::RB_DEPTH_INFO>().depth_format) ==
+            xenos::DepthRenderTargetFormat::kD24FS8) {
+      QuantizeDepthFloat24(*copy_src, r.image, x0, y0,
+                           {{dst_x0, dst_y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}});
+    }
     ++r.generation;
     // RC70: in a capture, every color resolve is also written as it is at this point of the frame (with alpha),
     // so chains that reuse one address (blur, depth of field, sun shafts) can be followed step by step.
@@ -5333,9 +5488,11 @@ void NativeCommandProcessor::LogStats() {
               stats_.msaa_draws / n, stats_.msaa_imports / n, stats_.msaa_imports_skipped / n,
               stats_.msaa_exports / n, stats_.face_clears / n);
   REXGPU_INFO("[native] texture fetches/frame: {:.1f} 1D, {:.1f} cube ({:.2f} faces copied from resolves), "
-              "{:.1f} white (3D/unsupported cube/other dimension), {:.1f} depth from 8888 ({:.2f} decodes)",
+              "{:.1f} white (3D/unsupported cube/other dimension), {:.1f} depth from 8888 ({:.2f} decodes), "
+              "{:.2f} float24 depth resolves",
               stats_.texture_1d / n, stats_.texture_cube / n, stats_.cube_faces_from_resolves / n,
-              stats_.texture_white_dimension / n, stats_.depth_decoded_fetches / n, stats_.depth_decodes / n);
+              stats_.texture_white_dimension / n, stats_.depth_decoded_fetches / n, stats_.depth_decodes / n,
+              stats_.depth_float24_quantized / n);
   std::string prims;
   for (uint32_t i = 0; i < 32; ++i) {
     if (stats_.prim_counts[i]) prims += fmt::format(" {}:{:.0f}", i, stats_.prim_counts[i] / n);

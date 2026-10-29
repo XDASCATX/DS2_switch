@@ -187,6 +187,11 @@ class VulkanDevice {
     // VK_EXT_extended_dynamic_state3 (#456). Only what the NFSMW native renderer uses (dynamic blend
     // enable, blend equation and color write mask).
 
+    // VK_EXT_depth_bias_control (#284)
+
+    bool depthBiasControl = false;
+    bool leastRepresentableValueForceUnormRepresentation = false;
+
     bool extendedDynamicState3ColorBlendEnable = false;
     bool extendedDynamicState3ColorBlendEquation = false;
     bool extendedDynamicState3ColorWriteMask = false;
@@ -207,6 +212,7 @@ class VulkanDevice {
     bool ext_1_1_KHR_dedicated_allocation = false;      // #128
     bool ext_EXT_shader_stencil_export = false;         // #141
     bool ext_EXT_sample_locations = false;              // #144
+    bool ext_EXT_depth_bias_control = false;            // #284
     bool ext_1_1_KHR_get_memory_requirements2 = false;  // #147
     bool ext_1_2_KHR_image_format_list = false;         // #148
     // Has optional features not implied by this being true.

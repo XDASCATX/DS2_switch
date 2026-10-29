@@ -228,6 +228,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_shader_stencil_export)
     // #144. DS2 native renderer (RC71): host 4x MSAA with the Xenos ordered-grid sample positions.
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_sample_locations)
+    if (get_physical_device_properties2_supported) {
+      // #284. DS2 native renderer (RC76): Xenos polygon offset is absolute (Direct3D 9), emulated with the unorm24
+      // representation of the constant factor on the float32 host depth buffer.
+      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_depth_bias_control)
+    }
     // #148.
     XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_image_format_list, 1, 2)
     if (get_physical_device_properties2_supported) {
@@ -346,6 +351,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceRobustness2FeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT>
       features_EXT_robustness2;
+  VulkanFeatures<VkPhysicalDeviceDepthBiasControlFeaturesEXT,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT>
+      features_EXT_depth_bias_control;
   // Native renderer of NFSMW.
   VulkanFeatures<VkPhysicalDeviceExtendedDynamicState3FeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT>
@@ -393,6 +401,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_EXT_extended_dynamic_state3) {
       features_EXT_extended_dynamic_state3.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_EXT_depth_bias_control) {
+      features_EXT_depth_bias_control.Link(supported_features_2, device_create_info);
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -766,6 +777,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_EXT_robustness2, nullDescriptor)
     }
+  }
+
+  if (device->extensions_.ext_EXT_depth_bias_control) {
+    XE_UI_VULKAN_FEATURE_2(features_EXT_depth_bias_control, depthBiasControl)
+    XE_UI_VULKAN_FEATURE_2(features_EXT_depth_bias_control, leastRepresentableValueForceUnormRepresentation)
   }
 
   if (device->extensions_.ext_EXT_extended_dynamic_state3) {
