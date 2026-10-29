@@ -154,6 +154,11 @@ REXCVAR_DEFINE_INT32(ds2_native_msaa_min_draws, 8, "GPU",
 REXCVAR_DEFINE_BOOL(ds2_native_shadow_face_clear, true, "GPU",
                     "RC74: clear the whole viewport of a shadow face drawn after a depth-only clear rectangle");
 REXCVAR_DECLARE(std::string, ds2_shader_library);
+REXCVAR_DEFINE_BOOL(ds2_native_texture_scratch, true, "GPU",
+                    "RC80: build texture rows in cached memory, then write them once to the uncached upload buffer");
+REXCVAR_DEFINE_INT32(ds2_native_gpu_spike_ms, 60, "GPU",
+                    "RC80: after a frame that waited 40+ ms for the GPU, time every command buffer with shader groups "
+                    "and log those that took this many ms (0 = off)");
 REXCVAR_DEFINE_BOOL(ds2_native_async_shader_restore, true, "GPU",
                     "RC79: restore shaders from the pack on a worker; draws wait for them (skipped) instead of the frame");
 REXCVAR_DEFINE_BOOL(ds2_native_constant_reuse, true, "GPU",
@@ -612,9 +617,16 @@ bool GetTextureFormat(xenos::TextureFormat f, TextureFormatInfo& out) {
 // Endian swap of one element (xenos::Endian), in place.
 void SwapElements(uint8_t* data, size_t bytes, xenos::Endian endian) {
   switch (endian) {
-    case xenos::Endian::k8in16:
-      for (size_t i = 0; i + 1 < bytes; i += 2) std::swap(data[i], data[i + 1]);
-      break;
+    case xenos::Endian::k8in16: {
+      size_t i = 0;
+      for (; i + 8 <= bytes; i += 8) {
+        uint64_t v;
+        std::memcpy(&v, data + i, 8);
+        v = ((v & 0x00FF00FF00FF00FFull) << 8) | ((v >> 8) & 0x00FF00FF00FF00FFull);
+        std::memcpy(data + i, &v, 8);
+      }
+      for (; i + 1 < bytes; i += 2) std::swap(data[i], data[i + 1]);
+    } break;
     case xenos::Endian::k8in32:
       for (size_t i = 0; i + 3 < bytes; i += 4) {
         uint32_t v;
@@ -1016,6 +1028,7 @@ class NativeCommandProcessor final : public CommandProcessor {
   std::vector<uint32_t> native_indices_;
   std::vector<VkWriteDescriptorSet> descriptor_writes_;
   std::vector<uint64_t> descriptor_key_;
+  std::vector<uint8_t> texture_row_scratch_;
   struct LastConstantUpload {
     std::vector<uint8_t> data;
     VkDeviceSize offset = 0;
@@ -1090,6 +1103,10 @@ class NativeCommandProcessor final : public CommandProcessor {
 
   // GPU profile.
   bool profiling_ = false;       // timestamps available and requested
+  // RC80: after a frame that waited long for the GPU, every command buffer of the next frames is timed with
+  // per-shader groups, and the slow ones are logged on their own (not averaged away over 10 s).
+  uint32_t spike_frames_ = 0, spike_logs_ = 0;
+  uint64_t spike_last_log_us_ = 0;
   bool profile_capable_ = false;  // RC66: profiling_ is set per command buffer (1 in ds2_native_gpu_profile_every)
   uint64_t profile_counter_ = 0;
   double timestamp_period_ns_ = 1.0;
@@ -1465,7 +1482,7 @@ bool NativeCommandProcessor::BeginFrame() {
   if (s.occlusion_pool) dfn().vkCmdResetQueryPool(s.cmd, s.occlusion_pool, 0, kMaxOcclusionQueries);
   if (profile_capable_) {
     const uint64_t every = uint64_t(std::max(REXCVAR_GET(ds2_native_gpu_profile_every), 1));
-    profiling_ = (profile_counter_++ % every) == 0;
+    profiling_ = (profile_counter_++ % every) == 0 || spike_frames_ > 0;
   }
   if (profiling_ && s.query_pool) {
     dfn().vkCmdResetQueryPool(s.cmd, s.query_pool, 0, kMaxQueries);
@@ -1538,8 +1555,27 @@ void NativeCommandProcessor::CollectProfile(FrameSlot& s) {
     ++l.count;
     l.draws += s.seg_draws[i];
   }
-  profile_gpu_ms_ += double((ts[s.queries - 1] - ts[0]) & timestamp_mask_) * timestamp_period_ns_ * 1e-6;
+  const double buffer_ms = double((ts[s.queries - 1] - ts[0]) & timestamp_mask_) * timestamp_period_ns_ * 1e-6;
+  profile_gpu_ms_ += buffer_ms;
   ++profile_buffers_;
+  const int32_t spike_ms = REXCVAR_GET(ds2_native_gpu_spike_ms);
+  if (spike_ms > 0 && buffer_ms >= double(spike_ms) && spike_logs_ < 6) {
+    ++spike_logs_;
+    std::unordered_map<uint16_t, std::pair<double, uint32_t>> per;
+    for (uint32_t i = 0; i + 1 < s.queries; ++i) {
+      auto& e = per[s.query_labels[i]];
+      e.first += double((ts[i + 1] - ts[i]) & timestamp_mask_) * timestamp_period_ns_ * 1e-6;
+      e.second += s.seg_draws[i];
+    }
+    std::vector<std::pair<uint16_t, std::pair<double, uint32_t>>> order(per.begin(), per.end());
+    std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+    std::string top;
+    for (size_t i = 0; i < order.size() && i < 20; ++i) {
+      top += fmt::format("\n[native gpu spike]   {:6.2f} ms  {} draws  {}", order[i].second.first, order[i].second.second,
+                         profile_labels_[order[i].first].name);
+    }
+    REXGPU_WARN("[native gpu spike] command buffer took {:.1f} ms on the GPU:{}", buffer_ms, top);
+  }
 }
 
 void NativeCommandProcessor::SubmitFrame() {
@@ -3417,8 +3453,13 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
   auto copy_level = [&](uint8_t* dst, uint32_t lbw, uint32_t lbh, const uint8_t* src, size_t src_size,
                         uint32_t tiled_pitch_blocks, size_t linear_row_bytes, uint32_t ox, uint32_t oy) {
     const VkDeviceSize row_bytes = VkDeviceSize(lbw) * fi.bytes_per_block;
+    // RC80: rows are built and byte-swapped in cached memory and then written once to the upload buffer, which is
+    // uncached (the in-place swap read it back: ~110 MB/s for textures when entering an area).
+    const bool scratch = REXCVAR_GET(ds2_native_texture_scratch);
+    if (scratch && texture_row_scratch_.size() < row_bytes) texture_row_scratch_.resize(size_t(row_bytes));
     for (uint32_t y = 0; y < lbh; ++y) {
-      uint8_t* row = dst + row_bytes * y;
+      uint8_t* const out_row = dst + row_bytes * y;
+      uint8_t* row = scratch ? texture_row_scratch_.data() : out_row;
       if (fetch.tiled && REXCVAR_GET(ds2_native_fast_untile)) {
         // RC77: the tiled layout keeps 16 bytes of a row contiguous (4 blocks of 4 bytes, 2 of 8, 1 of 16), so
         // the offset is computed once per 16 bytes, inline (GetTiledOffset2D, same arithmetic).
@@ -3469,6 +3510,7 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
         }
       }
       SwapElements(row, row_bytes, fetch.endianness);
+      if (row != out_row) std::memcpy(out_row, row, size_t(row_bytes));
     }
   };
   copy_level(dst_all, bw, bh, guest, guest_size, pitch_aligned, size_t(pitch_aligned) * fi.bytes_per_block, off_x,
@@ -3634,8 +3676,11 @@ VkImageView NativeCommandProcessor::GetCubeTextureView(const xenos::xe_gpu_textu
                        uint32_t row_pitch_bytes, uint32_t ox, uint32_t oy) {
     const size_t row_bytes = size_t(lbw) * fi.bytes_per_block;
     const uint32_t pitch_blocks = row_pitch_bytes >> bpb_log2;
+    const bool scratch = REXCVAR_GET(ds2_native_texture_scratch);
+    if (scratch && texture_row_scratch_.size() < row_bytes) texture_row_scratch_.resize(row_bytes);
     for (uint32_t y = 0; y < lbh; ++y) {
-      uint8_t* row = dst + row_bytes * y;
+      uint8_t* const out_row = dst + row_bytes * y;
+      uint8_t* row = scratch ? texture_row_scratch_.data() : out_row;
       if (fetch.tiled) {
         for (uint32_t x = 0; x < lbw; ++x) {
           const int32_t o = texture_util::GetTiledOffset2D(int32_t(x + ox), int32_t(y + oy), pitch_blocks, bpb_log2);
@@ -3654,6 +3699,7 @@ VkImageView NativeCommandProcessor::GetCubeTextureView(const xenos::xe_gpu_textu
         }
       }
       SwapElements(row, row_bytes, fetch.endianness);
+      if (row != out_row) std::memcpy(out_row, row, row_bytes);
     }
   };
   for (uint32_t l = 0; l < levels; ++l) {
@@ -4831,7 +4877,9 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                 regs[XE_GPU_REG_RB_STENCILREFMASK]);
   }
   const uint32_t shader_profile_every = uint32_t(REXCVAR_GET(ds2_native_shader_profile_every));
-  const bool sample_shader = profiling_ && shader_profile_every && (profile_counter_ - 1) % shader_profile_every == 0 &&
+  const bool sample_shader = profiling_ &&
+                             ((shader_profile_every && (profile_counter_ - 1) % shader_profile_every == 0) ||
+                              spike_frames_ > 0) &&
                              color_count && viewport.xy_extent[0] >= 640 && viewport.xy_extent[1] >= 360;
   if (!sample_shader && profile_shader_active_) {
     Mark("other (outside scene shader group)");
@@ -5400,6 +5448,16 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     const uint64_t cur[6] = {stats_.us_fence_wait, stats_.us_draws, stats_.us_textures, stats_.us_pipelines,
                              stats_.us_copies, stats_.texture_uploads};
     const int32_t hitch_ms = REXCVAR_GET(ds2_native_hitch_ms);
+    {
+      // RC80: a frame that waited 40+ ms for the GPU starts (or extends) a spike window of 20 timed frames.
+      const uint64_t wait_us = cur[0] - hitch_prev_[0];
+      if (spike_frames_) --spike_frames_;
+      if (REXCVAR_GET(ds2_native_gpu_spike_ms) > 0 && wait_us >= 40000) {
+        if (!spike_frames_ && now - spike_last_log_us_ > 5000000) spike_logs_ = 0;
+        if (!spike_frames_) spike_last_log_us_ = now;
+        spike_frames_ = 20;
+      }
+    }
     if (hitch_ms > 0 && frame_us > uint64_t(hitch_ms) * 1000 && draws_this_frame_ > 0) {
       REXGPU_WARN("[native] hitch: frame took {:.1f} ms ({} draws): waiting for the GPU {:.1f}, draws {:.1f} "
                   "(textures {:.1f}, {} uploads; shaders+pipelines {:.1f}), resolves {:.1f}; outside the command "
