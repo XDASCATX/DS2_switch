@@ -1190,7 +1190,7 @@ uint64_t NowUs() {
 #if defined(__aarch64__) && REX_PLATFORM_SWITCH
   // RC87: the system counter (19.2 MHz on the Switch) instead of steady_clock (~10 timer reads per draw).
   uint64_t ticks;
-  asm volatile("mrs %0, cntvct_el0" : "=r"(ticks));
+  asm volatile("mrs %0, cntpct_el0" : "=r"(ticks));  // cntvct_el0 traps on Horizon (RC87 crash)
   return ticks * 10 / 192;
 #else
   return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
