@@ -9,3 +9,12 @@
 4. `novolatile.py <gen>`: guest loads/stores without volatile (MMIO keeps it); compiler barrier on every loop
    back-edge and at sync/lwsync/eieio/isync.
 Steps 3 and 4 must be repeated after every codegen.
+
+## Lesson (RC97b crash)
+`share_registers` on a normal function is wrong: in such a function the generator drops the
+`__savegprlr_N` / `__restgprlr_N` calls (their bodies are no-ops once registers are locals), so it
+clobbers ctx.r14-r31 and its caller copies the clobbered value back (RC97b: sub_82C2A9F8 returned
+r31 = 0 to sub_82C2ACF8 -> null read at guest 0xD4). `lee_antes` is a linear scan and flags normal
+functions too (a loop body placed before its init, `subfe rX,rY,rY`, partial vector writes).
+Mark only pieces: `classify.py <gen>` -> PIECE (no own frame / prologue does not save the flagged
+registers). Check with `shared_helpers.py <gen>`: no shared function may call a `__save*` helper.
