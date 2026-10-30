@@ -38,6 +38,10 @@ target_include_directories(ds2_recomp PRIVATE "${DS2_GENERATED_DIR}")
 target_link_libraries(ds2_recomp PRIVATE rex::runtime)
 target_precompile_headers(ds2_recomp PRIVATE "${DS2_GENERATED_DIR}/ds2_pch.h")
 target_compile_options(ds2_recomp PRIVATE $<$<CXX_COMPILER_ID:Clang,AppleClang>:-gline-tables-only>)
+# RC97: guest memory is accessed through u8/u16/u32/u64 pointers to the same bytes (stfd + lwz of one half,
+# etc.). The SDK's add_compile_options(-fno-strict-aliasing) does not reach this target; without volatile
+# accesses GCC reordered such pairs (RC97 crash: assert in sub_8275AAD8 on a garbage pool count).
+target_compile_options(ds2_recomp PRIVATE -fno-strict-aliasing)
 rexglue_apply_target_settings(ds2_recomp)
 
 set(DS2_SOURCES
