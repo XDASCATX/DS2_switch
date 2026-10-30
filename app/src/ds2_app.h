@@ -72,9 +72,15 @@ class Ds2App : public rex::ReXApp {
   void OnPreSetup(rex::RuntimeConfig& config) override { ds2::input_script::Wrap(config); }
 
   // DLC packages (--ds2_install_dlc), installed once the XEX is loaded so the title id is known.
-  void OnPostSetup() override {
-    ds2::input_script::ApplyTimeScalar();
-    ds2::dlc::InstallConfigured(runtime());
+  void OnPostSetup() override { ds2::input_script::ApplyTimeScalar(); }
+
+  // v101: the packages are unpacked on a worker thread while the UI thread draws a progress bar (on the first boot
+  // this takes minutes and the screen used to stay black); the game is launched when it is done.
+  void LaunchModule() override {
+    ds2::dlc::InstallWithProgress(
+        runtime(), imgui_drawer(),
+        [this](std::function<void()> f) { app_context().CallInUIThreadDeferred(std::move(f)); },
+        [this]() { rex::ReXApp::LaunchModule(); });
   }
 
   // Diagnostic frame capture (off unless --ds2_capture_dir is given), see ds2_capture.h.

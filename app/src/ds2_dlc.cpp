@@ -8,9 +8,19 @@
 #include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_manager.h>
+#include <rex/system/xam/install_progress.h>
 #include <rex/system/xcontent.h>
+#include <rex/ui/imgui_dialog.h>
+#include <rex/ui/imgui_drawer.h>
 
+#include <imgui.h>
+
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <functional>
+#include <memory>
+#include <thread>
 #include <cstdio>
 #include <cstdint>
 #include <filesystem>
@@ -98,6 +108,9 @@ void ImportCalibration(const std::filesystem::path& exe_dir) {
 
 }  // namespace
 
+std::atomic<uint32_t> g_package_index{0};
+std::atomic<uint32_t> g_package_count{0};
+
 void InstallConfigured(rex::Runtime* runtime) {
   using rex::X_RESULT;
   if (!runtime || !runtime->kernel_state()) {
@@ -124,6 +137,12 @@ void InstallConfigured(rex::Runtime* runtime) {
     REXLOG_WARN("[ds2 dlc] no content manager");
     return;
   }
+  {
+    uint32_t n = 0;
+    for (char c : list) n += c == ';';
+    g_package_count.store(n + 1, std::memory_order_relaxed);
+    g_package_index.store(0, std::memory_order_relaxed);
+  }
   size_t start = 0;
   while (start <= list.size()) {
     size_t end = list.find(';', start);
@@ -134,6 +153,7 @@ void InstallConfigured(rex::Runtime* runtime) {
     std::filesystem::path path(item);
     if (path.is_relative() && !exe_dir.empty()) path = exe_dir / path;
     const std::string name = path.filename().string();
+    g_package_index.fetch_add(1, std::memory_order_relaxed);
     REXLOG_INFO("[ds2 dlc] installing {} (first boot only: the package is unpacked onto the SD card, which takes "
                 "minutes on the console)", rex::path_to_utf8(path));
     rex::FlushLogging();
@@ -146,6 +166,67 @@ void InstallConfigured(rex::Runtime* runtime) {
                   std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
   }
+}
+
+namespace {
+
+// v101: progress of the first-boot unpacking, centred on the screen. The bar shows only while a package is really
+// being extracted (an installed package is skipped in about a second without one).
+class InstallDialog final : public rex::ui::ImGuiDialog {
+ public:
+  explicit InstallDialog(rex::ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer) {}
+
+ protected:
+  void OnDraw(ImGuiIO& io) override {
+    auto& progress = rex::system::xam::install_progress();
+    const uint64_t total = progress.bytes_total.load(std::memory_order_relaxed);
+    if (!total) return;
+    const uint64_t done = std::min(progress.bytes_done.load(std::memory_order_relaxed), total);
+    const float fraction = float(double(done) / double(total));
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always,
+                            ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x * 0.6f, 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.85f);
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                                   ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs;
+    if (ImGui::Begin("##ds2_install", nullptr, flags)) {
+      ImGui::SetWindowFontScale(2.0f);
+      ImGui::Text("Installing game data %u/%u", g_package_index.load(std::memory_order_relaxed),
+                  g_package_count.load(std::memory_order_relaxed));
+      char label[32];
+      std::snprintf(label, sizeof(label), "%.1f%%", double(fraction) * 100.0);
+      ImGui::ProgressBar(fraction, ImVec2(-1.0f, 0.0f), label);
+      ImGui::SetWindowFontScale(1.4f);
+      ImGui::Text("%.1f / %.1f MB", double(done) / 1048576.0, double(total) / 1048576.0);
+    }
+    ImGui::End();
+  }
+};
+
+std::unique_ptr<InstallDialog> g_dialog;
+std::thread g_install_thread;
+
+}  // namespace
+
+void InstallWithProgress(rex::Runtime* runtime, rex::ui::ImGuiDrawer* drawer,
+                         std::function<void(std::function<void()>)> post_to_ui, std::function<void()> then) {
+  if (!drawer || !post_to_ui) {
+    InstallConfigured(runtime);
+    then();
+    return;
+  }
+  g_dialog = std::make_unique<InstallDialog>(drawer);
+  g_install_thread = std::thread([runtime, post_to_ui, then]() {
+    InstallConfigured(runtime);
+    post_to_ui([then]() {
+      // The dialog must be gone before the game starts: while a dialog is registered the presenter paints
+      // from the UI thread (see ReXApp::LaunchModule).
+      g_dialog.reset();
+      if (g_install_thread.joinable()) g_install_thread.join();
+      then();
+    });
+  });
 }
 
 }  // namespace ds2::dlc

@@ -7,12 +7,22 @@
 
 #pragma once
 
+#include <functional>
+
 namespace rex {
 class Runtime;
+namespace ui {
+class ImGuiDrawer;
+}
 }
 
 namespace ds2::dlc {
 
 void InstallConfigured(rex::Runtime* runtime);
+
+// v101: InstallConfigured on a worker thread with a progress bar in the centre of the screen (ImGui), then `then`
+// on the UI thread. Called from the UI thread.
+void InstallWithProgress(rex::Runtime* runtime, rex::ui::ImGuiDrawer* drawer,
+                         std::function<void(std::function<void()>)> post_to_ui, std::function<void()> then);
 
 }  // namespace ds2::dlc

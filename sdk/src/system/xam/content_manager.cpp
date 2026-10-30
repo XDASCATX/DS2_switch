@@ -26,6 +26,7 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_device.h>
 #include <rex/system/xam/content_manager.h>
+#include <rex/system/xam/install_progress.h>
 #include <rex/system/xam/user_profile.h>
 #include <rex/system/xfile.h>
 #include <rex/system/xobject.h>
@@ -708,6 +709,11 @@ void ContentManager::CloseOpenedFilesFromContent(const std::string_view root_nam
   }
 }
 
+InstallProgress& install_progress() {
+  static InstallProgress progress;
+  return progress;
+}
+
 static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
                              const std::filesystem::path& base_path) {
   auto dest_path = base_path / rex::to_path(rex::string::utf8_fix_path_separators(entry->path()));
@@ -750,6 +756,7 @@ static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
       break;
     }
     fwrite(buffer.get(), 1, bytes_read, out_file);
+    install_progress().bytes_done.fetch_add(bytes_read, std::memory_order_relaxed);
     offset += bytes_read;
     remaining -= bytes_read;
   }
@@ -806,6 +813,21 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
   auto* root = device->ResolvePath("");
   if (!root) {
     return X_ERROR_ACCESS_DENIED;
+  }
+
+  {
+    // Total size for the progress display.
+    uint64_t total = 0;
+    std::queue<rex::filesystem::Entry*> sizes;
+    sizes.push(root);
+    while (!sizes.empty()) {
+      auto* entry = sizes.front();
+      sizes.pop();
+      for (auto& child : entry->children()) sizes.push(child.get());
+      if (!(entry->attributes() & rex::filesystem::kFileAttributeDirectory)) total += entry->size();
+    }
+    install_progress().bytes_done.store(0, std::memory_order_relaxed);
+    install_progress().bytes_total.store(total ? total : 1, std::memory_order_relaxed);
   }
 
   std::queue<rex::filesystem::Entry*> queue;
