@@ -21,6 +21,8 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 
+REXCVAR_DECLARE(uint32_t, user_language);
+
 REXCVAR_DEFINE_UINT32(user_country, 103, "Kernel", "User's country ID");
 
 // TODO(gibbed): put these forward decls in a header somewhere.
@@ -261,6 +263,12 @@ u32 XamGetCountryString_entry(u32 id, u32 buffer_length, mapped_wstring buffer) 
   return X_E_SUCCESS;
 }
 
+// RC92: the system language the title sees (was a stub returning 0, so DS2 fell back to English).
+u32 XamGetLanguage_entry() {
+  const uint32_t configured = REXCVAR_GET(user_language);
+  return (configured >= 1 && configured <= 12) ? configured : 1u;
+}
+
 u32 XamGetLanguageString_entry(u32 id, u32 buffer_length, mapped_wstring buffer) {
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
@@ -399,6 +407,7 @@ REX_EXPORT(__imp__XamGetOnlineCountryFromLocale,
            rex::kernel::xam::XamGetOnlineCountryFromLocale_entry)
 REX_EXPORT(__imp__XamGetOnlineCountryString, rex::kernel::xam::XamGetOnlineCountryString_entry)
 REX_EXPORT(__imp__XamGetCountryString, rex::kernel::xam::XamGetCountryString_entry)
+REX_EXPORT(__imp__XamGetLanguage, rex::kernel::xam::XamGetLanguage_entry)
 REX_EXPORT(__imp__XamGetLanguageString, rex::kernel::xam::XamGetLanguageString_entry)
 REX_EXPORT(__imp__XamGetLanguageLocaleString, rex::kernel::xam::XamGetLanguageLocaleString_entry)
 REX_EXPORT(__imp__XamGetOnlineLanguageAndCountryString,
@@ -418,7 +427,6 @@ REX_EXPORT_STUB(__imp__XamFormatMessage);
 REX_EXPORT_STUB(__imp__XamFormatSystemDateString);
 REX_EXPORT_STUB(__imp__XamGetCountry);
 REX_EXPORT_STUB(__imp__XamGetCurrencyFormat);
-REX_EXPORT_STUB(__imp__XamGetLanguage);
 REX_EXPORT_STUB(__imp__XamGetLanguageLocaleFallbackString);
 REX_EXPORT_STUB(__imp__XamGetLanguageTypeface);
 REX_EXPORT_STUB(__imp__XamGetLanguageTypefacePatch);
