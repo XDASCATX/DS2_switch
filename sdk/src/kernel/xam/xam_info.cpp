@@ -29,6 +29,12 @@
 #include <fmt/xchar.h>
 
 REXCVAR_DECLARE(uint32_t, user_language);
+// RC95: the title's game region. DS2 picks its text language from (region, language): only the European SKU
+// (region byte 2, e.g. 0x02FE "Europe rest") offers Russian and Polish; 0xFFFF reads as North America -> English.
+REXCVAR_DEFINE_UINT32(user_game_region, 0xFFFF, "Kernel",
+                      "XGetGameRegion value: 0xFFFF = all (DS2: North America), 766 = 0x02FE Europe (DS2: Russian, "
+                      "Polish, German...), 257 = 0x0101 Japan");
+
 
 namespace rex {
 namespace kernel {
@@ -177,7 +183,7 @@ u32 XGetAVPack_entry() {
 }
 
 uint32_t xeXGetGameRegion() {
-  return 0xFFFFu;
+  return REXCVAR_GET(user_game_region);
 }
 
 u32 XGetGameRegion_entry() {
