@@ -12,6 +12,8 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <atomic>
+
 #include <rex/cvar.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -62,6 +64,13 @@ X_STATUS xeExGetXConfigSetting(uint16_t category, uint16_t setting, void* buffer
         case 0x0009:  // XCONFIG_USER_LANGUAGE
           setting_size = 4;
           memory::store_and_swap<uint32_t>(value, REXCVAR_GET(user_language));
+          {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1) < 8) {
+              REXKRNL_INFO("[lang] XConfig USER_LANGUAGE -> {} (buffer {}, size {})", REXCVAR_GET(user_language),
+                           buffer ? "yes" : "no", buffer_size);
+            }
+          }
           break;
         case 0x000A:  // XCONFIG_USER_VIDEO_FLAGS
           setting_size = 4;

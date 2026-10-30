@@ -266,6 +266,8 @@ u32 XamGetCountryString_entry(u32 id, u32 buffer_length, mapped_wstring buffer) 
 // RC92: the system language the title sees (was a stub returning 0, so DS2 fell back to English).
 u32 XamGetLanguage_entry() {
   const uint32_t configured = REXCVAR_GET(user_language);
+  static int logged = 0;
+  if (logged++ < 8) REXKRNL_INFO("[lang] XamGetLanguage -> {}", configured);
   return (configured >= 1 && configured <= 12) ? configured : 1u;
 }
 

@@ -344,7 +344,8 @@ inline void AnotarApertura(uint64_t us, bool ok, const std::string_view ruta) {
   {
     std::string lower(ruta);
     for (char& ch : lower) ch = char(std::tolower(static_cast<unsigned char>(ch)));
-    if (lower.find("regulation") != std::string::npos || lower.find("user_data15") != std::string::npos) {
+    if (lower.find("regulation") != std::string::npos || lower.find("user_data") != std::string::npos ||
+        lower.find("font") != std::string::npos || lower.find("\\text\\") != std::string::npos) {
       REXKRNL_INFO("[io] regulation: abrir '{}' ({}, {:.1f} ms)", ruta, ok ? "abierto" : "no existe", us / 1000.0);
     }
   }
