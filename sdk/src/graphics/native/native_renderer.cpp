@@ -225,6 +225,11 @@ REXCVAR_DEFINE_INT32(ds2_native_occlusion_hold, 2, "GPU",
                      "RC69: an occlusion query reports 'hidden' only after this many consecutive zero measurements "
                      "(otherwise the largest recent count), so a late result cannot make an object blink; 1 = raw");
 REXCVAR_DECLARE(int32_t, query_occlusion_fake_sample_count);
+REXCVAR_DEFINE_INT32(ds2_native_probe, 0, "GPU",
+                     "RC90 diagnostic probe, the picture is wrong on purpose: 1 = game draws with an empty scissor (vertex "
+                     "work only, no pixels), 2 = only the first triangle of every game draw (pixel work only); the probe "
+                     "is on in every other pair of log intervals, so one session gives both numbers; 0 = off")
+    .range(0, 2);
 
 #if REX_PLATFORM_SWITCH
 extern "C" void RexSwitchPerfCount(unsigned id);  // switch_perf.cpp: 0 = swaps (FPS for the overlay / SaltyNX)
@@ -1123,6 +1128,8 @@ class NativeCommandProcessor final : public CommandProcessor {
   SpirvShaderTranslator::SystemConstants system_constants_ = {};
   Stats stats_;
   uint64_t last_log_frame_ = 0;
+  uint32_t probe_active_ = 0;     // RC90: ds2_native_probe mode applied in this log interval (0 = not now)
+  uint64_t probe_intervals_ = 0;  // RC90: log intervals since start
   uint64_t draws_this_frame_ = 0, heavy_frames_ = 0;
   bool dumped_ = false;
 
@@ -5436,6 +5443,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   sr.offset.y = int32_t(std::min(scissor.offset[1], rt_height));
   sr.extent.width = std::min(scissor.extent[0], rt_width - uint32_t(sr.offset.x));
   sr.extent.height = std::min(scissor.extent[1], rt_height - uint32_t(sr.offset.y));
+  if (probe_active_ == 1) sr.extent = {0, 0};  // RC90 probe: no fragments
   if (!filter || std::memcmp(&ds.scissor, &sr, sizeof(sr))) {
     dfn().vkCmdSetScissor(cmd, 0, 1, &sr);
     ds.scissor = sr;
@@ -5511,6 +5519,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     ++stats_.state_calls_skipped;
   }
   ds.valid = true;
+  if (probe_active_ == 2) draw_count = std::min<uint32_t>(draw_count, 3);  // RC90 probe: one triangle
   if (use_indices) {
     dfn().vkCmdBindIndexBuffer(cmd, slot().upload, index_offset, index_type);
     work_since_barrier_ = true;
@@ -6360,6 +6369,10 @@ void NativeCommandProcessor::LogStats() {
   if (every <= 0 || stats_.swaps - last_log_frame_ < uint64_t(every)) return;
   const double n = double(stats_.swaps - last_log_frame_);
   last_log_frame_ = stats_.swaps;
+  if (REXCVAR_GET(ds2_native_probe)) {
+    REXGPU_INFO("[native] probe interval {}: mode {} {} (1 = no pixels, 2 = one triangle per draw)", probe_intervals_,
+                REXCVAR_GET(ds2_native_probe), probe_active_ ? "ON, picture wrong on purpose" : "OFF, normal frames");
+  }
   REXGPU_INFO(
       "[native] per frame: {:.0f} draws ({:.1f} skipped, {:.1f} unsupported prim, {:.1f} failed), {:.1f} resolves, "
       "{:.1f} clears, {:.1f} passes, {:.1f} conversions, {:.1f} texture uploads ({:.1f} from resolves, {:.1f} unsupported), {:.2f} MB "
@@ -6471,6 +6484,9 @@ void NativeCommandProcessor::LogStats() {
   stats_.pipelines = pipelines;
   stats_.swaps = swaps;
   stats_.swaps_presented = presented;
+  // RC90: two intervals off, two on; switching right after the report keeps every interval pure.
+  ++probe_intervals_;
+  probe_active_ = ((probe_intervals_ / 2) & 1) ? uint32_t(REXCVAR_GET(ds2_native_probe)) : 0u;
 }
 
 // --- Graphics system ---------------------------------------------------------------------------------------------
