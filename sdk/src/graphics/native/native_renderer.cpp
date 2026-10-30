@@ -227,9 +227,11 @@ REXCVAR_DEFINE_INT32(ds2_native_occlusion_hold, 2, "GPU",
 REXCVAR_DECLARE(int32_t, query_occlusion_fake_sample_count);
 REXCVAR_DEFINE_INT32(ds2_native_probe, 0, "GPU",
                      "RC90 diagnostic probe, the picture is wrong on purpose: 1 = game draws with an empty scissor (vertex "
-                     "work only, no pixels), 2 = only the first triangle of every game draw (pixel work only); the probe "
-                     "is on in every other pair of log intervals, so one session gives both numbers; 0 = off")
-    .range(0, 2);
+                     "work only, no pixels), 2 = only the first triangle of every game draw (pixel work only), 3 (RC91) "
+                     "= every game pixel shader replaced by one that writes a constant (no shader math, no textures: "
+                     "what is left is writing the targets); the probe is on in every other pair of log intervals, so "
+                     "one session gives both numbers; 0 = off")
+    .range(0, 3);
 
 #if REX_PLATFORM_SWITCH
 extern "C" void RexSwitchPerfCount(unsigned id);  // switch_perf.cpp: 0 = swaps (FPS for the overlay / SaltyNX)
@@ -1054,6 +1056,7 @@ class NativeCommandProcessor final : public CommandProcessor {
   std::unordered_map<uint64_t, VkPipeline> convert_pipelines_;
   NativeImage color_resolve_scratch_;  // converted source pixels, never the root atlas
   VkShaderModule present_fs_ = VK_NULL_HANDLE;
+  VkShaderModule probe_fs_ = VK_NULL_HANDLE;  // RC91: constant pixel shader of ds2_native_probe = 3
   VkDescriptorSetLayout present_set_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout present_layout_ = VK_NULL_HANDLE;
   VkPipeline present_pipeline_ = VK_NULL_HANDLE;
@@ -1464,6 +1467,7 @@ void NativeCommandProcessor::ShutdownContext() {
   if (present_layout_) dfn().vkDestroyPipelineLayout(dev, present_layout_, nullptr);
   if (present_set_layout_) dfn().vkDestroyDescriptorSetLayout(dev, present_set_layout_, nullptr);
   if (present_fs_) dfn().vkDestroyShaderModule(dev, present_fs_, nullptr);
+  if (probe_fs_) dfn().vkDestroyShaderModule(dev, probe_fs_, nullptr);
   if (convert_vs_) dfn().vkDestroyShaderModule(dev, convert_vs_, nullptr);
   for (auto m : convert_fs_) {
     if (m) dfn().vkDestroyShaderModule(dev, m, nullptr);
@@ -2096,6 +2100,21 @@ bool NativeCommandProcessor::SetupConversions() {
     return false;
   }
   present_fs_ = ui::vulkan::util::CreateShaderModule(vulkan_device_, spirv.data(), spirv.size() * 4);
+  if (REXCVAR_GET(ds2_native_probe) == 3) {
+    spirv.clear();
+    static const char kProbeFs[] = R"(#version 450
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+layout(location = 2) out vec4 o2;
+layout(location = 3) out vec4 o3;
+void main() { o0 = vec4(0.5, 0.5, 0.5, 1.0); o1 = o0; o2 = o0; o3 = o0; }
+)";
+    if (CompileGlsl(EShLangFragment, kProbeFs, spirv, error)) {
+      probe_fs_ = ui::vulkan::util::CreateShaderModule(vulkan_device_, spirv.data(), spirv.size() * 4);
+    } else {
+      REXGPU_ERROR("[native] probe shader: {}", error);
+    }
+  }
   {
     VkDescriptorSetLayoutBinding b[2] = {};
     b[0].binding = 0;
@@ -3168,10 +3187,13 @@ VkPipeline NativeCommandProcessor::GetPipeline(const PipelineKey& key, VulkanSha
     pipeline_done_.clear();
     pipeline_done_count_.store(0, std::memory_order_release);
   }
-  const uint64_t hash = XXH3_64bits(&key, sizeof(key));
+  // RC91 probe 3: the same key with the constant pixel shader is another pipeline (salted hash).
+  const bool probe_ps = probe_active_ == 3 && ps && probe_fs_;
+  const uint64_t hash = XXH3_64bits(&key, sizeof(key)) ^ (probe_ps ? 0x9E3779B97F4A7C15ull : 0ull);
   auto it = pipelines_.find(hash);
   if (it != pipelines_.end()) return it->second;
-  const VkShaderModule vsm = vs->shader_module(), psm = ps ? ps->shader_module() : VK_NULL_HANDLE;
+  const VkShaderModule vsm = vs->shader_module(),
+                       psm = probe_ps ? probe_fs_ : (ps ? ps->shader_module() : VK_NULL_HANDLE);
   if (pipeline_pending_.count(hash)) {
     if (allow_async) {
       pending_out = true;
