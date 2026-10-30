@@ -168,7 +168,7 @@
 "0x8271F2A0" = {}   # 16 bytes
 "0x8271F2D8" = {}   # 32 bytes
 "0x82731080" = {}   # 8 bytes
-"0x82737E0C" = {}   # 52 bytes
+"0x82737E0C" = { share_registers = true }   # 52 bytes
 "0x827424E0" = {}   # 8 bytes
 "0x827572F8" = {}   # 8 bytes
 "0x82757320" = {}   # 8 bytes
@@ -368,7 +368,7 @@
 "0x8320DB80" = {}   # 8 bytes
 "0x8322F788" = {}   # 8 bytes
 "0x8322F7B0" = {}   # 8 bytes
-"0x83278D6C" = {}   # 100 bytes
+"0x83278D6C" = { share_registers = true }   # 100 bytes
 "0x8328CAE8" = {}   # 64 bytes
 "0x8328CBF0" = {}   # 40 bytes
 "0x8332BA38" = {}   # 8 bytes

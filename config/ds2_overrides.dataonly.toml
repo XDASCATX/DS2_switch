@@ -124,7 +124,7 @@
 "0x82AE5A6C" = {}   # refs: 0x821CD9D0
 "0x82AE64B0" = {}   # refs: 0x821CDA10
 "0x82AE6610" = {}   # refs: 0x821CDA28
-"0x82B0442C" = {}   # refs: 0x821CDA38
+"0x82B0442C" = { share_registers = true }   # refs: 0x821CDA38
 "0x82B0443C" = {}   # refs: 0x821CDA40
 "0x82BBF7B8" = {}   # refs: 0x820BA90C
 "0x82BFBC30" = {}   # refs: 0x820BF3F4 0x820C27A4 0x820C280C ...
@@ -162,8 +162,8 @@
 "0x82C295A8" = {}   # refs: 0x820CB7EC
 "0x82C2AED8" = {}   # refs: 0x820CB890 0x820CB894
 "0x82C6DA10" = {}   # refs: 0x821CDAD0
-"0x82E64F84" = {}   # refs: 0x820FB970
-"0x82E65AF0" = {}   # refs: 0x820FBAC8
+"0x82E64F84" = { share_registers = true }   # refs: 0x820FB970
+"0x82E65AF0" = { share_registers = true }   # refs: 0x820FBAC8
 "0x82E6AC90" = {}   # refs: 0x820FCD90
 "0x82E6ACA0" = {}   # refs: 0x820FCD98
 "0x82E6ACA8" = {}   # refs: 0x820FCD9C
@@ -202,11 +202,11 @@
 "0x82F84F38" = {}   # refs: 0x8210EAD8
 "0x82FA9928" = {}   # refs: 0x8210EF40 0x8210F360
 "0x82FE7768" = {}   # refs: 0x82116908 0x82116C00
-"0x82FF43EC" = {}   # refs: 0x821CDC28
+"0x82FF43EC" = { share_registers = true }   # refs: 0x821CDC28
 "0x82FF92B4" = {}   # refs: 0x821CDD38
-"0x82FFF5F8" = {}   # refs: 0x821CDE38
-"0x83000194" = {}   # refs: 0x821CDEA0
-"0x83001B90" = {}   # refs: 0x821CDF10
+"0x82FFF5F8" = { share_registers = true }   # refs: 0x821CDE38
+"0x83000194" = { share_registers = true }   # refs: 0x821CDEA0
+"0x83001B90" = { share_registers = true }   # refs: 0x821CDF10
 "0x83001CE8" = {}   # refs: 0x821CDF30
 "0x83002054" = {}   # refs: 0x821CDF48
 "0x83002194" = {}   # refs: 0x821CDF60
@@ -223,7 +223,7 @@
 "0x830B69DC" = {}   # refs: 0x821CE0C8
 "0x830B6C7C" = {}   # refs: 0x821CE0E0
 "0x830B6FE8" = {}   # refs: 0x821CE0F8
-"0x830B8888" = {}   # refs: 0x821A0D54 0x821B799C
+"0x830B8888" = { share_registers = true }   # refs: 0x821A0D54 0x821B799C
 "0x830BCDA8" = {}   # refs: 0x821250B0 0x82125108
 "0x830BF020" = {}   # refs: 0x8212511C
 "0x830BF040" = {}   # refs: 0x82125114

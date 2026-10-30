@@ -38,11 +38,11 @@
 "0x82EE2608" = {}   # refs: 0x82EE2A18
 "0x82F03A00" = {}   # refs: 0x82F03F78
 "0x82F03A08" = {}   # refs: 0x82F03B28
-"0x82FEDCC8" = {}   # refs: 0x82FEDCF4
-"0x82FF0B58" = {}   # refs: 0x82FF0B08
+"0x82FEDCC8" = { share_registers = true }   # refs: 0x82FEDCF4
+"0x82FF0B58" = { share_registers = true }   # refs: 0x82FF0B08
 "0x830C0B50" = {}   # refs: 0x830C3108
 "0x8322E588" = {}   # refs: 0x8322130C 0x8322166C 0x8322E6B8
 "0x832D4660" = {}   # refs: 0x832D46B4
 "0x832D4670" = {}   # refs: 0x832D46C4
 "0x833172B0" = {}   # refs: 0x8331762C
-"0x83348FB0" = {}   # refs: 0x83348F60
+"0x83348FB0" = { share_registers = true }   # refs: 0x83348F60
