@@ -28,6 +28,8 @@
 #include <fmt/format.h>
 #include <fmt/xchar.h>
 
+REXCVAR_DECLARE(uint32_t, user_language);
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -183,6 +185,9 @@ u32 XGetGameRegion_entry() {
 }
 
 u32 XGetLanguage_entry() {
+  // RC92: the configured user_language (as XConfig already reports), e.g. 12 = Russian.
+  const uint32_t configured = REXCVAR_GET(user_language);
+  if (configured >= 1 && configured <= 12) return configured;
   auto desired_language = XLanguage::kEnglish;
 
   // Switch the language based on game region.

@@ -11,6 +11,8 @@
 #include <rex/system/xcontent.h>
 
 #include <chrono>
+#include <cstdio>
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -23,7 +25,78 @@ REXCVAR_DEFINE_STRING(ds2_install_dlc, "", "DS2",
                       "Empty: every file of <executable folder>/dlc/ is installed.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_STRING(ds2_calibration_file, "", "DS2",
+                      "RC92: the game's online calibration (the regulation the 360 downloads into the save, file "
+                      "USER_DATA15 of the -GAME_0000 save, e.g. Calibration 1.15 of the release). At start it is copied "
+                      "into every profile's -GAME_0000 save whose USER_DATA15 differs; the old one is kept once as "
+                      "USER_DATA15.before_calibration. Relative to the executable folder. Empty: off.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace ds2::dlc {
+
+namespace {
+
+bool ReadAll(const std::filesystem::path& p, std::vector<char>& out) {
+  FILE* f = std::fopen(rex::path_to_utf8(p).c_str(), "rb");
+  if (!f) return false;
+  out.clear();
+  char buf[65536];
+  size_t n;
+  while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) out.insert(out.end(), buf, buf + n);
+  std::fclose(f);
+  return true;
+}
+
+bool WriteAll(const std::filesystem::path& p, const std::vector<char>& data) {
+  const auto tmp = std::filesystem::path(rex::path_to_utf8(p) + ".tmp");
+  FILE* f = std::fopen(rex::path_to_utf8(tmp).c_str(), "wb");
+  if (!f) return false;
+  const bool ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
+  if (std::fclose(f) != 0 || !ok) return false;
+  std::error_code ec;
+  std::filesystem::remove(p, ec);
+  std::filesystem::rename(tmp, p, ec);
+  return !ec;
+}
+
+// The calibration is a zlib-compressed regulation BND4 behind two big-endian sizes (compressed, uncompressed).
+void ImportCalibration(const std::filesystem::path& exe_dir) {
+  std::string name = REXCVAR_GET(ds2_calibration_file);
+  if (name.empty()) return;
+  std::filesystem::path src(name);
+  if (src.is_relative()) src = exe_dir / src;
+  std::vector<char> calib;
+  if (!ReadAll(src, calib) || calib.size() < 16 || uint8_t(calib[8]) != 0x78) {
+    REXLOG_WARN("[ds2 calibration] {}: missing or not a calibration file", rex::path_to_utf8(src));
+    return;
+  }
+  std::error_code ec;
+  int copied = 0, same = 0;
+  for (const auto& profile : std::filesystem::directory_iterator(exe_dir / "user", ec)) {
+    if (ec) break;
+    const auto save = profile.path() / "465307E4" / "00000001" / "-GAME_0000";
+    std::error_code ec2;
+    if (!std::filesystem::is_directory(save, ec2)) continue;
+    const auto target = save / "USER_DATA15";
+    std::vector<char> current;
+    if (ReadAll(target, current) && current == calib) {
+      ++same;
+      continue;
+    }
+    const auto backup = save / "USER_DATA15.before_calibration";
+    if (!current.empty() && !std::filesystem::exists(backup, ec2)) WriteAll(backup, current);
+    if (WriteAll(target, calib)) {
+      ++copied;
+      REXLOG_INFO("[ds2 calibration] {} -> {} ({} bytes; old one kept as {})", rex::path_to_utf8(src),
+                  rex::path_to_utf8(target), calib.size(), rex::path_to_utf8(backup));
+    } else {
+      REXLOG_WARN("[ds2 calibration] could not write {}", rex::path_to_utf8(target));
+    }
+  }
+  REXLOG_INFO("[ds2 calibration] {}: {} save(s) updated, {} already had it", rex::path_to_utf8(src), copied, same);
+}
+
+}  // namespace
 
 void InstallConfigured(rex::Runtime* runtime) {
   using rex::X_RESULT;
@@ -31,6 +104,7 @@ void InstallConfigured(rex::Runtime* runtime) {
     return;
   }
   const auto exe_dir = rex::filesystem::GetExecutableFolder();
+  if (!exe_dir.empty()) ImportCalibration(exe_dir);
   std::string list = REXCVAR_GET(ds2_install_dlc);
   if (list.empty() && !exe_dir.empty()) {
     // Portable layout (sdmc:/switch/ds2/dlc/ on the Switch): install whatever packages were copied there.
