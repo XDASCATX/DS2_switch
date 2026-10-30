@@ -420,6 +420,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool TranslateAnalyzedShader(Shader::Translation& translation);
   uint64_t ShaderLibrarySignature() const;
 
+  // RC96: texture fetch signs (the swizzled TextureSign bits of the system constants) as specialization constants
+  // kSpecTextureSignsBase + (fetch constant >> 2), one 32-bit word per four fetch constants, instead of a uniform
+  // load: the pipeline gives the values, so the per-component sign switch, the second (signed) sample and the gamma
+  // conversion of the components that are not gamma are folded away by the driver. Off by default.
+  static constexpr uint32_t kSpecTextureSignsBase = 0x5300;
+  void set_fold_texture_signs(bool fold) { fold_texture_signs_ = fold; }
+  bool fold_texture_signs() const { return fold_texture_signs_; }
+
   uint64_t GetDefaultVertexShaderModification(
       uint32_t dynamic_addressable_register_count,
       Shader::HostVertexShaderType host_vertex_shader_type =
@@ -767,6 +775,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool edram_fragment_shader_interlock_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
+  bool fold_texture_signs_ = false;
+  spv::Id spec_texture_signs_[8] = {};
 
   // Is currently writing the empty depth-only pixel shader, such as for depth
   // and stencil testing with fragment shader interlock.

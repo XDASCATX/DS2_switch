@@ -88,7 +88,7 @@ uint64_t SpirvShaderTranslator::ShaderLibrarySignature() const {
       (uint32_t(features_.sample_rate_shading) << 11) |
       (uint32_t(native_2x_msaa_with_attachments_) << 12) |
       (uint32_t(native_2x_msaa_no_attachments_) << 13) |
-      (uint32_t(edram_fragment_shader_interlock_) << 14);
+      (uint32_t(edram_fragment_shader_interlock_) << 14) | (uint32_t(fold_texture_signs_) << 15);
   const uint32_t values[] = {Modification::kVersion, features_.spirv_version,
                             features_.max_storage_buffer_range, flags,
                             draw_resolution_scale_x_, draw_resolution_scale_y_};
@@ -205,6 +205,7 @@ uint32_t SpirvShaderTranslator::GetModificationRegisterCount() const {
 }
 
 void SpirvShaderTranslator::StartTranslation() {
+  std::fill(std::begin(spec_texture_signs_), std::end(spec_texture_signs_), spv::NoResult);
   // TODO(Triang3l): Logger.
   builder_ = std::make_unique<SpirvBuilder>(features_.spirv_version, (kSpirvMagicToolId << 16) | 1,
                                             nullptr);

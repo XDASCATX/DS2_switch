@@ -67,6 +67,9 @@ REXCVAR_DEFINE_BOOL(ds2_native_resolve_logical_size, true, "GPU",
 REXCVAR_DEFINE_BOOL(ds2_native_resolve_color_convert, true, "GPU",
                     "Convert single-sample float color resolves to RGBA8 with the guest copy exponent bias")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(ds2_native_fold_texture_signs, false, "GPU",
+                    "RC96: texture signs/gamma as pipeline specialization constants (needs a pack built with "
+                    "REX_FOLD_TEXTURE_SIGNS=1); the sign switch and the second sample fold away");
 REXCVAR_DEFINE_BOOL(ds2_native_alpha_specialization, false, "GPU",
                     "Compile away alpha tests only when the guest comparison is Always");
 REXCVAR_DEFINE_BOOL(ds2_native_cpu_cache, false, "GPU",
@@ -730,6 +733,7 @@ struct PipelineKey {
   uint32_t samples_reserved;  // keeps the key free of padding
   uint32_t texture_layout;  // texture/sampler counts for the pipeline layout
   uint32_t native_binding_count, native_attribute_count;
+  uint32_t texture_signs[8];  // RC96: specialization constants with ds2_native_fold_texture_signs, else 0
   VkVertexInputBindingDescription native_bindings[8];
   VkVertexInputAttributeDescription native_attributes[32];
 };
@@ -1249,6 +1253,9 @@ bool NativeCommandProcessor::SetupContext() {
 
   translator_ = std::make_unique<SpirvShaderTranslator>(SpirvShaderTranslator::Features(vulkan_device_), false,
                                                         false, false, 1, 1);
+  translator_->set_fold_texture_signs(REXCVAR_GET(ds2_native_fold_texture_signs));
+  REXGPU_INFO("[native] texture signs as specialization constants: {}",
+              REXCVAR_GET(ds2_native_fold_texture_signs) ? "on" : "off");
   shared_memory_bindings_ =
       uint32_t(1) << SpirvShaderTranslator::GetSharedMemoryStorageBufferCountLog2(props.maxStorageBufferRange);
 
@@ -3404,6 +3411,20 @@ VkPipeline NativeCommandProcessor::CreatePipelineObject(const PipelineKey& key, 
     stages[stage_count].pName = "main";
     ++stage_count;
   }
+  // RC96: texture signs (IDs kSpecTextureSignsBase + word); unused IDs in a module are ignored by Vulkan.
+  VkSpecializationMapEntry sign_entries[8];
+  VkSpecializationInfo sign_info = {};
+  if (REXCVAR_GET(ds2_native_fold_texture_signs)) {
+    for (uint32_t w = 0; w < 8; ++w) {
+      sign_entries[w] = {SpirvShaderTranslator::kSpecTextureSignsBase + w, uint32_t(w * sizeof(uint32_t)),
+                         sizeof(uint32_t)};
+    }
+    sign_info.mapEntryCount = 8;
+    sign_info.pMapEntries = sign_entries;
+    sign_info.dataSize = sizeof(key.texture_signs);
+    sign_info.pData = key.texture_signs;
+    for (uint32_t i = 0; i < stage_count; ++i) stages[i].pSpecializationInfo = &sign_info;
+  }
   VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
   vi.vertexBindingDescriptionCount = key.native_binding_count;
   vi.pVertexBindingDescriptions = key.native_bindings;
@@ -4734,6 +4755,16 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // Full-screen passes (rectangles, a few vertices) wait for their pipeline: skipping one would flash the frame.
   const bool allow_async = prim_type != xenos::PrimitiveType::kRectangleList && index_count > 6;
   bool pipeline_pending = false;
+  if (REXCVAR_GET(ds2_native_fold_texture_signs)) {
+    // RC96: the same words as the system constants' texture_swizzled_signs.
+    for (const auto* tb : {&vs_textures, &ps_textures}) {
+      for (const auto& b : *tb) {
+        const uint32_t i = b.fetch_constant;
+        key.texture_signs[(i >> 2) & 7] |=
+            uint32_t(texture_util::SwizzleSigns(regs.GetTextureFetch(i))) << (8 * (i & 3));
+      }
+    }
+  }
   VkPipeline pipeline = GetPipeline(key, vst, pst, layout->layout, allow_async && !native_vertex, pipeline_pending);
   if (!pipeline && native_vertex) {
     native_vertex = false;

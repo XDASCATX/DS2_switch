@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -318,6 +319,12 @@ int main(int argc, char** argv) {
   if (cached_added) std::printf("source shaders added from the caches: %zu\n", cached_added);
   if (inputs.empty()) return 2;
   SpirvShaderTranslator translator(SpirvShaderTranslator::Features(true), false, false, false);
+  // RC96: REX_FOLD_TEXTURE_SIGNS=1 builds the pack with the texture signs as specialization constants
+  // (for ds2_native_fold_texture_signs = true).
+  if (const char* fold = std::getenv("REX_FOLD_TEXTURE_SIGNS"); fold && fold[0] == '1') {
+    translator.set_fold_texture_signs(true);
+    std::printf("texture signs: specialization constants\n");
+  }
   const uint64_t signature = translator.ShaderLibrarySignature();
   FILE* output = std::fopen(argv[2], "wb");
   if (!output || !SpirvShaderLibrary::Begin(output)) return 2;

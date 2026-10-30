@@ -1314,10 +1314,22 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       // All 32 bits containing the values for 4 fetch constants (use
       // OpBitFieldUExtract to get the signednesses for the specific components
       // of this texture).
-      spv::Id swizzled_signs_word = builder_->createLoad(
-          builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                      id_vector_temp_),
-          spv::NoPrecision);
+      spv::Id swizzled_signs_word;
+      if (fold_texture_signs_) {
+        // RC96: the word as a specialization constant (one per four fetch constants, created on first use).
+        spv::Id& spec = spec_texture_signs_[(fetch_constant_index >> 2) & 7];
+        if (spec == spv::NoResult) {
+          spec = builder_->makeUintConstant(0, true);
+          builder_->addDecoration(spec, spv::DecorationSpecId,
+                                  int(kSpecTextureSignsBase + ((fetch_constant_index >> 2) & 7)));
+        }
+        swizzled_signs_word = spec;
+      } else {
+        swizzled_signs_word = builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                        id_vector_temp_),
+            spv::NoPrecision);
+      }
       uint32_t swizzled_signs_word_offset = 8 * (fetch_constant_index & 3);
 
       spv::Builder::TextureParameters texture_parameters = {};
