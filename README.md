@@ -25,9 +25,9 @@ Xbox 360 emulator nor a port of the PC version.**
 
 ## Status (build v104)
 
-- Playable: tested from the new-game intro through Majula, the bosses so far and into the first DLC area.
+- Playable from the new-game intro through Majula, with multiple bosses and the first DLC area tested.
   Russian or English interface (other disc languages through the emulated region).
-- Around **31–40 FPS** (typically ~33) in heavy scenes with the clocks of the supplied configuration
+- Approximately **31–40 FPS** (typically ~33) in demanding scenes with the clocks of the supplied configuration
   (CPU 1963 / GPU 1267 / memory 2500 MHz); about **17–29 FPS** at stock clocks. The limits now are the GPU
   (25–32 ms per frame) and the renderer's command thread (~20 ms).
 - Intro videos, saves, DLC, audio, achievements and the controller work.
@@ -106,6 +106,9 @@ install DARK SOULS II Scholar of the First Sin (port) [0100D52000560000][v0].nsp
 ```
  
 An NSP forwarder can start `ds2.nro` from the home menu.
+
+> [!NOTE]
+> For English-speaking players: The European multilanguage version supports English. To enable it, change user_language = 12 to user_language = 1 in ds2.toml.
 
 **Port menus:** hold **L + R + Plus**, then press a D-pad direction: Up = debug overlay, Right = settings,
 Down = log console, Left = achievements.
