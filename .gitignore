@@ -61,3 +61,6 @@ _to_delete*/
 # Release artifacts
 release/**/*.nro
 release/**/*.toml
+
+# Output of tools/huecos.py (regenerated, not committed)
+tools/huecos_functions.toml

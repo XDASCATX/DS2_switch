@@ -51,8 +51,8 @@ This port modifies these files of the SDK's third-party tree; the modified copie
 - `CMakeLists.txt`: builds the libraries for the Switch
 
 The rest of FFmpeg and libmspack is the unmodified upstream source at the commits pinned by ReXGlue SDK v0.10.0.
-Everything needed to rebuild and relink the NRO with a modified version of either library is in this repository and
-in [docs/building.md](docs/building.md).
+Everything needed to rebuild and relink the NRO with a modified version of either library is in this repository
+(`tools/fetch_thirdparty.py`, `tools/switch/toolchain/` and `tools/build/build-switch.sh`).
 
 ## Installer page
 

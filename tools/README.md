@@ -1,44 +1,43 @@
 # Tools
 
-This folder has the scripts that build the port: they get the missing libraries, extract the game, translate it to
-C++, fix up the generated code, check the result and build the NRO. Look here when a step of
-[docs/building.md](../docs/building.md) names a script and you want to know what it does. The names are in Spanish;
-each one is translated below.
+Scripts and small programs used to build, generate and analyse the DS2 port. Several names are Spanish; each one
+is explained below.
 
-## Main steps
+## Build
 
-In the order of [docs/building.md](../docs/building.md):
-
-| File | What it does |
+| Path | What it does |
 |---|---|
 | `fetch_thirdparty.py` | Fetches the third-party sources of the SDK into `sdk/thirdparty`. The repository only keeps the files this port changed. |
-| `fase1_extraer.py` ("phase 1: extract") | Extracts the Xbox 360 ISO into `assets/game_root` and prints the [XEX](../docs/glossary.md#xex) information. |
-| `codegen.sh` | Runs the code generator (`rexglue codegen`, which translates the game to C++) on an edition tree (`app/`, or the `app_<edition>` copy of another [edition](../docs/glossary.md#edition)), then `llamadas_directas.py` and `copia_literal.py`. |
-| `build.ps1` | Configures and builds the [NRO](../docs/glossary.md#nro) of the default tree (`app/`). |
+| `switch/toolchain/` | Builds the whole Switch toolchain from source (devkitA64 GCC, libnx, portlibs, Mesa NVK with the port patches). `setup-cloud.sh` does it in one go on Linux. |
+| `switch/cmake/switch-devkitA64.cmake` | The CMake toolchain file for devkitA64 and libnx. |
+| `build/` | Configure and build the Switch NRO (`build-switch.sh`), the Linux PC build (`build-pc.sh`), Mesa (`build-mesa.sh`), release packaging and the NSP forwarder (`make-forwarder.py`). |
+| `switch/hbl-ds2/` | Builds `hbl_ds2.nsp`: nx-hbloader with a larger system resource for the game process (kernel page tables), for testing. |
+| `run/` | Running the PC build. |
 
-## After every code generation
+## Code generation
 
-The build depends on these two tools. `codegen.sh` runs them for you, right after the code generator. If you run the
-code generator another way, run them afterwards, in this order.
-
-| File | What it does |
+| Path | What it does |
 |---|---|
-| `llamadas_directas.py` ("direct calls") | Turns calls between recompiled functions into direct calls, except for calls to functions with a [hook](../docs/glossary.md#hook). [LTO](../docs/glossary.md#lto) needs this to optimise across them (see [docs/toolchain.md](../docs/toolchain.md#direct-calls)). |
-| `copia_literal.py` ("literal copy") | Writes the literal copies of five game functions. The [guards](../docs/glossary.md#guard) of their [native versions](../docs/glossary.md#native-replacement) compare against these copies. |
+| `run_codegen_diag.sh`, `run_codegen_monitored.sh` | Run `rexglue codegen` on `Default.xex` with the manifests in `app/` and the overrides in `config/`, logging time and memory. |
+| `rc97/` | The optimised code generation used since build 97 (registers as C++ locals, `share_registers` marks, direct calls, guest memory without `volatile`). Steps and pitfalls: [rc97/README.md](rc97/README.md). |
+| `huecos.py`, `huecos_excluir.txt` ("gaps") | Finds code the generator left outside any function and writes candidate entries (`huecos_functions.toml`, not committed); `config/ds2_overrides.gaps.toml` was made from it. |
+| `ds2_find_dataonly_entries.py`, `ds2_find_split_culprits.py`, `ds2_analyze_unresolved.py`, `ds2_classify_unresolved.py` | Find and classify function entries referenced only from data or code pointers, and unresolved branches (the `config/ds2_overrides.*.toml` inputs). |
+| `build/patch-generated.py` | Brings already generated code up to the current generator output without a full codegen run. |
 
-## Checks and analysis
+## Shaders
 
-| File | What it does |
+| Path | What it does |
 |---|---|
-| `huecos.py`, `huecos_excluir.txt` ("gaps", "gaps to exclude") | Finds code the code generator's analysis left without a function and writes it to `app/huecos.toml`. `huecos_excluir.txt` lists the gaps to leave out. |
-| `lee_antes.py` ("read before") | Lists, per recompiled function, the non-volatile registers (the ones a function must keep unchanged for its caller) it reads before writing them. See [docs/toolchain.md](../docs/toolchain.md#registers-as-c-locals) for why this matters. |
-| `calientes.py` ("hot ones") | Resolves the samples of the console profiler (`rex_perfil.log`) to functions, hottest first. Its output is the input for `app/orden_funciones.ld`, the list of functions placed first in the program ([function ordering](../docs/glossary.md#function-ordering)). |
-| `comprobar_clave_textura.py` ("check texture key") | Checks in the built ELF (the program before it is packed as an NRO) that the texture key is written before it is hashed. It catches an LTO/PGO aliasing pitfall (see [docs/toolchain.md](../docs/toolchain.md#an-lto-and-pgo-pitfall-strict-aliasing-in-xxhash)). |
+| `shaders/` | The offline SPIR-V shader pack builder (`build_library.cpp`, `rex-shader-library`), spirv-opt pass over a pack, and the XenosRecomp research. See [shaders/README.md](shaders/README.md). |
+| `ds2/gen_direct_resolve_shaders.sh` | Compiles the direct resolve compute shader into the SPIR-V headers used by the SDK. |
 
-## Folders
+## Analysis
 
-| Folder | What it has |
+| Path | What it does |
 |---|---|
-| `switch/cmake/` | The CMake toolchain for devkitA64 and [libnx](../docs/glossary.md#libnx), `switch-devkitA64.cmake`: the file that tells CMake how to compile for the Switch. |
-| `editions/` | Support for the other editions: address matching, tree creation, checks, profile translation, per-edition build ([docs/editions.md](../docs/editions.md)). |
-| `french-dub/` | Makes the PAL (English) edition French (text, movies, in-game speech) from the player's own original Xbox French disc ([french-dub/README.md](french-dub/README.md)). |
+| `analysis/` | Console log and profile analysis (`perf.py`, `cvars.py`, `ds2_func_counts.py`, `ds2_resolve_dump.py`), BND4 archives (`bnd4.py`), the 16-bit jump table check, SPIR-V extraction from generated headers (`hdr2spv.py`). |
+| `ds2_trace_*.py`, `ds2_imagedump.py` | Read the native renderer's frame captures (L3+R3): draw traces and dumped images. |
+| `ds2_xexinfo.py`, `ds2_make_elf.py` | XEX header information; the game image wrapped in a PowerPC ELF so disassemblers show guest addresses. |
+| `compile_check/`, `switch/gm-sim/` | Link probe and a small GM20B command simulator used while bringing up the driver. |
+
+Nothing in this folder contains game data. Game files, generated code and built binaries are never committed.
