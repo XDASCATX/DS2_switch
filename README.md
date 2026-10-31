@@ -109,7 +109,7 @@ An NSP forwarder can start `ds2.nro` from the home menu.
 Down = log console, Left = achievements.
 
 > [!WARNING]
-> The supplied configuration requests non-stock clocks (CPU 1963 MHz, GPU 1267 MHz, memory 2500 MHz). They only apply
+> The supplied configuration requests non-stock clocks (CPU 1963 MHz, GPU 1267 MHz, RAM 2500 MHz). They only apply
 > with a suitable clock sysmodule and hardware. Lower them in `ds2.toml` (`ds2_switch_cpu_mhz`, `ds2_switch_gpu_mhz`,
 > `ds2_switch_mem_mhz`; 0 = leave unchanged) to play at stock clocks.
 
