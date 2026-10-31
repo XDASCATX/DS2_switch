@@ -72,7 +72,8 @@ std::string BuilderContext::f(size_t index) {
 std::string BuilderContext::v(size_t index) {
   const auto& cfg = config();
   if ((cfg.nonArgumentRegistersAsLocalVariables && (index >= 32 && index <= 63)) ||
-      (localizeNonVolatiles() && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127)))) {
+      (localizeNonVolatiles() && config().nonVolatileVectorsAsLocalVariables &&
+       ((index >= 14 && index <= 31) || (index >= 64 && index <= 127)))) {
     locals.v[index] = true;
     return fmt::format("v{}", index);
   }
@@ -202,8 +203,11 @@ void BuilderContext::emit_function_call(uint32_t address) {
       // function's: the helper bodies are emitted under it too, so once they
       // spill to locals they are no-ops that scribble zeros on the caller's
       // frame. A share_registers function still has to elide them.
+      // Vector helpers stay real calls when vectors are kept in ctx.
+      const bool vmxHelper = name.find("__savevmx") == 0 || name.find("__restvmx") == 0;
       if (cfg.nonVolatileRegistersAsLocalVariables &&
-          (name.find("__rest") == 0 || name.find("__save") == 0)) {
+          (name.find("__rest") == 0 || name.find("__save") == 0) &&
+          !(vmxHelper && !cfg.nonVolatileVectorsAsLocalVariables)) {
         // print nothing - these are handled by local variable tracking
         return;
       }

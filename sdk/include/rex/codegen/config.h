@@ -96,6 +96,9 @@ struct RecompilerConfig {
   bool crRegistersAsLocalVariables = false;
   bool nonArgumentRegistersAsLocalVariables = false;
   bool nonVolatileRegistersAsLocalVariables = false;
+  // With nonVolatileRegistersAsLocalVariables: also v14-v31 / v64-v127. DS2 RC97 needs false: hand-written VMX
+  // (Bink) passes values between its functions in non-volatile vector registers, which per-function locals lose.
+  bool nonVolatileVectorsAsLocalVariables = true;
   bool generateExceptionHandlers = false;  ///< Generate SEH exception handler wrappers
 
   // === Analysis tuning (optional) ===

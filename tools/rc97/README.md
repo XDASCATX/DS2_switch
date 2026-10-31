@@ -18,3 +18,9 @@ r31 = 0 to sub_82C2ACF8 -> null read at guest 0xD4). `lee_antes` is a linear sca
 functions too (a loop body placed before its init, `subfe rX,rY,rY`, partial vector writes).
 Mark only pieces: `classify.py <gen>` -> PIECE (no own frame / prologue does not save the flagged
 registers). Check with `shared_helpers.py <gen>`: no shared function may call a `__save*` helper.
+
+## v102: vectors stay in ctx
+`non_volatile_vector_as_local = false` (new generator option, default true): v14-v31 / v64-v127 are not
+localized and `__savevmx` / `__restvmx` stay real calls. The Bink video decoder (hand-written VMX, 0x8317xxxx /
+0x833Dxxxx) passes values between its functions in non-volatile vector registers; as per-function locals
+they were lost and the intro video was striped purple/green in v100/v101 (fine in RC96).
