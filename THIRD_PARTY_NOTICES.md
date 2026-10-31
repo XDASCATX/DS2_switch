@@ -46,7 +46,7 @@ This port modifies these files of the SDK's third-party tree; the modified copie
 
 - `FFmpeg/libavcodec/fft_template.c` and `FFmpeg/libavcodec/mdct_template.c`
 - `FFmpeg/config.h`, plus `FFmpeg/config_switch_aarch64.h` and `FFmpeg/config_nfsmw_wmv3.h` (new): the configuration
-  for AArch64 Horizon and for a build limited to the WMV3 decoder
+  for AArch64 Horizon and for a build limited to the WMV3 decoder 
 - `ffmpeg-overlay/codec_list.c`: registers the WMV3 decoder
 - `CMakeLists.txt`: builds the libraries for the Switch
 
