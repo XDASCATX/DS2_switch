@@ -108,7 +108,8 @@ std::unique_ptr<Entry> HostPathEntry::CreateEntryInternal(const std::string_view
                                                           uint32_t attributes) {
   auto full_path = host_path_ / rex::to_path(name);
   if (attributes & kFileAttributeDirectory) {
-    if (!std::filesystem::create_directories(full_path)) {
+    std::error_code ec;  // v103: no exceptions on odd SD card entries
+    if (!std::filesystem::create_directories(full_path, ec) || ec) {
       return nullptr;
     }
   } else {

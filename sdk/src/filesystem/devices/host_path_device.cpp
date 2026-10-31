@@ -53,10 +53,16 @@ HostPathDevice::HostPathDevice(const std::string_view mount_path,
 HostPathDevice::~HostPathDevice() = default;
 
 bool HostPathDevice::Initialize() {
-  if (!std::filesystem::exists(host_path_)) {
+  std::error_code exists_ec;  // v103: no exceptions on odd SD card entries
+  if (!std::filesystem::exists(host_path_, exists_ec)) {
     if (!read_only_) {
       // Create the path.
-      std::filesystem::create_directories(host_path_);
+      std::error_code ec;
+      std::filesystem::create_directories(host_path_, ec);
+      if (ec) {
+        REXFS_ERROR("Cannot create host path: {}", ec.message());
+        return false;
+      }
     } else {
       REXFS_ERROR("Host path does not exist");
       return false;

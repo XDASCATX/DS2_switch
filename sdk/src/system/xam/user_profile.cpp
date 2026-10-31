@@ -159,10 +159,12 @@ void UserProfile::SaveSetting(UserProfile::Setting* setting) {
   if (setting->is_title_specific()) {
     auto serialized_setting = setting->Serialize();
     auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath();
-    std::filesystem::create_directories(content_dir);
+    std::error_code dir_ec;  // v103: no exceptions on odd SD card entries
+    std::filesystem::create_directories(content_dir, dir_ec);
     auto setting_id = fmt::format("{:08X}", setting->setting_id);
     auto file_path = content_dir / setting_id;
     auto file = rex::filesystem::OpenFile(file_path, "wb");
+    if (!file) return;
     fwrite(serialized_setting.data(), 1, serialized_setting.size(), file);
     fclose(file);
   } else {
