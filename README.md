@@ -102,7 +102,7 @@ sdmc:/switch/ds2/
   user/                          # created by the port: saves and installed DLC
   logs/                          # created by the port
 ```
-
+ 
 An NSP forwarder can start `ds2.nro` from the home menu.
 
 **Port menus:** hold **L + R + Plus**, then press a D-pad direction: Up = debug overlay, Right = settings,
