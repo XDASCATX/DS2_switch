@@ -121,8 +121,6 @@ Down = log console, Left = achievements.
 | `sdk/` | ReXGlue SDK with the Switch platform and the native Vulkan renderer. |
 | `config/` | Code generation overrides (entry points, gaps, `share_registers`). |
 | `tools/` | Toolchain, build, code generation, shader library and analysis tools ([tools/README.md](tools/README.md)). |
-| `tests/` | Unit tests for tools and the upload cache. |
-| `audit/` | Sizes and hashes of the expected game files, to check a dump. |
 
 Building needs a personally supplied copy of the Xbox 360 game; generated game code and binaries are not tracked.
 
