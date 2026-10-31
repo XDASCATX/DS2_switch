@@ -9,6 +9,8 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <thread>
+#include <chrono>
 #include <rex/rex_app.h>
 
 #include <cstdlib>
@@ -486,6 +488,28 @@ void ReXApp::LaunchModule() {
               }
               if (achievement_notification_) {
                 achievement_notification_->Push(copia);
+                /*
+                 * v104: the dialog goes away again once its toasts have been shown. While any dialog is
+                 * registered the presenter paints from the UI thread and about half of the frames are
+                 * dropped (35-38 FPS counted, half of it on screen until the game was restarted).
+                 * Each toast is shown 4.5 s, one after another.
+                 */
+                using Clock = std::chrono::steady_clock;
+                static Clock::time_point toast_until{};
+                const auto now = Clock::now();
+                toast_until = std::max(toast_until, now) + std::chrono::milliseconds(4700);
+                const auto release_at = toast_until + std::chrono::milliseconds(300);
+                std::thread([this, release_at]() {
+                  std::this_thread::sleep_until(release_at);
+                  if (shutting_down_.load(std::memory_order_acquire)) return;
+                  app_context().CallInUIThreadDeferred([this, release_at]() {
+                    if (shutting_down_.load(std::memory_order_acquire)) return;
+                    // A later toast moved the deadline: its own release will do it.
+                    if (Clock::now() + std::chrono::milliseconds(50) < release_at) return;
+                    if (toast_until + std::chrono::milliseconds(300) > release_at) return;
+                    achievement_notification_.reset();
+                  });
+                }).detach();
               }
             });
           });

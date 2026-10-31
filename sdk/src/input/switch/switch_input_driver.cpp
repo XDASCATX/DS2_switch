@@ -309,6 +309,17 @@ void SwitchInputDriver::Poll(size_t index) {
       buttons |= mapping.xinput;
     }
   }
+  /*
+   * v104: the menu shortcuts are L+R+Plus+D-pad (L+R+D-pad alone opened them by accident in play). While
+   * L+R+Plus are held the game sees neither Plus (Start), the shoulders nor the D-pad.
+   */
+  constexpr uint64_t kMenuCombo = HidNpadButton_L | HidNpadButton_R | HidNpadButton_Plus;
+  if ((held & kMenuCombo) == kMenuCombo) {
+    buttons = static_cast<uint16_t>(buttons & ~(X_INPUT_GAMEPAD_START | X_INPUT_GAMEPAD_LEFT_SHOULDER |
+                                                X_INPUT_GAMEPAD_RIGHT_SHOULDER | X_INPUT_GAMEPAD_DPAD_UP |
+                                                X_INPUT_GAMEPAD_DPAD_DOWN | X_INPUT_GAMEPAD_DPAD_LEFT |
+                                                X_INPUT_GAMEPAD_DPAD_RIGHT));
+  }
   gamepad.buttons = buttons;
   // ZL and ZR are digital.
   gamepad.left_trigger = (held & HidNpadButton_ZL) ? 0xFF : 0;
@@ -351,11 +362,12 @@ extern "C" void RexSwitchPerfToggleAb(void);
  * has no keyboard, so they go to combinations with L+R, which no game uses
  * together with the D-pad:
  *
- *   L + R + Up    -> debug overlay (counters, statistics)
- *   L + R + Right -> settings
- *   L + R + Down  -> log console
- *   L + R + Left  -> achievements
- *   L + R + ZL    -> GPU A/B test lap (for measuring, not for playing)
+ *   L + R + Plus + Up    -> debug overlay (counters, statistics)
+ *   L + R + Plus + Right -> settings
+ *   L + R + Plus + Down  -> log console
+ *   L + R + Plus + Left  -> achievements
+ *   L + R + Plus + ZL    -> GPU A/B test lap (for measuring, not for playing)
+ *   (v104: Plus added; L + R + D-pad alone opened the menus by accident in play)
  *   L + R + right stick -> moves the debug overlay if it is open
  *                          (its position is saved; see Poll and debug_overlay.cpp)
  *
@@ -367,7 +379,7 @@ void SwitchInputDriver::DispatchMenuShortcuts(Slot& slot, uint64_t held) {
     uint64_t boton;
     rex::ui::VirtualKey tecla;
   };
-  constexpr uint64_t kModificador = HidNpadButton_L | HidNpadButton_R;
+  constexpr uint64_t kModificador = HidNpadButton_L | HidNpadButton_R | HidNpadButton_Plus;  // v104: + Plus
   static const Atajo kAtajos[] = {
       {HidNpadButton_Up, rex::ui::VirtualKey::kF3},
       {HidNpadButton_Right, rex::ui::VirtualKey::kF4},

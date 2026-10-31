@@ -136,7 +136,8 @@ void Poll() {
     }
     const bool recent_change = now - last_change_at < std::chrono::seconds(6);
     const bool invalid_banner = g_invalid.load() && now - start < std::chrono::seconds(60);
-    SetShown(RexSwitchPerfLapActive() || mode != 0 || invalid_banner || recent_change);
+    // v104: no banner for MODE 0 (normal rendering) at startup or when a mode returns to 0.
+    SetShown(RexSwitchPerfLapActive() || mode != 0 || invalid_banner || (recent_change && mode != 0));
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
   }
 }

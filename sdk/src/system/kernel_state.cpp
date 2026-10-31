@@ -285,8 +285,9 @@ void KernelState::LoadAchievementsData() {
 
   const util::XdbfGameData db = title_xdbf();
   if (db.is_valid()) {
-    const XLanguage language =
-        db.GetExistingLanguage(static_cast<XLanguage>(REXCVAR_GET(user_language)));
+    // v104: the overlay (toast, list) draws with ImGui's default font, which has no Cyrillic: its
+    // strings are always English. The game's own queries (xam_user.cpp) keep user_language.
+    const XLanguage language = db.GetExistingLanguage(XLanguage::kEnglish);
     for (const auto& entry : db.GetAchievements()) {
       AchievementInfo info;
       info.id = entry.id;
