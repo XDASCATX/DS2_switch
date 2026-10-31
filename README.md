@@ -101,6 +101,8 @@ sdmc:/switch/ds2/
   dlc/<Compatibility Pack 4 STFS file>   # unpacked on first launch
   user/                          # created by the port: saves and installed DLC
   logs/                          # created by the port
+
+install DARK SOULS II Scholar of the First Sin (port) [0100D52000560000][v0].nsp - using DBI, as usual.
 ```
  
 An NSP forwarder can start `ds2.nro` from the home menu.
