@@ -21,6 +21,7 @@
 #include <mutex>
 #include <unordered_set>
 #include <pthread.h>
+#include <thread>
 #include <sys/stat.h>
 #include <map>
 #include <unordered_map>
@@ -174,6 +175,12 @@ REXCVAR_DEFINE_BOOL(ds2_native_halfres_msaa, true, "GPU",
 REXCVAR_DEFINE_BOOL(ds2_native_halfres_alpha_over, true, "GPU",
                     "v105: reduced-resolution particles also accept blend 07060706 (alpha = src_a * src_a + ...); "
                     "the copy keeps what remains of the scene in alpha, as for 07000706");
+REXCVAR_DEFINE_BOOL(ds2_native_resolve_skip_unchanged, true, "GPU",
+                    "v106: a resolve copies nothing when its source was not written since the same copy into the "
+                    "same unchanged texture (DS2 resolves its depth buffer several times per frame)");
+REXCVAR_DEFINE_INT32(ds2_fps_cap, 0, "GPU",
+                     "v106: frame rate cap with even frame spacing (30 = a steady 30 instead of 28-40 jumping); "
+                     "0 = off");
 REXCVAR_DEFINE_BOOL(ds2_native_dynamic_textures, true, "GPU",
                     "RC86: a texture whose content changed is checked every frame for 120 frames (videos)");
 REXCVAR_DEFINE_BOOL(ds2_native_fast_registers, true, "GPU",
@@ -548,6 +555,7 @@ struct NativeImage {
   uint32_t volume_depth = 0;  // v104: > 0 for a 3D image (VK_IMAGE_TYPE_3D)
   bool depth = false;
   uint32_t samples = 1;      // RC71: 4 for the host MSAA copies of 4x render targets
+  uint64_t write_id = 0;     // v106: changes on every GPU write recorded into this image (0 = unknown)
   bool initialized = false;  // transitioned to GENERAL
 };
 
@@ -854,6 +862,11 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint32_t sample_scale_x = 1, sample_scale_y = 1;
     uint64_t generation = 0;
     uint64_t frame = 0;
+    // v106: the last plain copy into this entry, to skip a resolve that would copy the same unchanged pixels.
+    VkImage last_src = VK_NULL_HANDLE;
+    uint64_t last_src_write = 0, last_dst_write = 0, last_generation = UINT64_MAX;
+    int32_t last_rect[6] = {};
+    uint32_t last_aspect = 0;
     std::unordered_map<uint32_t, VkImageView> swizzle_views;
     // Guest fetch dimensions may be smaller than the tiled pitch or 8-row resolve rectangle.
     // Keep the root image unchanged: sub-resolves still write into the complete atlas.
@@ -867,6 +880,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t texture_uploads = 0, texture_unsupported = 0, texture_from_resolve = 0;
     uint64_t texture_1d = 0, texture_white_dimension = 0, texture_cube = 0, cube_faces_from_resolves = 0;
     uint64_t texture_3d = 0;  // v104
+    uint64_t resolves_skipped = 0;  // v106
     uint64_t depth_decoded_fetches = 0, depth_decodes = 0, depth_float24_quantized = 0;
     uint64_t barriers_issued = 0, barriers_elided = 0;
     uint64_t state_calls = 0, state_calls_skipped = 0;
@@ -1101,6 +1115,9 @@ class NativeCommandProcessor final : public CommandProcessor {
     NativeImage image;
   };
   std::unordered_map<VkImage, HalfResTarget> halfres_targets_;
+  uint64_t write_counter_ = 0;  // v106: source of NativeImage::write_id
+  uint64_t cap_next_us_ = 0;     // v106: ds2_fps_cap, when the next frame may be presented
+  void Written(NativeImage& img) { img.write_id = ++write_counter_; }
   VkPipeline halfres_composite_pipeline_ = VK_NULL_HANDLE;
   VkPipeline halfres_composite_pipeline_msaa_ = VK_NULL_HANDLE;  // v105: into a host 4x MSAA copy
   VkShaderModule halfres_composite_fs_ = VK_NULL_HANDLE;
@@ -2016,6 +2033,7 @@ NativeImage* NativeCommandProcessor::GetRenderTarget(uint32_t base, uint32_t pit
                             (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
   if (!CreateImage(img, vk_format, pitch, height, depth, usage)) return nullptr;
   EnsureGeneral(img);
+  Written(img);
   // Start from zero like a fresh EDRAM range would look after a clear.
   VkImageSubresourceRange r = ui::vulkan::util::InitializeSubresourceRange(
       depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_COLOR_BIT);
@@ -2285,6 +2303,7 @@ NativeImage* NativeCommandProcessor::PrepareColorResolve(NativeImage& src, const
 bool NativeCommandProcessor::Convert(ConvertMode mode, NativeImage& src, NativeImage& dst, int32_t src_x,
                                      int32_t src_y, const VkRect2D& dst_rect, bool src_float24,
                                      int32_t resolve_exp_bias) {
+  Written(dst);
   if (!convert_vs_ || !convert_fs_[mode] || !dst_rect.extent.width || !dst_rect.extent.height) return false;
   const VkDevice dev = vulkan_device_->device();
   VkFormat dst_format = dst.format;
@@ -2606,6 +2625,7 @@ VkPipeline NativeCommandProcessor::GetMsaaPipeline(uint32_t mode, VkFormat forma
 bool NativeCommandProcessor::MsaaTransfer(NativeImage& rt, NativeImage& ms, bool to_ms, uint32_t rows) {
   NativeImage& dst = to_ms ? ms : rt;
   NativeImage& src = to_ms ? rt : ms;
+  Written(dst);
   const VkDevice dev = vulkan_device_->device();
   const VkFormat format = dst.format;
   const uint32_t samples = to_ms ? 4 : 1;
@@ -2719,6 +2739,7 @@ bool NativeCommandProcessor::MsaaTransfer(NativeImage& rt, NativeImage& ms, bool
 // exact float32 depth the lit wall shadows itself at random (striped squares in torch light, flickering).
 bool NativeCommandProcessor::QuantizeDepthFloat24(NativeImage& src, NativeImage& dst, int32_t src_x, int32_t src_y,
                                                   const VkRect2D& dst_rect) {
+  Written(dst);
   if (!src.depth || !dst.depth || !src.depth_view || !dst_rect.extent.width || !dst_rect.extent.height) return false;
   const VkDevice dev = vulkan_device_->device();
   VkRenderPass pass = GetRenderPass(nullptr, 0, dst.format, 1);
@@ -2798,6 +2819,7 @@ uint32_t NativeCommandProcessor::HalfResMode(uint64_t hash) {
 bool NativeCommandProcessor::IsHalfResPixelShader(uint64_t hash) { return HalfResMode(hash) != 0; }
 
 bool NativeCommandProcessor::DownsampleDepth(NativeImage& src, NativeImage& dst, uint32_t divisor, bool use_max) {
+  Written(dst);
   if (!src.depth || !dst.depth || !src.depth_view) return false;
   const VkDevice dev = vulkan_device_->device();
   VkRenderPass pass = GetRenderPass(nullptr, 0, dst.format, 1);
@@ -2865,6 +2887,7 @@ bool NativeCommandProcessor::DownsampleDepth(NativeImage& src, NativeImage& dst,
 }
 
 bool NativeCommandProcessor::CompositeHalfRes(NativeImage& rt, NativeImage& half, const VkRect2D& rect) {
+  Written(rt);
   const VkDevice dev = vulkan_device_->device();
   VkFormat format = rt.format;
   const bool msaa = rt.samples == 4;
@@ -4732,16 +4755,20 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     const bool msaa_ok = !host_msaa || (!wants_depth && REXCVAR_GET(ds2_native_halfres_msaa) &&
                                         color_rts[0]->samples == 4);
     if (mode && ps && color_count == 1 && msaa_ok && sx == 1 && sy == 1 && !msaa_force_clear_ && d > 1 && blend_ok &&
-        color_rts[0]->format == VK_FORMAT_R16G16B16A16_SFLOAT && color_rts[0]->width >= 2 * d &&
+        (color_rts[0]->format == VK_FORMAT_R16G16B16A16_SFLOAT ||
+         color_rts[0]->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) &&
+        color_rts[0]->width >= 2 * d &&
         color_rts[0]->height >= 2 * d) {
       HalfResTarget& h = halfres_targets_[color_rts[0]->image];
+      // The reduced copy is always RGBA16F: its alpha holds what remains of the scene (v106: also for B10G11R11
+      // targets, ds2_native_7e3_as_r11g11b10).
       if (h.image.image && h.image.width != color_rts[0]->width / d) {
         if (halfres_pending_half_ == &h.image) FlushHalfRes();
         DestroyImage(h.image, true);
         h.image = NativeImage();
       }
       if (!h.image.image) {
-        if (!CreateImage(h.image, color_rts[0]->format, color_rts[0]->width / d, color_rts[0]->height / d, false,
+        if (!CreateImage(h.image, VK_FORMAT_R16G16B16A16_SFLOAT, color_rts[0]->width / d, color_rts[0]->height / d, false,
                          VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
           DestroyImage(h.image, false);
           h.image = NativeImage();
@@ -4791,6 +4818,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           }
           halfres_full_rt = color_rts[0];
           color_rts[0] = &h.image;
+          color_formats[0] = h.image.format;
           depth_rt = reduced_depth;
           rt_width = h.image.width;
           rt_height = h.image.height;
@@ -5492,6 +5520,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     bi.renderArea = {{0, 0}, {rt_width, rt_height}};
     work_since_barrier_ = true;
     InvalidateDrawState();
+    for (uint32_t i = 0; i < color_count; ++i) Written(*color_rts[i]);
+    if (depth_rt) Written(*depth_rt);
     dfn().vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
     in_render_pass_ = true;
     if (Tracing()) {
@@ -5766,6 +5796,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
 bool NativeCommandProcessor::ClearRect(NativeImage& rt, const VkClearValue& value, const VkRect2D& rect,
                                        bool depth_only) {
+  Written(rt);
   // A one-attachment render pass on the target and vkCmdClearAttachments for the rectangle.
   VkFormat color_format = rt.format;
   VkRenderPass pass = rt.depth ? GetRenderPass(nullptr, 0, rt.format) : GetRenderPass(&color_format, 1,
@@ -6067,6 +6098,17 @@ bool NativeCommandProcessor::IssueCopy() {
         ++r.generation;
       }
     } else {
+    // v106: the same pixels again (source not written since the last copy into this unchanged entry, same
+    // rectangle): the copy would not change the texture. DS2 resolves its depth buffer up to 3 times per frame.
+    const uint32_t aspect_key = is_depth ? (REXCVAR_GET(ds2_native_resolve_depth_only) ? 1u : 2u) : 0u;
+    const int32_t rect_key[6] = {x0, y0, x1, y1, dst_x0, dst_y0};
+    if (REXCVAR_GET(ds2_native_resolve_skip_unchanged) && copy_src == src && src->write_id != 0 &&
+        r.last_src == src->image && r.last_src_write == src->write_id && r.image.write_id != 0 &&
+        r.last_dst_write == r.image.write_id && r.last_generation == r.generation && r.last_aspect == aspect_key &&
+        std::memcmp(r.last_rect, rect_key, sizeof(rect_key)) == 0) {
+      ++stats_.resolves_skipped;
+      if (Tracing()) REXGPU_INFO("[native trace]   resolve skipped: source unchanged since the last copy");
+    } else {
     if (profiling_) {
       Mark(fmt::format("resolve copy {} {}x{}", is_depth ? "depth" : "color", src->width, src->height));
     }
@@ -6092,11 +6134,23 @@ bool NativeCommandProcessor::IssueCopy() {
                            {{dst_x0, dst_y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}});
     }
     ++r.generation;
+    Written(r.image);
+    if (copy_src == src) {
+      r.last_src = src->image;
+      r.last_src_write = src->write_id;
+      r.last_dst_write = r.image.write_id;
+      r.last_generation = r.generation;
+      r.last_aspect = aspect_key;
+      std::memcpy(r.last_rect, rect_key, sizeof(rect_key));
+    } else {
+      r.last_src = VK_NULL_HANDLE;
+    }
     // RC70: in a capture, every color resolve is also written as it is at this point of the frame (with alpha),
     // so chains that reuse one address (blur, depth of field, sun shafts) can be followed step by step.
     if (Tracing() && combo_dumps_ && !is_depth && REXCVAR_GET(ds2_native_capture_resolves)) {
       DumpImage(fmt::format("snap_{:04}_{:08X}_g{}", draws_this_frame_, dest_base, r.guest_format), r.image, true);
     }
+    }  // v106: copy not skipped
     }
   }
 
@@ -6196,6 +6250,17 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
 #endif
   if (!frame_open_ && !BeginFrame()) return;
   EndRenderPass();
+  // v106: optional frame cap with even spacing (the presentation of this frame waits for its slot).
+  if (const int32_t cap = REXCVAR_GET(ds2_fps_cap); cap > 0) {
+    const uint64_t period = 1000000u / uint64_t(std::clamp(cap, 10, 60));
+    const uint64_t before = NowUs();
+    if (cap_next_us_ > before && cap_next_us_ - before <= period) {
+      std::this_thread::sleep_for(std::chrono::microseconds(cap_next_us_ - before));
+    }
+    const uint64_t t = NowUs();
+    // Keep the cadence while on time (or late by less than half a frame); restart it after a slow frame.
+    cap_next_us_ = (cap_next_us_ && t < cap_next_us_ + period / 2) ? cap_next_us_ + period : t + period;
+  }
   ui::Presenter* presenter = graphics_system_->presenter();
   // The swap source is texture fetch constant 0 (as in the emulation's RequestSwapTexture).
   const xenos::xe_gpu_texture_fetch_t swap_fetch = register_file_->GetTextureFetch(0);
@@ -6580,10 +6645,10 @@ void NativeCommandProcessor::LogStats() {
   }
   REXGPU_INFO(
       "[native] per frame: {:.0f} draws ({:.1f} skipped, {:.1f} unsupported prim, {:.1f} failed), {:.1f} resolves, "
-      "{:.1f} clears, {:.1f} passes, {:.1f} conversions, {:.1f} texture uploads ({:.1f} from resolves, {:.1f} unsupported), {:.2f} MB "
+      "({:.1f} skipped as unchanged), {:.1f} clears, {:.1f} passes, {:.1f} conversions, {:.1f} texture uploads ({:.1f} from resolves, {:.1f} unsupported), {:.2f} MB "
       "uploaded | totals: {} pipelines, {} render targets, {} textures, {} resolve targets, presented {}/{} swaps",
       stats_.draws / n, stats_.draws_skipped / n, stats_.draws_unsupported_prim / n, stats_.draws_failed / n,
-      stats_.copies / n, stats_.clears / n, stats_.render_passes_begun / n, stats_.conversions / n, stats_.texture_uploads / n,
+      stats_.copies / n, stats_.resolves_skipped / n, stats_.clears / n, stats_.render_passes_begun / n, stats_.conversions / n, stats_.texture_uploads / n,
       stats_.texture_from_resolve / n, stats_.texture_unsupported / n, stats_.upload_bytes / n / 1048576.0,
       pipelines_.size(), render_targets_.size(), textures_.size(), resolved_.size(), stats_.swaps_presented,
       stats_.swaps);
