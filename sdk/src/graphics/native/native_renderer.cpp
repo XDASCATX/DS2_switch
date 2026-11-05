@@ -4711,8 +4711,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   float rect_max_y = std::numeric_limits<float>::quiet_NaN();
   // v111: one rectangle only (3 vertices, not indexed); a list of several (UI, sprites) is bounded by the scissor.
   if (prim_type == xenos::PrimitiveType::kRectangleList && index_count == 3 && !index_buffer_info &&
-      !(regs[XE_GPU_REG_PA_CL_VTE_CNTL] & 0xC) &&
-      !regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable && !vs->vertex_bindings().empty()) {
+      !(regs[XE_GPU_REG_PA_CL_VTE_CNTL] & 0xC) && !vs->vertex_bindings().empty()) {
     const auto& binding = vs->vertex_bindings().front();
     xenos::xe_gpu_vertex_fetch_t vf;
     std::memcpy(&vf, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 2], sizeof(vf));
@@ -4723,6 +4722,10 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       for (uint32_t v = 0; v < 3; ++v) {
         const float y = xenos::GpuSwap(rex::memory::Reinterpret<float>(vtx[v * stride_words + 1]), vf.endian);
         if (std::isnan(rect_max_y) || y > rect_max_y) rect_max_y = y;
+      }
+      // v113: DS2 draws with the window offset enabled (it is 0); add it like the viewport does.
+      if (!std::isnan(rect_max_y) && regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
+        rect_max_y += float(regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset);
       }
     }
   }
@@ -5851,6 +5854,10 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       if ((write_mask >> (4 * i)) & 0xF) color_rts[i]->Wrote(bottom);
     }
     if (depth_rt && (depth_control.z_write_enable || depth_control.stencil_enable)) depth_rt->Wrote(bottom);
+    if (Tracing()) {
+      REXGPU_INFO("[native trace]   draw {} writes rows < {} (rectangle bottom {})", draws_this_frame_, bottom,
+                  rect_max_y);
+    }
   }
   if (!filter || std::memcmp(&ds.scissor, &sr, sizeof(sr))) {
     dfn().vkCmdSetScissor(cmd, 0, 1, &sr);

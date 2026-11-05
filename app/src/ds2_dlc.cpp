@@ -227,7 +227,7 @@ std::thread g_install_thread;
 // screen, driven with the controller (D-pad + A) or the touch screen.
 class ResolutionDialog final : public rex::ui::ImGuiDialog {
  public:
-  ResolutionDialog(rex::ui::ImGuiDrawer* drawer, std::function<void(double)> on_choice)
+  ResolutionDialog(rex::ui::ImGuiDrawer* drawer, std::function<void(double, int)> on_choice)
       : ImGuiDialog(drawer), on_choice_(std::move(on_choice)) {}
 
  protected:
@@ -255,16 +255,58 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       if (Choice("##540", "540p", "More FPS, softer", size)) choice = 0.75;
       ImGui::PopStyleVar();
       ImGui::PopStyleColor(2);
+      // v113: frame rate cap, a pair of small toggles at the right (60 by default; does not start the game).
+      ImGui::Dummy(ImVec2(0.0f, 6.0f));
+      {
+        const ImVec2 small(io.DisplaySize.x * 0.075f, io.DisplaySize.y * 0.065f);
+        const float row_w = small.x * 2.0f + 12.0f;
+        souls::PushTitleFont(0.55f);
+        const char* label = "Frame Rate";
+        const ImVec2 label_size = ImGui::CalcTextSize(label);
+        const float right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
+        ImGui::SetCursorPosX(right - row_w - label_size.x - 16.0f);
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (small.y - label_size.y) * 0.5f);
+        ImGui::PushStyleColor(ImGuiCol_Text, souls::kAsh);
+        ImGui::TextUnformatted(label);
+        ImGui::PopStyleColor();
+        souls::PopTitleFont();
+        ImGui::SameLine(0.0f, 16.0f);
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() - (small.y - label_size.y) * 0.5f);
+        if (Toggle("##fps30", "30", fps_ == 30, small)) fps_ = 30;
+        ImGui::SameLine(0.0f, 12.0f);
+        if (Toggle("##fps60", "60", fps_ == 60, small)) fps_ = 60;
+      }
       ImGui::Dummy(ImVec2(0.0f, 4.0f));
       souls::CenteredTitle("Select with the D-pad and A", 0.5f, souls::kAsh);
       first_frame_ = false;
       if (choice > 0.0) {
         chosen_ = true;
-        on_choice_(choice);
+        on_choice_(choice, fps_);
       }
     }
     ImGui::End();
     souls::PopWindowStyle();
+  }
+
+  // v113: a small toggle; the selected one is lit in ember, the other dimmed.
+  static bool Toggle(const char* id, const char* text, bool selected, ImVec2 size) {
+    namespace souls = rex::ui::souls;
+    ImGui::PushStyleColor(ImGuiCol_Button, selected ? ImVec4(0.42f, 0.23f, 0.07f, 0.95f)
+                                                    : ImVec4(0.10f, 0.08f, 0.06f, 0.85f));
+    ImGui::PushStyleColor(ImGuiCol_Border, selected ? souls::kEmber : souls::kBronzeDim);
+    const bool pressed = ImGui::Button(id, size);
+    ImGui::PopStyleColor(2);
+    const bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused();
+    const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    souls::PushTitleFont(0.8f);
+    const ImVec2 t = ImGui::CalcTextSize(text);
+    const ImVec4 color = selected ? souls::kParchment : souls::kAsh;
+    dl->AddText(ImVec2((a.x + b.x - t.x) * 0.5f, (a.y + b.y - t.y) * 0.5f),
+                souls::Col(color, selected || hot ? 1.0f : 0.6f), text);
+    souls::PopTitleFont();
+    if (selected) souls::Diamond(dl, ImVec2((a.x + b.x) * 0.5f, b.y), 4.0f, souls::Col(souls::kEmber));
+    return pressed;
   }
 
   // A button with the resolution in the title font and a short line under it.
@@ -292,7 +334,8 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
   }
 
  private:
-  std::function<void(double)> on_choice_;
+  std::function<void(double, int)> on_choice_;
+  int fps_ = 60;  // v113: frame rate cap chosen on the start screen
   bool chosen_ = false;
   bool first_frame_ = true;
 };
@@ -307,10 +350,13 @@ void ChooseResolution(rex::ui::ImGuiDrawer* drawer, std::function<void(std::func
     then();
     return;
   }
-  g_resolution_dialog = std::make_unique<ResolutionDialog>(drawer, [post_to_ui, then](double scale) {
+  g_resolution_dialog = std::make_unique<ResolutionDialog>(drawer, [post_to_ui, then](double scale, int fps) {
     // From inside the dialog's OnDraw: the dialog is destroyed later, on the UI thread, before the game starts.
-    post_to_ui([scale, then]() {
+    post_to_ui([scale, fps, then]() {
       rex::cvar::SetFlagByName("ds2_render_scale", scale >= 1.0 ? "1.0" : "0.75");
+      // v113: frame rate cap (ds2_fps_cap, even frame spacing): 30, or 60.
+      rex::cvar::SetFlagByName("ds2_fps_cap", fps == 30 ? "30" : "60");
+      REXLOG_INFO("ds2: frame rate cap chosen on the start screen: {}", fps == 30 ? 30 : 60);
       REXLOG_INFO("ds2: internal resolution chosen on the start screen: {}", scale >= 1.0 ? "720p" : "540p");
       g_resolution_dialog.reset();
       then();
