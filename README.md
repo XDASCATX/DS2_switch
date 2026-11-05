@@ -9,7 +9,7 @@
 <h1 align="center">DARK SOULS II: Scholar of the First Sin — Nintendo Switch</h1>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/build-v118-1F1F1F?style=for-the-badge" alt="Build v118">
+  <img src="https://img.shields.io/badge/build-v119-1F1F1F?style=for-the-badge" alt="Build v119">
   <img src="https://img.shields.io/badge/static%20recompilation-PPC→ARM64-1F1F1F?style=for-the-badge" alt="Static recompilation">
   <img src="https://img.shields.io/badge/Horizon-libnx-E60012?style=for-the-badge&logo=nintendoswitch&logoColor=white" alt="Horizon libnx">
   <img src="https://img.shields.io/badge/Vulkan-Mesa%20NVK-AC162C?style=for-the-badge&logo=vulkan" alt="Vulkan NVK">
@@ -23,9 +23,9 @@ Xbox 360 emulator nor a port of the PC version.**
 > You need your **own Xbox 360 game files** and Compatibility Pack 4. No game files, generated game code or keys are
 > distributed here.
 
-## Status (build v118)
+## Status (build v119)
 
-- Playable from the new-game intro through Majula, with multiple bosses and the first DLC area tested.
+v119 restores the shader pack signature: v116 changed spirv_library.cpp, which is hashed into the translator signature, so v116-v117 rejected the pack and translated every shader at runtime (the stutters). v119 = v118 (countdown that survives the launch press, breathing resolution cards) + spirv_library.cpp/.h byte-identical to v115.
   Russian or English interface (other disc languages through the emulated region).
 - Approximately **31–40 FPS** (typically ~33) in demanding scenes with the clocks of the supplied configuration
   (CPU 1963 / GPU 1267 / memory 2500 MHz); about **17–29 FPS** at stock clocks. The limits now are the GPU
@@ -94,8 +94,8 @@ guest-memory buffer and NAK compiler tuning.
 sdmc:/switch/ds2/
   ds2.nro
   ds2.toml
-  ds2_shaders_v118.spvlib        # shader library (name set in ds2.toml)
-  ds2_shaders_v118.spvlib.idx
+  ds2_shaders_v119.spvlib        # shader library (name set in ds2.toml)
+  ds2_shaders_v119.spvlib.idx
   game_root/Default.xex          # your Xbox 360 game files, original structure
   game_root/GameData1.bdt, GameData1.bhd, GameData2.bdt, GameData2.bhd, ...
   dlc/<Compatibility Pack 4 STFS file>   # unpacked on first launch
