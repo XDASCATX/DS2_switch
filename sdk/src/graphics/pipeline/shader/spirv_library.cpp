@@ -14,9 +14,10 @@
 #include <rex/filesystem.h>
 #include <rex/logging.h>
 
-REXCVAR_DEFINE_INT32(ds2_shader_read_ahead_mb, 32, "GPU",
+REXCVAR_DEFINE_INT32(ds2_shader_read_ahead_mb, 0, "GPU",
                      "v116: at the first shader, read ahead into RAM up to this many MB of the pack variants the "
-                     "previous session used (sdmc:/switch/ds2/ds2_shader_warm.bin); 0 = off");
+                     "previous session used (sdmc:/switch/ds2/ds2_shader_warm.bin); 0 = off (v117 default: it "
+                     "competed with the game's own reads at start and made the hitches worse)");
 REXCVAR_DEFINE_STRING(ds2_shader_library, "", "GPU",
                       "Offline SPIR-V library; empty disables it. Unknown variants use the SDK translator.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);

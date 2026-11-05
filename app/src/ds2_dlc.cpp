@@ -15,6 +15,7 @@
 #include <rex/ui/souls_style.h>
 
 #include <imgui.h>
+#include <imgui_internal.h>  // ImRect
 
 #include <algorithm>
 #include <atomic>
@@ -297,7 +298,7 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
     DrawBackground(io);
     // Countdown: any button or touch stops it.
     if (counting_) {
-      for (int k = ImGuiKey_GamepadStart; k <= ImGuiKey_GamepadR3; ++k) {
+      for (int k = ImGuiKey_GamepadStart; k <= ImGuiKey_GamepadRStickDown; ++k) {
         if (ImGui::IsKeyDown(ImGuiKey(k))) counting_ = false;
       }
       if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) counting_ = false;
@@ -325,31 +326,47 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       souls::CenteredTitle("Choose Resolution", 1.0f, souls::kParchment);
       souls::Divider();
       // The two resolutions; the remembered one has the focus.
-      const ImVec2 size(io.DisplaySize.x * 0.24f, io.DisplaySize.y * 0.2f);
+      const ImVec2 size(io.DisplaySize.x * 0.24f, io.DisplaySize.y * 0.27f);
       const float gap = 24.0f;
       ImGui::PushStyleColor(ImGuiCol_Border, souls::kBronze);
       ImGui::PushStyleColor(ImGuiCol_Text, souls::kParchment);
       ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.5f);
-      const float cards_x = ImGui::GetCursorPosX();
       if (first_frame_ && scale_ >= 1.0) ImGui::SetKeyboardFocusHere();
-      if (Choice("##720", "720p", "Native, sharp", size)) choice = 1.0;
+      if (Choice("##720", "720p", "Native, sharp", size, false)) choice = 1.0;
+      ImRect card720(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
       if (scale_ >= 1.0) ImGui::SetItemDefaultFocus();
       ImGui::SameLine(0.0f, gap);
       if (first_frame_ && scale_ < 1.0) ImGui::SetKeyboardFocusHere();
-      if (Choice("##540", "540p", "More FPS, softer", size)) choice = 0.75;
+      if (Choice("##540", "540p", "More FPS, softer", size, true)) choice = 0.75;
+      ImRect card540(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
       if (scale_ < 1.0) ImGui::SetItemDefaultFocus();
       ImGui::PopStyleVar();
       ImGui::PopStyleColor(2);
-      // Sharpening of the 540p upscale, under its card.
+      const ImVec2 after_cards = ImGui::GetCursorScreenPos();
+      // v117: sharpening of the 540p upscale, inside the 540p card (it belongs to that mode).
       const ImVec2 small(io.DisplaySize.x * 0.075f, io.DisplaySize.y * 0.065f);
       {
-        ImGui::SetCursorPosX(cards_x + size.x + gap);
-        const ImVec2 bar(size.x, small.y * 0.8f);
+        const float pad = 18.0f;
+        const ImVec2 bar(card540.GetWidth() - 2.0f * pad, card540.GetHeight() * 0.2f);
+        ImGui::SetCursorScreenPos(ImVec2(card540.Min.x + pad, card540.Max.y - bar.y - pad));
         if (Toggle("##sharpen", sharpen_ ? "Sharpening: On" : "Sharpening: Off", sharpen_, bar, 0.55f)) {
           sharpen_ = !sharpen_;
           counting_ = false;
         }
       }
+      // v117: the countdown shown on the remembered card: an ember bar draining along its top edge.
+      if (counting_) {
+        const ImRect& card = scale_ >= 1.0 ? card720 : card540;
+        const float frac = std::clamp((kCountdown - time_) / kCountdown, 0.0f, 1.0f);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float y = card.Min.y + 5.0f;
+        dl->AddRectFilled(ImVec2(card.Min.x + 6.0f, y), ImVec2(card.Max.x - 6.0f, y + 4.0f),
+                          souls::Col(souls::kBronzeDim));
+        dl->AddRectFilled(ImVec2(card.Min.x + 6.0f, y),
+                          ImVec2(card.Min.x + 6.0f + (card.GetWidth() - 12.0f) * frac, y + 4.0f),
+                          souls::Col(souls::kEmber));
+      }
+      ImGui::SetCursorScreenPos(after_cards);
       // Frame rate lock at the right.
       ImGui::Dummy(ImVec2(0.0f, 6.0f));
       {
@@ -377,8 +394,8 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       if (counting_ && left <= 0.0f) choice = scale_;
       if (counting_) {
         char text[64];
-        std::snprintf(text, sizeof(text), "Starting in %d  -  press any button to choose", int(left) + 1);
-        souls::CenteredTitle(text, 0.62f, souls::kEmber);
+        std::snprintf(text, sizeof(text), "Auto start in %d s  -  any button to stay", int(left) + 1);
+        souls::CenteredTitle(text, 0.75f, souls::kEmber);
       } else {
         DrawHints();
       }
@@ -407,10 +424,10 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
     namespace souls = rex::ui::souls;
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
     const ImVec2 d = io.DisplaySize;
-    dl->AddRectFilled(ImVec2(0, 0), d, IM_COL32(6, 5, 4, 255));
+    dl->AddRectFilled(ImVec2(0, 0), d, IM_COL32(0, 0, 0, 255));  // v117: black
     const ImU32 clear = souls::Col(souls::kEmber, 0.0f);
-    const ImU32 glow = souls::Col(souls::kEmber, 0.10f + 0.03f * std::sin(time_ * 1.3f));
-    dl->AddRectFilledMultiColor(ImVec2(0, d.y * 0.55f), d, clear, clear, glow, glow);
+    const ImU32 glow = souls::Col(souls::kEmber, 0.035f + 0.01f * std::sin(time_ * 1.3f));
+    dl->AddRectFilledMultiColor(ImVec2(0, d.y * 0.75f), d, clear, clear, glow, glow);
     for (int i = 0; i < kEmbers; ++i) {
       // Deterministic per ember: start, speed, sway and size from its index.
       const float h1 = Hash(i * 3 + 1), h2 = Hash(i * 3 + 2), h3 = Hash(i * 3 + 3);
@@ -497,8 +514,9 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
   }
 
   // A button with the resolution in the title font and a short line under it.
-  static bool Choice(const char* id, const char* title, const char* note, ImVec2 size) {
+  static bool Choice(const char* id, const char* title, const char* note, ImVec2 size, bool overlap) {
     namespace souls = rex::ui::souls;
+    if (overlap) ImGui::SetNextItemAllowOverlap();  // v117: the sharpening toggle sits inside the 540p card
     const bool pressed = ImGui::Button(id, size);
     const bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused();
     const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
@@ -506,12 +524,12 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
     souls::PushTitleFont(1.3f);
     ImVec2 t = ImGui::CalcTextSize(title);
     const float cx = (a.x + b.x) * 0.5f;
-    const float ty = a.y + (b.y - a.y) * 0.30f - t.y * 0.5f;
+    const float ty = a.y + (b.y - a.y) * 0.24f - t.y * 0.5f;
     dl->AddText(ImVec2(cx - t.x * 0.5f, ty), souls::Col(hot ? souls::kEmber : souls::kParchment), title);
     souls::PopTitleFont();
     souls::PushTitleFont(0.55f);
     const ImVec2 n = ImGui::CalcTextSize(note);
-    dl->AddText(ImVec2(cx - n.x * 0.5f, a.y + (b.y - a.y) * 0.72f - n.y * 0.5f), souls::Col(souls::kAsh), note);
+    dl->AddText(ImVec2(cx - n.x * 0.5f, a.y + (b.y - a.y) * 0.48f - n.y * 0.5f), souls::Col(souls::kAsh), note);
     souls::PopTitleFont();
     if (hot) {
       souls::Diamond(dl, ImVec2(a.x, (a.y + b.y) * 0.5f), 6.0f, souls::Col(souls::kEmber));
