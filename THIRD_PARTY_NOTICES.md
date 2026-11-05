@@ -34,6 +34,7 @@ Libraries used by the SDK, the NRO and the code generator, fetched from the subm
 | [SIMDe](https://github.com/simd-everywhere/simde) | MIT |
 | [toml++](https://github.com/marzer/tomlplusplus) | MIT |
 | [Dear ImGui](https://github.com/ocornut/imgui) | MIT |
+| [Cinzel](https://github.com/NDISCOVER/Cinzel) font by The Cinzel Project Authors, embedded for the titles of the port's windows (`sdk/src/ui/fonts/`) | SIL Open Font License 1.1 (`sdk/src/ui/fonts/Cinzel-OFL.txt`) |
 | [o1heap](https://github.com/pavel-kirienko/o1heap) | MIT |
 | [utfcpp](https://github.com/nemtrif/utfcpp) | BSL-1.0 |
 | [CLI11](https://github.com/CLIUtils/CLI11) | BSD-3-Clause |

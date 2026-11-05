@@ -14,6 +14,7 @@
 #include <algorithm>
 
 #include <rex/ui/immediate_drawer.h>
+#include <rex/ui/souls_style.h>
 
 namespace rex::ui {
 
@@ -60,41 +61,49 @@ void AchievementToastDialog::OnDraw(ImGuiIO& io) {
     alpha = (kDisplaySeconds - age) / 0.5f;
   alpha = std::max(0.0f, std::min(1.0f, alpha));
 
+  // v109 (DS2 port): Dark Souls look, rex/ui/souls_style.h.
+  namespace souls = rex::ui::souls;
   const float pad = 16.0f;
-  const float w = 320.0f;
-  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - w - pad, io.DisplaySize.y - 80.0f - pad),
-                          ImGuiCond_Always);
-  ImGui::SetNextWindowSize(ImVec2(w, 70.0f), ImGuiCond_Always);
+  const float w = 380.0f, h = 92.0f;
+  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - w - pad, io.DisplaySize.y - h - pad), ImGuiCond_Always);
+  ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
   const ToastStyle& s = imgui_drawer()->style().toast;
-  ImGui::SetNextWindowBgAlpha(s.background_alpha * alpha);
 
-  ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav |
-                           ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
-                           ImGuiWindowFlags_NoInputs;
+  ImGuiWindowFlags flags = souls::kWindowFlags | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs |
+                           ImGuiWindowFlags_NoFocusOnAppearing;
   // Colors carry the fade envelope; the style holds them at full opacity.
   auto faded = [alpha](ImVec4 c) { return ImVec4(c.x, c.y, c.z, c.w * alpha); };
 
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, s.rounding);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18.0f, 14.0f));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
   ImGui::PushStyleColor(ImGuiCol_Text, faded(s.text));
   if (ImGui::Begin("##ach_toast", nullptr, flags)) {
+    souls::DrawFrame(alpha * s.background_alpha);
     ImmediateTexture* icon = icon_cache_.GetIcon(toast.event.achievement);
     if (icon) {
       ImGui::Image(reinterpret_cast<ImTextureID>(icon), ImVec2(s.icon_size, s.icon_size));
-      ImGui::SameLine();
+      ImGui::SameLine(0.0f, 12.0f);
     }
 
     ImGui::BeginGroup();
+    souls::PushTitleFont(0.62f);
     ImGui::PushStyleColor(ImGuiCol_Text, faded(s.title));
     ImGui::TextUnformatted("Achievement Unlocked");
     ImGui::PopStyleColor();
+    souls::PopTitleFont();
+    souls::PushTitleFont(0.52f);
     ImGui::TextUnformatted(toast.event.achievement.label.c_str());
-    ImGui::SameLine();
-    ImGui::TextDisabled(" (%dG)", static_cast<int>(toast.event.achievement.gamerscore));
+    souls::PopTitleFont();
+    ImGui::PushStyleColor(ImGuiCol_Text, faded(souls::kAsh));
+    ImGui::SetWindowFontScale(1.6f);
+    ImGui::Text("%dG", static_cast<int>(toast.event.achievement.gamerscore));
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::PopStyleColor();
     ImGui::EndGroup();
   }
   ImGui::End();
   ImGui::PopStyleColor();
-  ImGui::PopStyleVar();
+  ImGui::PopStyleVar(2);
 }
 
 }  // namespace rex::ui

@@ -20,14 +20,14 @@
 namespace rex::ui {
 
 struct AchievementsStyle {
-  ImVec4 unlocked_title{0.45f, 1.00f, 0.55f, 1.00f};
-  ImVec4 unlocked_desc{0.70f, 0.85f, 0.72f, 1.00f};
-  ImVec4 locked_title{0.78f, 0.80f, 0.84f, 1.00f};
-  ImVec4 locked_desc{0.50f, 0.52f, 0.56f, 1.00f};
-  ImVec4 badge_gamerscore{1.00f, 0.82f, 0.30f, 1.00f};
-  ImVec4 row_unlocked_bg{0.16f, 0.30f, 0.18f, 0.55f};
-  ImVec4 header_text{0.60f, 0.85f, 1.00f, 1.00f};
-  ImVec4 progress_bar{0.30f, 0.80f, 0.40f, 1.00f};
+  ImVec4 unlocked_title{0.96f, 0.56f, 0.16f, 1.00f};  // v109: DS2 port ember (souls_style.h)
+  ImVec4 unlocked_desc{0.93f, 0.87f, 0.74f, 1.00f};
+  ImVec4 locked_title{0.70f, 0.64f, 0.54f, 1.00f};
+  ImVec4 locked_desc{0.48f, 0.43f, 0.36f, 1.00f};
+  ImVec4 badge_gamerscore{0.96f, 0.56f, 0.16f, 1.00f};
+  ImVec4 row_unlocked_bg{0.30f, 0.17f, 0.06f, 0.55f};
+  ImVec4 header_text{0.96f, 0.56f, 0.16f, 1.00f};
+  ImVec4 progress_bar{0.96f, 0.56f, 0.16f, 1.00f};
   ImVec4 unlocked_icon_tint{1.00f, 1.00f, 1.00f, 1.00f};
   ImVec4 locked_icon_tint{0.45f, 0.45f, 0.45f, 0.80f};
   ImVec2 window_padding{14.0f, 12.0f};
@@ -38,8 +38,8 @@ struct AchievementsStyle {
 
 struct ToastStyle {
   /// Alpha is the fade envelope, applied on top of these at draw time.
-  ImVec4 text{1.00f, 1.00f, 1.00f, 1.00f};
-  ImVec4 title{1.00f, 0.85f, 0.20f, 1.00f};
+  ImVec4 text{0.93f, 0.87f, 0.74f, 1.00f};  // v109: DS2 port parchment / ember
+  ImVec4 title{0.96f, 0.56f, 0.16f, 1.00f};
   float rounding = 6.0f;
   float background_alpha = 0.88f;
   float icon_size = 44.0f;

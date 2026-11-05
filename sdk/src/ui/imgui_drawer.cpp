@@ -20,6 +20,9 @@
 #include <rex/platform.h>
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
+#include <rex/ui/souls_style.h>
+
+#include "fonts/cinzel_ttf.h"
 #include <rex/ui/ui_event.h>
 #include <rex/ui/window.h>
 #if REX_PLATFORM_SWITCH
@@ -56,54 +59,62 @@ float FisicoALogico(const Window* window) {
   return float(window->GetMediumDpi()) / float(window->GetDpi());
 }
 
+// DS2 port (v109): dark bronze and ember instead of the Xenia green (rex/ui/souls_style.h).
 void ApplyDefaultStyle(ImGuiStyle& style) {
+  using namespace rex::ui::souls;
   style.ScrollbarRounding = 0;
   style.WindowRounding = 0;
   style.TabRounding = 0;
-  style.Colors[ImGuiCol_Text] = ImVec4(0.89f, 0.90f, 0.90f, 1.00f);
-  style.Colors[ImGuiCol_TextDisabled] = ImVec4(0.60f, 0.60f, 0.60f, 1.00f);
-  style.Colors[ImGuiCol_WindowBg] = ImVec4(0.00f, 0.06f, 0.00f, 1.00f);
+  style.FrameRounding = 0;
+  style.WindowBorderSize = 1.0f;
+  style.FrameBorderSize = 1.0f;
+  const ImVec4 bronze_soft(kBronze.x, kBronze.y, kBronze.z, 0.55f);
+  const ImVec4 ember_soft(kEmber.x, kEmber.y, kEmber.z, 0.35f);
+  style.Colors[ImGuiCol_Text] = kParchment;
+  style.Colors[ImGuiCol_TextDisabled] = kAsh;
+  style.Colors[ImGuiCol_WindowBg] = ImVec4(0.055f, 0.047f, 0.038f, 0.94f);
   style.Colors[ImGuiCol_ChildBg] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-  style.Colors[ImGuiCol_Border] = ImVec4(0.00f, 0.35f, 0.00f, 1.00f);
+  style.Colors[ImGuiCol_Border] = bronze_soft;
   style.Colors[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-  style.Colors[ImGuiCol_FrameBg] = ImVec4(0.80f, 0.80f, 0.80f, 0.30f);
-  style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.90f, 0.80f, 0.80f, 0.40f);
-  style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.90f, 0.65f, 0.65f, 0.45f);
-  style.Colors[ImGuiCol_TitleBg] = ImVec4(0.00f, 0.40f, 0.00f, 1.00f);
-  style.Colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.00f, 0.33f, 0.00f, 1.00f);
-  style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.16f, 0.65f, 0.00f, 1.00f);
-  style.Colors[ImGuiCol_MenuBarBg] = ImVec4(0.00f, 0.35f, 0.00f, 1.00f);
-  style.Colors[ImGuiCol_ScrollbarBg] = ImVec4(0.00f, 0.40f, 0.11f, 0.59f);
-  style.Colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.00f, 0.68f, 0.00f, 0.68f);
-  style.Colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.00f, 1.00f, 0.15f, 0.62f);
-  style.Colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.00f, 0.91f, 0.09f, 0.40f);
-  style.Colors[ImGuiCol_PopupBg] = ImVec4(0.20f, 0.20f, 0.20f, 0.99f);
-  style.Colors[ImGuiCol_CheckMark] = ImVec4(0.74f, 0.90f, 0.72f, 0.50f);
-  style.Colors[ImGuiCol_SliderGrab] = ImVec4(1.00f, 1.00f, 1.00f, 0.30f);
-  style.Colors[ImGuiCol_SliderGrabActive] = ImVec4(0.34f, 0.75f, 0.11f, 1.00f);
-  style.Colors[ImGuiCol_Button] = ImVec4(0.15f, 0.56f, 0.11f, 0.60f);
-  style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.19f, 0.72f, 0.09f, 1.00f);
-  style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.19f, 0.60f, 0.09f, 1.00f);
-  style.Colors[ImGuiCol_Header] = ImVec4(0.00f, 0.40f, 0.00f, 0.71f);
-  style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.00f, 0.60f, 0.26f, 0.80f);
-  style.Colors[ImGuiCol_HeaderActive] = ImVec4(0.00f, 0.75f, 0.00f, 0.80f);
-  style.Colors[ImGuiCol_Separator] = ImVec4(0.00f, 0.35f, 0.00f, 1.00f);
-  style.Colors[ImGuiCol_SeparatorHovered] = ImVec4(0.36f, 0.89f, 0.38f, 1.00f);
-  style.Colors[ImGuiCol_SeparatorActive] = ImVec4(0.13f, 0.50f, 0.11f, 1.00f);
-  style.Colors[ImGuiCol_ResizeGrip] = ImVec4(1.00f, 1.00f, 1.00f, 0.30f);
-  style.Colors[ImGuiCol_ResizeGripHovered] = ImVec4(1.00f, 1.00f, 1.00f, 0.60f);
-  style.Colors[ImGuiCol_ResizeGripActive] = ImVec4(1.00f, 1.00f, 1.00f, 0.90f);
+  style.Colors[ImGuiCol_FrameBg] = ImVec4(0.12f, 0.10f, 0.08f, 0.85f);
+  style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.24f, 0.15f, 0.07f, 0.90f);
+  style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.36f, 0.20f, 0.07f, 0.95f);
+  style.Colors[ImGuiCol_TitleBg] = ImVec4(0.10f, 0.08f, 0.06f, 1.00f);
+  style.Colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.08f, 0.06f, 0.05f, 1.00f);
+  style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.26f, 0.15f, 0.06f, 1.00f);
+  style.Colors[ImGuiCol_MenuBarBg] = ImVec4(0.10f, 0.08f, 0.06f, 1.00f);
+  style.Colors[ImGuiCol_ScrollbarBg] = ImVec4(0.05f, 0.04f, 0.03f, 0.60f);
+  style.Colors[ImGuiCol_ScrollbarGrab] = bronze_soft;
+  style.Colors[ImGuiCol_ScrollbarGrabHovered] = kBronze;
+  style.Colors[ImGuiCol_ScrollbarGrabActive] = kEmber;
+  style.Colors[ImGuiCol_PopupBg] = ImVec4(0.07f, 0.06f, 0.05f, 0.98f);
+  style.Colors[ImGuiCol_CheckMark] = kEmber;
+  style.Colors[ImGuiCol_SliderGrab] = kBronze;
+  style.Colors[ImGuiCol_SliderGrabActive] = kEmber;
+  style.Colors[ImGuiCol_Button] = ImVec4(0.14f, 0.11f, 0.08f, 0.92f);
+  style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.42f, 0.23f, 0.07f, 0.95f);
+  style.Colors[ImGuiCol_ButtonActive] = kEmberDeep;
+  style.Colors[ImGuiCol_Header] = ImVec4(0.30f, 0.18f, 0.07f, 0.70f);
+  style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.45f, 0.25f, 0.08f, 0.85f);
+  style.Colors[ImGuiCol_HeaderActive] = kEmberDeep;
+  style.Colors[ImGuiCol_Separator] = bronze_soft;
+  style.Colors[ImGuiCol_SeparatorHovered] = kBronze;
+  style.Colors[ImGuiCol_SeparatorActive] = kEmber;
+  style.Colors[ImGuiCol_ResizeGrip] = bronze_soft;
+  style.Colors[ImGuiCol_ResizeGripHovered] = kBronze;
+  style.Colors[ImGuiCol_ResizeGripActive] = kEmber;
   style.Colors[ImGuiCol_Tab] = style.Colors[ImGuiCol_Button];
   style.Colors[ImGuiCol_TabHovered] = style.Colors[ImGuiCol_ButtonHovered];
   style.Colors[ImGuiCol_TabActive] = style.Colors[ImGuiCol_ButtonActive];
   style.Colors[ImGuiCol_TabUnfocused] = style.Colors[ImGuiCol_FrameBg];
   style.Colors[ImGuiCol_TabUnfocusedActive] = style.Colors[ImGuiCol_FrameBgHovered];
-  style.Colors[ImGuiCol_PlotLines] = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
-  style.Colors[ImGuiCol_PlotLinesHovered] = ImVec4(0.90f, 0.70f, 0.00f, 1.00f);
-  style.Colors[ImGuiCol_PlotHistogram] = ImVec4(0.90f, 0.70f, 0.00f, 1.00f);
-  style.Colors[ImGuiCol_PlotHistogramHovered] = ImVec4(1.00f, 0.60f, 0.00f, 1.00f);
-  style.Colors[ImGuiCol_TextSelectedBg] = ImVec4(0.00f, 1.00f, 0.00f, 0.21f);
-  style.Colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.20f, 0.20f, 0.20f, 0.35f);
+  style.Colors[ImGuiCol_PlotLines] = kParchment;
+  style.Colors[ImGuiCol_PlotLinesHovered] = kEmber;
+  style.Colors[ImGuiCol_PlotHistogram] = kEmber;
+  style.Colors[ImGuiCol_PlotHistogramHovered] = ImVec4(1.00f, 0.66f, 0.25f, 1.00f);
+  style.Colors[ImGuiCol_TextSelectedBg] = ember_soft;
+  style.Colors[ImGuiCol_NavCursor] = kEmber;
+  style.Colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.45f);
 }
 
 }  // namespace
@@ -205,6 +216,16 @@ void ImGuiDrawer::Initialize() {
   };
   io.Fonts->AddFontFromMemoryCompressedBase85TTF(kProggyTinyCompressedDataBase85, 10.0f,
                                                  &font_config, font_glyph_ranges);
+  // v109: Cinzel for the titles of the port's windows (rex/ui/souls_style.h); the default font stays Proggy.
+  {
+    ImFontConfig cinzel_config;
+    cinzel_config.FontDataOwnedByAtlas = false;
+    cinzel_config.OversampleH = 2;
+    cinzel_config.OversampleV = 1;
+    rex::ui::souls::TitleFont() =
+        io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(kCinzelTtf), int(sizeof(kCinzelTtf)),
+                                       rex::ui::souls::kTitleFontSize, &cinzel_config, font_glyph_ranges);
+  }
 
 #if REX_PLATFORM_WIN32
   // TODO(benvanik): jp font on other platforms?

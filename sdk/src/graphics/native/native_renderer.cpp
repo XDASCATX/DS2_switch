@@ -184,6 +184,9 @@ REXCVAR_DEFINE_INT32(ds2_fps_cap, 0, "GPU",
 REXCVAR_DEFINE_DOUBLE(ds2_render_scale, 1.0, "GPU",
                       "v107: internal resolution of the scene (1 = 720p, 0.75 = 540p); chosen on the start screen "
                       "when ds2_resolution_prompt is on");
+REXCVAR_DEFINE_BOOL(ds2_native_convert_written_rows, true, "GPU",
+                    "v109: an EDRAM range taken over by another format converts only the rows written since the "
+                    "previous owner took it (bottom strip of the screen blurred by depth of field before)");
 REXCVAR_DEFINE_BOOL(ds2_native_dynamic_textures, true, "GPU",
                     "RC86: a texture whose content changed is checked every frame for 120 frames (videos)");
 REXCVAR_DEFINE_BOOL(ds2_native_fast_registers, true, "GPU",
@@ -565,6 +568,14 @@ struct NativeImage {
   uint32_t samples = 1;      // RC71: 4 for the host MSAA copies of 4x render targets
   uint64_t write_id = 0;     // v106: changes on every GPU write recorded into this image (0 = unknown)
   bool scaled = false;       // v107: a render target at the reduced internal resolution (ds2_render_scale)
+  // v109: EDRAM ownership. Rows written since this image last became the owner of its EDRAM range (draws, clears,
+  // conversions, 4x exports): when another format of the same range takes over, only these rows are converted,
+  // so rows the new owner kept from before stay as they are (DS2 clears a 640x360 / 320x180 target with a 4x depth
+  // clear of the top 352 / 176 rows and a 1x color clear of the rest; converting the whole depth image put stale
+  // depth in the bottom rows: the blurred strip at the bottom of the screen, through depth of field).
+  uint32_t epoch_rows = 0;
+  bool owned_before = false;
+  void Wrote(uint32_t bottom) { epoch_rows = std::max(epoch_rows, std::min(bottom, height)); }
   bool initialized = false;  // transitioned to GENERAL
 };
 
@@ -2093,6 +2104,7 @@ void NativeCommandProcessor::AdoptRenderTarget(uint32_t base, uint32_t pitch, ui
   auto it = edram_owner_.find(area);
   if (it == edram_owner_.end()) {
     edram_owner_.emplace(area, key);
+    img.owned_before = true;
     return;
   }
   if (it->second == key) return;
@@ -2116,11 +2128,21 @@ void NativeCommandProcessor::AdoptRenderTarget(uint32_t base, uint32_t pitch, ui
              F(new_format) == F::k_2_10_10_10_FLOAT) {
     mode = kConvertUnorm10ToFloat7e3;
   }
-  if (mode == kConvertModeCount) return;
+  const bool first_time = !img.owned_before;
+  img.owned_before = true;
+  if (mode == kConvertModeCount) {
+    img.epoch_rows = img.height;  // not converted: as before v109, a later conversion takes the whole image
+    return;
+  }
   // RC71: the conversion reads the owner's sample-space image and writes this one.
   ExportMsaaShadow(owner, true);
   ExportMsaaShadow(img, true);
-  const VkRect2D rect = {{0, 0}, {std::min(owner.width, img.width), std::min(owner.height, img.height)}};
+  // v109: only the rows the owner wrote (or received) while it owned the range; all of them for a new image.
+  uint32_t rows = std::min(owner.height, img.height);
+  if (!first_time && REXCVAR_GET(ds2_native_convert_written_rows)) rows = std::min(rows, owner.epoch_rows);
+  img.epoch_rows = 0;
+  if (!rows) return;
+  const VkRect2D rect = {{0, 0}, {std::min(owner.width, img.width), rows}};
   if (Tracing() && mode == kConvertDepthToRgba8) {
     REXGPU_INFO("[native trace]   convert depth->8888 at {}: before depth {:08X} stencil {:02X} color {:08X}", base,
                 ReadPixel(owner, 100, 100, VK_IMAGE_ASPECT_DEPTH_BIT),
@@ -2129,6 +2151,7 @@ void NativeCommandProcessor::AdoptRenderTarget(uint32_t base, uint32_t pitch, ui
   }
   Convert(mode, owner, img, 0, 0, rect,
           owner_depth && xenos::DepthRenderTargetFormat(owner_format) == xenos::DepthRenderTargetFormat::kD24FS8);
+  img.epoch_rows = rows;
   if (Tracing() && mode == kConvertDepthToRgba8) {
     REXGPU_INFO("[native trace]   convert depth->8888 at {}: after color {:08X}", base,
                 ReadPixel(img, 100, 100, VK_IMAGE_ASPECT_COLOR_BIT));
@@ -2336,6 +2359,7 @@ bool NativeCommandProcessor::Convert(ConvertMode mode, NativeImage& src, NativeI
                                      int32_t src_y, const VkRect2D& dst_rect, bool src_float24,
                                      int32_t resolve_exp_bias) {
   Written(dst);
+  dst.Wrote(uint32_t(dst_rect.offset.y) + dst_rect.extent.height);
   if (!convert_vs_ || !convert_fs_[mode] || !dst_rect.extent.width || !dst_rect.extent.height) return false;
   const VkDevice dev = vulkan_device_->device();
   VkFormat dst_format = dst.format;
@@ -2658,6 +2682,7 @@ bool NativeCommandProcessor::MsaaTransfer(NativeImage& rt, NativeImage& ms, bool
   NativeImage& dst = to_ms ? ms : rt;
   NativeImage& src = to_ms ? rt : ms;
   Written(dst);
+  dst.Wrote(rows ? rows : dst.height);
   const VkDevice dev = vulkan_device_->device();
   const VkFormat format = dst.format;
   const uint32_t samples = to_ms ? 4 : 1;
@@ -2920,6 +2945,7 @@ bool NativeCommandProcessor::DownsampleDepth(NativeImage& src, NativeImage& dst,
 
 bool NativeCommandProcessor::CompositeHalfRes(NativeImage& rt, NativeImage& half, const VkRect2D& rect) {
   Written(rt);
+  rt.Wrote(uint32_t(rect.offset.y) + rect.extent.height);
   const VkDevice dev = vulkan_device_->device();
   VkFormat format = rt.format;
   const bool msaa = rt.samples == 4;
@@ -5046,6 +5072,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   uint32_t fetch_constants[6 * 32];
   std::memcpy(fetch_constants, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(fetch_constants));
   float rect_first_z = std::numeric_limits<float>::quiet_NaN();
+  float rect_max_y = std::numeric_limits<float>::quiet_NaN();  // v109: lowest row of a rectangle (window coords)
   for (const auto& binding : vs->vertex_bindings()) {
     const uint32_t fc = binding.fetch_constant;
     xenos::xe_gpu_vertex_fetch_t vf;
@@ -5055,6 +5082,13 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (prim_type == xenos::PrimitiveType::kRectangleList && std::isnan(rect_first_z) && size >= 12) {
       if (const uint32_t* vtx = memory_->TranslatePhysical<const uint32_t*>(address)) {
         rect_first_z = xenos::GpuSwap(rex::memory::Reinterpret<float>(vtx[2]), vf.endian);
+        const uint32_t stride_words = std::max<uint32_t>(binding.stride_words, 3);
+        if (size >= (2 * stride_words + 2) * 4) {
+          for (uint32_t v = 0; v < 3; ++v) {
+            const float y = xenos::GpuSwap(rex::memory::Reinterpret<float>(vtx[v * stride_words + 1]), vf.endian);
+            if (std::isnan(rect_max_y) || y > rect_max_y) rect_max_y = y;
+          }
+        }
       }
     }
     if (Tracing()) {
@@ -5755,6 +5789,25 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   sr.extent.width = std::min(scissor.extent[0], rt_width - uint32_t(sr.offset.x));
   sr.extent.height = std::min(scissor.extent[1], rt_height - uint32_t(sr.offset.y));
   if (probe_active_ == 1) sr.extent = {0, 0};  // RC90 probe: no fragments
+  {
+    // v109: the rows this draw can write (EDRAM ownership, see NativeImage::epoch_rows).
+    uint32_t bottom = uint32_t(sr.offset.y) + sr.extent.height;
+    const float vp_bottom = vp.y + vp.height;
+    if (vp_bottom > 0.0f) bottom = std::min(bottom, uint32_t(std::ceil(vp_bottom)));
+    const uint32_t vte = regs[XE_GPU_REG_PA_CL_VTE_CNTL];
+    if (prim_type == xenos::PrimitiveType::kRectangleList && !std::isnan(rect_max_y) && !(vte & 0xC) &&
+        !regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
+      // Window coordinates (no y scale or offset): the rectangle's own extent.
+      float y = (rect_max_y + 0.5f) * float(sy);
+      if (draw_scaled) y *= res_scale_;
+      if (halfres_draw_) y /= float(halfres_divisor_);
+      bottom = std::min(bottom, uint32_t(std::max(std::ceil(y), 0.0f)));
+    }
+    for (uint32_t i = 0; i < color_count; ++i) {
+      if ((write_mask >> (4 * i)) & 0xF) color_rts[i]->Wrote(bottom);
+    }
+    if (depth_rt && (depth_control.z_write_enable || depth_control.stencil_enable)) depth_rt->Wrote(bottom);
+  }
   if (!filter || std::memcmp(&ds.scissor, &sr, sizeof(sr))) {
     dfn().vkCmdSetScissor(cmd, 0, 1, &sr);
     ds.scissor = sr;
@@ -5873,6 +5926,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 bool NativeCommandProcessor::ClearRect(NativeImage& rt, const VkClearValue& value, const VkRect2D& rect,
                                        bool depth_only) {
   Written(rt);
+  rt.Wrote(uint32_t(rect.offset.y) + rect.extent.height);
   // A one-attachment render pass on the target and vkCmdClearAttachments for the rectangle.
   VkFormat color_format = rt.format;
   VkRenderPass pass = rt.depth ? GetRenderPass(nullptr, 0, rt.format) : GetRenderPass(&color_format, 1,

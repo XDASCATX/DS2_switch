@@ -12,6 +12,7 @@
 #include <rex/system/xcontent.h>
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
+#include <rex/ui/souls_style.h>
 
 #include <imgui.h>
 
@@ -180,6 +181,7 @@ class InstallDialog final : public rex::ui::ImGuiDialog {
 
  protected:
   void OnDraw(ImGuiIO& io) override {
+    namespace souls = rex::ui::souls;
     auto& progress = rex::system::xam::install_progress();
     const uint64_t total = progress.bytes_total.load(std::memory_order_relaxed);
     if (!total) return;
@@ -188,21 +190,33 @@ class InstallDialog final : public rex::ui::ImGuiDialog {
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always,
                             ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x * 0.6f, 0.0f), ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.85f);
-    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
-                                   ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs;
+    souls::PushWindowStyle();
+    const ImGuiWindowFlags flags = souls::kWindowFlags | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+                                   ImGuiWindowFlags_NoInputs;
     if (ImGui::Begin("##ds2_install", nullptr, flags)) {
-      ImGui::SetWindowFontScale(2.0f);
-      ImGui::Text("Installing game data %u/%u", g_package_index.load(std::memory_order_relaxed),
-                  g_package_count.load(std::memory_order_relaxed));
+      souls::DrawFrame();
+      // v109: Dark Souls look (rex/ui/souls_style.h).
+      souls::CenteredTitle("Installing Game Data", 1.0f, souls::kParchment);
+      char line[64];
+      std::snprintf(line, sizeof(line), "Package %u of %u", g_package_index.load(std::memory_order_relaxed),
+                    g_package_count.load(std::memory_order_relaxed));
+      souls::CenteredTitle(line, 0.6f, souls::kAsh);
+      souls::Divider();
       char label[32];
       std::snprintf(label, sizeof(label), "%.1f%%", double(fraction) * 100.0);
+      ImGui::PushStyleColor(ImGuiCol_PlotHistogram, souls::kEmber);
+      ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.10f, 0.08f, 0.06f, 1.0f));
+      ImGui::PushStyleColor(ImGuiCol_Border, souls::kBronze);
+      ImGui::PushStyleColor(ImGuiCol_Text, souls::kParchment);
+      ImGui::SetWindowFontScale(2.0f);
       ImGui::ProgressBar(fraction, ImVec2(-1.0f, 0.0f), label);
-      ImGui::SetWindowFontScale(1.4f);
-      ImGui::Text("%.1f / %.1f MB", double(done) / 1048576.0, double(total) / 1048576.0);
+      ImGui::SetWindowFontScale(1.0f);
+      ImGui::PopStyleColor(4);
+      std::snprintf(line, sizeof(line), "%.1f / %.1f MB", double(done) / 1048576.0, double(total) / 1048576.0);
+      souls::CenteredTitle(line, 0.55f, souls::kAsh);
     }
     ImGui::End();
+    souls::PopWindowStyle();
   }
 };
 
@@ -218,24 +232,31 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
 
  protected:
   void OnDraw(ImGuiIO& io) override {
+    namespace souls = rex::ui::souls;
     if (chosen_) return;
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always,
                             ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowBgAlpha(0.9f);
     if (first_frame_) ImGui::SetNextWindowFocus();
-    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize;
-    if (ImGui::Begin("##ds2_resolution", nullptr, flags)) {
-      ImGui::SetWindowFontScale(2.0f);
-      ImGui::TextUnformatted("Resolution");
-      ImGui::SetWindowFontScale(1.6f);
+    souls::PushWindowStyle();
+    if (ImGui::Begin("##ds2_resolution", nullptr, souls::kWindowFlags | ImGuiWindowFlags_AlwaysAutoResize)) {
+      souls::DrawFrame();
+      // v109: Dark Souls look (rex/ui/souls_style.h).
+      souls::CenteredTitle("Choose Resolution", 1.0f, souls::kParchment);
+      souls::Divider();
       const ImVec2 size(io.DisplaySize.x * 0.24f, io.DisplaySize.y * 0.2f);
+      ImGui::PushStyleColor(ImGuiCol_Border, souls::kBronze);
+      ImGui::PushStyleColor(ImGuiCol_Text, souls::kParchment);
+      ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.5f);
       if (first_frame_) ImGui::SetKeyboardFocusHere();
       double choice = 0.0;
-      if (ImGui::Button("720p\nNative, sharp", size)) choice = 1.0;
+      if (Choice("##720", "720p", "Native, sharp", size)) choice = 1.0;
       ImGui::SetItemDefaultFocus();
-      ImGui::SameLine();
-      if (ImGui::Button("540p\nMore FPS, softer", size)) choice = 0.75;
+      ImGui::SameLine(0.0f, 24.0f);
+      if (Choice("##540", "540p", "More FPS, softer", size)) choice = 0.75;
+      ImGui::PopStyleVar();
+      ImGui::PopStyleColor(2);
+      ImGui::Dummy(ImVec2(0.0f, 4.0f));
+      souls::CenteredTitle("Select with the D-pad and A", 0.5f, souls::kAsh);
       first_frame_ = false;
       if (choice > 0.0) {
         chosen_ = true;
@@ -243,6 +264,31 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       }
     }
     ImGui::End();
+    souls::PopWindowStyle();
+  }
+
+  // A button with the resolution in the title font and a short line under it.
+  static bool Choice(const char* id, const char* title, const char* note, ImVec2 size) {
+    namespace souls = rex::ui::souls;
+    const bool pressed = ImGui::Button(id, size);
+    const bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused();
+    const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    souls::PushTitleFont(1.3f);
+    ImVec2 t = ImGui::CalcTextSize(title);
+    const float cx = (a.x + b.x) * 0.5f;
+    const float ty = a.y + (b.y - a.y) * 0.30f - t.y * 0.5f;
+    dl->AddText(ImVec2(cx - t.x * 0.5f, ty), souls::Col(hot ? souls::kEmber : souls::kParchment), title);
+    souls::PopTitleFont();
+    souls::PushTitleFont(0.55f);
+    const ImVec2 n = ImGui::CalcTextSize(note);
+    dl->AddText(ImVec2(cx - n.x * 0.5f, a.y + (b.y - a.y) * 0.72f - n.y * 0.5f), souls::Col(souls::kAsh), note);
+    souls::PopTitleFont();
+    if (hot) {
+      souls::Diamond(dl, ImVec2(a.x, (a.y + b.y) * 0.5f), 6.0f, souls::Col(souls::kEmber));
+      souls::Diamond(dl, ImVec2(b.x, (a.y + b.y) * 0.5f), 6.0f, souls::Col(souls::kEmber));
+    }
+    return pressed;
   }
 
  private:
