@@ -4709,7 +4709,9 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // v109: the lowest pixel row of a rectangle-list draw in window coordinates (clears), NaN otherwise; bounds the
   // rows a draw writes (EDRAM ownership, NativeImage::epoch_rows; v110: also the rows of a 4x copy to export).
   float rect_max_y = std::numeric_limits<float>::quiet_NaN();
-  if (prim_type == xenos::PrimitiveType::kRectangleList && !(regs[XE_GPU_REG_PA_CL_VTE_CNTL] & 0xC) &&
+  // v111: one rectangle only (3 vertices, not indexed); a list of several (UI, sprites) is bounded by the scissor.
+  if (prim_type == xenos::PrimitiveType::kRectangleList && index_count == 3 && !index_buffer_info &&
+      !(regs[XE_GPU_REG_PA_CL_VTE_CNTL] & 0xC) &&
       !regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable && !vs->vertex_bindings().empty()) {
     const auto& binding = vs->vertex_bindings().front();
     xenos::xe_gpu_vertex_fetch_t vf;
@@ -4831,7 +4833,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (host_msaa) {
       rt_width = rt_height = UINT32_MAX;
       uint32_t drawn_rows = scissor_pixels.offset[1] + scissor_pixels.extent[1];
-      if (!std::isnan(rect_max_y)) {
+      if (!std::isnan(rect_max_y) && REXCVAR_GET(ds2_native_convert_written_rows)) {
         // v110: a clear rectangle: only its rows (pixel space of the 4x copy).
         float y = rect_max_y + 0.5f;
         if (draw_scaled) y *= res_scale_;
