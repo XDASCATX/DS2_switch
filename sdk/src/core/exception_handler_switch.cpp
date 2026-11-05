@@ -78,6 +78,7 @@
 #include <cstring>
 #include <utility>
 
+#include <rex/cvar.h>
 #include <rex/exception_handler.h>
 
 #include <switch.h>
@@ -505,6 +506,10 @@ extern "C" void RexSwitchCrashLog(const char* reason, const ThreadExceptionDump*
   busy.clear();
 }
 
+REXCVAR_DEFINE_BOOL(guest_fault_recovery, true, "Memory",
+                    "v105: a game load/store on uncommitted guest memory reads 0 / is discarded instead of "
+                    "ending the game (2345-0102); the first ones are logged in rex_crash.log");
+
 namespace rex::arch {
 
 static_assert(sizeof(vec128_t) == 16, "vec128_t ya no mide 16 bytes");
@@ -745,6 +750,33 @@ void WriteBack(const Exception& ex, const HostThreadContext& tc, ThreadException
   if (RexSwitchSehHandleFault(ctx)) {
     RexSwitchPerfCount(4);
     RexResumeFromException(ctx);
+  }
+
+  // --- 3b. v105: stray guest access, recovered ------------------------------
+  //
+  // A load or store of the recompiled game that lands on guest memory nobody committed (a bad pointer
+  // of the game: in v104 three of seven crash reports, in UI transitions - bonfire travel menu, death
+  // screen - inside sub_82F37B60, a UI stack pop). On the 360 it would not happen; here it ended the
+  // game. The access is emulated against zeros (a load reads 0, a store is discarded) and the game
+  // goes on; the first ones are written to rex_crash.log as "recuperado" to find the cause.
+  if (data_abort && in_window && REXCVAR_GET(guest_fault_recovery)) {
+    const uint32_t insn = *reinterpret_cast<const uint32_t*>(pc);
+    RexAccess acc;
+    if (RexDecodeAccess(ctx, insn, &acc)) {
+      alignas(16) static uint8_t zeros[64];
+      alignas(16) static uint8_t sink[64];
+      std::memset(zeros, 0, sizeof(zeros));
+      RexEmulateAccess(ctx, &acc, acc.kind == REX_ACC_LOAD ? zeros : sink);
+      ctx->pc.x += 4;
+      static std::atomic<uint32_t> recovered{0};
+      if (recovered.fetch_add(1, std::memory_order_relaxed) < 8) {
+        RexSwitchCrashLog(is_write ? "acceso invalido del juego recuperado (escritura descartada)"
+                                   : "acceso invalido del juego recuperado (lectura = 0)",
+                          ctx, ctx->sp.x, pc);
+      }
+      RexSwitchPerfCount(82);  // v105: stray guest accesses recovered
+      RexResumeFromException(ctx);
+    }
   }
 
   // --- 4. fatal --------------------------------------------------------------

@@ -168,6 +168,12 @@ REXCVAR_DEFINE_INT32(ds2_native_halfres_divisor, 2, "GPU",
                      "RC84: resolution divisor of the reduced-resolution particles (2 = half, 4 = quarter)");
 REXCVAR_DEFINE_INT32(ds2_native_halfres_vpos_const, 215, "GPU",
                      "RC82: pixel shader float constant whose zw scale the pixel position (doubled for half resolution)");
+REXCVAR_DEFINE_BOOL(ds2_native_halfres_msaa, true, "GPU",
+                    "v105: reduced-resolution particles also in host 4x MSAA passes (the main scene: fog and smoke "
+                    "drawn there cost up to 27 ms at full resolution); composited into the 4x copy");
+REXCVAR_DEFINE_BOOL(ds2_native_halfres_alpha_over, true, "GPU",
+                    "v105: reduced-resolution particles also accept blend 07060706 (alpha = src_a * src_a + ...); "
+                    "the copy keeps what remains of the scene in alpha, as for 07000706");
 REXCVAR_DEFINE_BOOL(ds2_native_dynamic_textures, true, "GPU",
                     "RC86: a texture whose content changed is checked every frame for 120 frames (videos)");
 REXCVAR_DEFINE_BOOL(ds2_native_fast_registers, true, "GPU",
@@ -1096,6 +1102,7 @@ class NativeCommandProcessor final : public CommandProcessor {
   };
   std::unordered_map<VkImage, HalfResTarget> halfres_targets_;
   VkPipeline halfres_composite_pipeline_ = VK_NULL_HANDLE;
+  VkPipeline halfres_composite_pipeline_msaa_ = VK_NULL_HANDLE;  // v105: into a host 4x MSAA copy
   VkShaderModule halfres_composite_fs_ = VK_NULL_HANDLE;
   VkSampler linear_sampler_ = VK_NULL_HANDLE;
   bool halfres_draw_ = false;
@@ -1476,6 +1483,7 @@ void NativeCommandProcessor::ShutdownContext() {
   for (auto& [k, h] : halfres_depth_targets_) DestroyImage(h.image, false);
   halfres_depth_targets_.clear();
   if (halfres_composite_pipeline_) dfn().vkDestroyPipeline(dev, halfres_composite_pipeline_, nullptr);
+  if (halfres_composite_pipeline_msaa_) dfn().vkDestroyPipeline(dev, halfres_composite_pipeline_msaa_, nullptr);
   if (halfres_composite_fs_) dfn().vkDestroyShaderModule(dev, halfres_composite_fs_, nullptr);
   if (linear_sampler_) dfn().vkDestroySampler(dev, linear_sampler_, nullptr);
   for (uint32_t i = 0; i < 2; ++i) {
@@ -1993,6 +2001,7 @@ NativeImage* NativeCommandProcessor::GetRenderTarget(uint32_t base, uint32_t pit
     // Taller than before: recreate (the old contents are lost - logged, rare).
     REXGPU_WARN("[native] render target {}@{} grows {} -> {} rows", format, base, it->second.height, height);
     EndRenderPass();
+    FlushHalfRes();  // v105: the pending composite may target this image or its 4x copy
     auto sit = msaa_shadows_.find(it->second.image);
     if (sit != msaa_shadows_.end()) {
       DestroyImage(sit->second.image, true);
@@ -2858,15 +2867,17 @@ bool NativeCommandProcessor::DownsampleDepth(NativeImage& src, NativeImage& dst,
 bool NativeCommandProcessor::CompositeHalfRes(NativeImage& rt, NativeImage& half, const VkRect2D& rect) {
   const VkDevice dev = vulkan_device_->device();
   VkFormat format = rt.format;
-  VkRenderPass pass = GetRenderPass(&format, 1, VK_FORMAT_UNDEFINED, 1);
+  const bool msaa = rt.samples == 4;
+  VkRenderPass pass = GetRenderPass(&format, 1, VK_FORMAT_UNDEFINED, msaa ? 4 : 1);
   if (!pass) return false;
+  VkPipeline& composite_pipeline = msaa ? halfres_composite_pipeline_msaa_ : halfres_composite_pipeline_;
   if (!linear_sampler_) {
     VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     if (dfn().vkCreateSampler(dev, &sci, nullptr, &linear_sampler_) != VK_SUCCESS) return false;
   }
-  if (!halfres_composite_pipeline_) {
+  if (!composite_pipeline) {
     static const char* kFs = R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D t;
 layout(push_constant) uniform P { vec2 inv_size; float scale; } pc;
@@ -2883,7 +2894,9 @@ void main() {
       REXGPU_ERROR("[native] half-resolution composite shader: {}", error);
       return false;
     }
-    halfres_composite_fs_ = ui::vulkan::util::CreateShaderModule(vulkan_device_, spirv.data(), spirv.size() * 4);
+    if (!halfres_composite_fs_) {
+      halfres_composite_fs_ = ui::vulkan::util::CreateShaderModule(vulkan_device_, spirv.data(), spirv.size() * 4);
+    }
     VkPipelineShaderStageCreateInfo stages[2] = {};
     stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -2902,7 +2915,7 @@ void main() {
     rs.cullMode = VK_CULL_MODE_NONE;
     rs.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo msi = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    msi.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    msi.rasterizationSamples = msaa ? VK_SAMPLE_COUNT_4_BIT : VK_SAMPLE_COUNT_1_BIT;
     VkPipelineColorBlendAttachmentState ba = {};
     ba.blendEnable = VK_TRUE;
     ba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
@@ -2931,9 +2944,8 @@ void main() {
     ci.pDynamicState = &dy;
     ci.layout = convert_layout_[0];
     ci.renderPass = pass;
-    if (dfn().vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &ci, nullptr, &halfres_composite_pipeline_) !=
-        VK_SUCCESS) {
-      halfres_composite_pipeline_ = VK_NULL_HANDLE;
+    if (dfn().vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &ci, nullptr, &composite_pipeline) != VK_SUCCESS) {
+      composite_pipeline = VK_NULL_HANDLE;
       return false;
     }
   }
@@ -2985,7 +2997,7 @@ void main() {
   dfn().vkCmdSetScissor(cmd, 0, 1, &rect);
   const float pc[4] = {1.0f / float(rt.width), 1.0f / float(rt.height),
                        float(std::clamp(REXCVAR_GET(ds2_native_halfres_strength), 0.0, 4.0)), 0.0f};
-  dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, halfres_composite_pipeline_);
+  dfn().vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, composite_pipeline);
   dfn().vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, convert_layout_[0], 0, 1, &set, 0, nullptr);
   dfn().vkCmdPushConstants(cmd, convert_layout_[0], VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), pc);
   dfn().vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -3090,6 +3102,8 @@ void NativeCommandProcessor::ExportMsaaShadow(NativeImage& rt, bool invalidate) 
   auto it = msaa_shadows_.find(rt.image);
   if (it == msaa_shadows_.end()) return;
   MsaaShadow& sh = it->second;
+  // v105: reduced-resolution particles pending for this 4x copy are composited into it first.
+  if (halfres_pending_rt_ == &sh.image) FlushHalfRes();
   if (sh.newer) {
     MsaaTransfer(rt, sh.image, false, sh.dirty_rows ? sh.dirty_rows * 2 : 0);
     sh.newer = false;
@@ -4704,7 +4718,9 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     const uint32_t b = blend[0];
     const uint32_t csrc = b & 0x1Fu, ccomb = (b >> 5) & 7u, cdst = (b >> 8) & 0x1Fu;
     const uint32_t asrc = (b >> 16) & 0x1Fu, acomb = (b >> 21) & 7u, adst = (b >> 24) & 0x1Fu;
-    const bool blend_ok = (csrc == 1 || csrc == 6) && ccomb == 0 && (cdst == 1 || cdst == 7) && asrc == 0 &&
+    // v105: 07060706 (alpha source factor = color source factor) too; its alpha source term is dropped in the copy.
+    const bool blend_ok = (csrc == 1 || csrc == 6) && ccomb == 0 && (cdst == 1 || cdst == 7) &&
+                          (asrc == 0 || (asrc == csrc && REXCVAR_GET(ds2_native_halfres_alpha_over))) &&
                           acomb == 0 && adst == cdst;
     const uint32_t d = std::clamp<uint32_t>(uint32_t(std::max(REXCVAR_GET(ds2_native_halfres_divisor), 1)), 1, 8);
     uint32_t mode = ps ? HalfResMode(ps->ucode_data_hash()) : 0;
@@ -4712,7 +4728,10 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     const bool wants_depth = mode == 2 && depth_rt && depth_control.z_enable;
     if (mode == 2 && depth_rt && (depth_control.z_write_enable || depth_control.stencil_enable)) mode = 0;
     if (wants_depth && (depth_rt->width < 2 * d || depth_rt->height < 2 * d)) mode = 0;
-    if (mode && ps && color_count == 1 && !host_msaa && sx == 1 && sy == 1 && !msaa_force_clear_ && d > 1 && blend_ok &&
+    // v105: in a host 4x MSAA pass too (without a reduced depth buffer: that would read the 4x depth copy).
+    const bool msaa_ok = !host_msaa || (!wants_depth && REXCVAR_GET(ds2_native_halfres_msaa) &&
+                                        color_rts[0]->samples == 4);
+    if (mode && ps && color_count == 1 && msaa_ok && sx == 1 && sy == 1 && !msaa_force_clear_ && d > 1 && blend_ok &&
         color_rts[0]->format == VK_FORMAT_R16G16B16A16_SFLOAT && color_rts[0]->width >= 2 * d &&
         color_rts[0]->height >= 2 * d) {
       HalfResTarget& h = halfres_targets_[color_rts[0]->image];
@@ -4782,6 +4801,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           halfres_draw_ = true;
           halfres_divisor_ = d;
           halfres_mode_ = mode;
+          host_msaa = false;  // v105: the reduced copy is single-sampled; the composite writes the 4x copy
         }
       }
     }
@@ -4865,6 +4885,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
   for (uint32_t i = 0; i < color_count; ++i) key.blend[i] = blend[i];
+  // v105: the reduced copy's alpha is what remains of the scene: dst * factor only (07060706 adds src_a * src_a).
+  if (halfres_draw_) key.blend[0] &= ~(0x1Fu << 16);
   key.write_mask = write_mask;
   key.color_count = color_count;
   key.has_ps = ps ? 1 : 0;

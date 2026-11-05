@@ -12,6 +12,7 @@
 #include <thread>
 #include <chrono>
 #include <rex/rex_app.h>
+#include <rex/thread/timer_queue.h>
 
 #include <cstdlib>
 
@@ -499,17 +500,24 @@ void ReXApp::LaunchModule() {
                 const auto now = Clock::now();
                 toast_until = std::max(toast_until, now) + std::chrono::milliseconds(4700);
                 const auto release_at = toast_until + std::chrono::milliseconds(300);
-                std::thread([this, release_at]() {
-                  std::this_thread::sleep_until(release_at);
-                  if (shutting_down_.load(std::memory_order_acquire)) return;
-                  app_context().CallInUIThreadDeferred([this, release_at]() {
-                    if (shutting_down_.load(std::memory_order_acquire)) return;
-                    // A later toast moved the deadline: its own release will do it.
-                    if (Clock::now() + std::chrono::milliseconds(50) < release_at) return;
-                    if (toast_until + std::chrono::milliseconds(300) > release_at) return;
-                    achievement_notification_.reset();
-                  });
-                }).detach();
+                // v105: on the SDK's timer thread. v104 started a std::thread per toast; on the console the
+                // process is at its thread limit, std::thread threw system_error (EAGAIN) and std::terminate
+                // ended the game (2345-0104, 4 of 7 crash reports of v104).
+                const auto wait = release_at - Clock::now();
+                rex::thread::QueueTimerOnce(
+                    [this, release_at](void*) {
+                      if (shutting_down_.load(std::memory_order_acquire)) return;
+                      app_context().CallInUIThreadDeferred([this, release_at]() {
+                        if (shutting_down_.load(std::memory_order_acquire)) return;
+                        // A later toast moved the deadline: its own release will do it.
+                        if (Clock::now() + std::chrono::milliseconds(50) < release_at) return;
+                        if (toast_until + std::chrono::milliseconds(300) > release_at) return;
+                        achievement_notification_.reset();
+                      });
+                    },
+                    nullptr,
+                    rex::thread::TimerQueueWaitItem::clock::now() +
+                        std::chrono::duration_cast<rex::thread::TimerQueueWaitItem::clock::duration>(wait));
               }
             });
           });
