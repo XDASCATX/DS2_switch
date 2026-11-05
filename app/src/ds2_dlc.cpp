@@ -278,6 +278,8 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
   ResolutionDialog(rex::ui::ImGuiDrawer* drawer, std::function<void(const StartPrefs&)> on_choice)
       : ImGuiDialog(drawer), on_choice_(std::move(on_choice)) {
     const StartPrefs saved = LoadStartPrefs();
+    REXLOG_INFO("ds2: start screen: remembered choice {} (scale {:.2f}, {} FPS lock, language {}, sharpening {})",
+                saved.valid ? "found" : "none", saved.scale, saved.fps, saved.language, saved.sharpen);
     toml_language_ = TomlLanguage();
     language_ = (toml_language_ == 1 || OtherLanguageName(toml_language_)) ? toml_language_ : 12;
     if (saved.language == 1 || saved.language == 12 || OtherLanguageName(saved.language)) {
@@ -297,11 +299,18 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
     time_ += io.DeltaTime;
     DrawBackground(io);
     // Countdown: any button or touch stops it.
-    if (counting_) {
-      for (int k = ImGuiKey_GamepadStart; k <= ImGuiKey_GamepadRStickDown; ++k) {
-        if (ImGui::IsKeyDown(ImGuiKey(k))) counting_ = false;
+    // v118: only a new press stops it, after a short grace: the A that launched the port can still be held
+    // when the screen appears (v117 stopped the countdown in its first frame), and stick noise is ignored.
+    if (counting_ && time_ > 0.6f) {
+      for (int k = ImGuiKey_GamepadStart; k <= ImGuiKey_GamepadR3; ++k) {
+        if (ImGui::IsKeyPressed(ImGuiKey(k), false)) counting_ = false;
       }
-      if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) counting_ = false;
+      for (int k = ImGuiKey_GamepadLStickLeft; k <= ImGuiKey_GamepadRStickDown; ++k) {
+        if (ImGui::IsKeyPressed(ImGuiKey(k), false) && ImGui::GetKeyData(ImGuiKey(k))->AnalogValue > 0.5f) {
+          counting_ = false;
+        }
+      }
+      if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) counting_ = false;
     }
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always,
                             ImVec2(0.5f, 0.5f));
@@ -443,7 +452,7 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       dl->AddCircleFilled(ImVec2(x, y), r, souls::Col(ImVec4(1.0f, 0.72f, 0.35f, 1.0f), 0.9f * fade));
     }
     if (DS2_VERSION_STRING[0]) {
-      souls::PushTitleFont(0.5f);
+      souls::PushTitleFont(0.57f);  // v118: larger
       const ImVec2 t = ImGui::CalcTextSize(DS2_VERSION_STRING);
       dl->AddText(ImVec2(d.x - t.x - 18.0f, d.y - t.y - 12.0f), souls::Col(souls::kAsh, 0.8f), DS2_VERSION_STRING);
       souls::PopTitleFont();
@@ -521,6 +530,17 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
     const bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused();
     const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
     ImDrawList* dl = ImGui::GetWindowDrawList();
+    // v118: both cards breathe in ember while the screen waits for a choice; the focused one more strongly.
+    {
+      const float pulse = 0.5f + 0.5f * std::sin(float(ImGui::GetTime()) * 2.4f);
+      const float strength = hot ? 0.55f + 0.45f * pulse : 0.18f + 0.22f * pulse;
+      for (int i = 3; i >= 1; --i) {
+        const float g = float(i) * 3.0f;
+        dl->AddRect(ImVec2(a.x - g, a.y - g), ImVec2(b.x + g, b.y + g),
+                    souls::Col(souls::kEmber, strength * 0.22f / float(i)), 0.0f, 0, 2.0f);
+      }
+      dl->AddRect(a, b, souls::Col(souls::kEmber, strength), 0.0f, 0, hot ? 2.5f : 1.5f);
+    }
     souls::PushTitleFont(1.3f);
     ImVec2 t = ImGui::CalcTextSize(title);
     const float cx = (a.x + b.x) * 0.5f;

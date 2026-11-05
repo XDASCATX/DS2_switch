@@ -187,8 +187,9 @@ REXCVAR_DEFINE_DOUBLE(ds2_render_scale, 1.0, "GPU",
 REXCVAR_DEFINE_BOOL(ds2_native_convert_written_rows, true, "GPU",
                     "v109: an EDRAM range taken over by another format converts only the rows written since the "
                     "previous owner took it (bottom strip of the screen blurred by depth of field before)");
-REXCVAR_DEFINE_BOOL(ds2_fps_lock_vsync, true, "GPU",
-                    "v116: with ds2_fps_cap = 30, present on every other display refresh (swap interval 2)");
+REXCVAR_DEFINE_BOOL(ds2_fps_lock_vsync, false, "GPU",
+                    "v116: with ds2_fps_cap = 30, present on every other display refresh (swap interval 2); v118: "
+                    "off by default (a frame over 33 ms waits for 50 ms: hitches)");
 REXCVAR_DEFINE_BOOL(ds2_sharpen, true, "GPU",
                     "v116: at a reduced internal resolution, upscale to 1280x720 with contrast-adaptive sharpening "
                     "(chosen on the start screen) instead of the presenter's bilinear filter");
