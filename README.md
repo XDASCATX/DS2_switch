@@ -26,6 +26,8 @@ Xbox 360 emulator nor a port of the PC version.**
 ## Status (build v119)
 
 v119 restores the shader pack signature: v116 changed spirv_library.cpp, which is hashed into the translator signature, so v116-v117 rejected the pack and translated every shader at runtime (the stutters). v119 = v118 (countdown that survives the launch press, breathing resolution cards) + spirv_library.cpp/.h byte-identical to v115.
+
+- Playable from the new-game intro through Majula, with multiple bosses and the first DLC area tested.
   Russian or English interface (other disc languages through the emulated region).
 - Approximately **31–40 FPS** (typically ~33) in demanding scenes with the clocks of the supplied configuration
   (CPU 1963 / GPU 1267 / memory 2500 MHz); about **17–29 FPS** at stock clocks. The limits now are the GPU
