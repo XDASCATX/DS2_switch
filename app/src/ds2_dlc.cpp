@@ -227,7 +227,7 @@ std::thread g_install_thread;
 // screen, driven with the controller (D-pad + A) or the touch screen.
 class ResolutionDialog final : public rex::ui::ImGuiDialog {
  public:
-  ResolutionDialog(rex::ui::ImGuiDrawer* drawer, std::function<void(double, int)> on_choice)
+  ResolutionDialog(rex::ui::ImGuiDrawer* drawer, std::function<void(double, int, int)> on_choice)
       : ImGuiDialog(drawer), on_choice_(std::move(on_choice)) {}
 
  protected:
@@ -241,6 +241,15 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
     if (ImGui::Begin("##ds2_resolution", nullptr, souls::kWindowFlags | ImGuiWindowFlags_AlwaysAutoResize)) {
       souls::DrawFrame();
       // v109: Dark Souls look (rex/ui/souls_style.h).
+      // v114: game language at the top left (Russian by default), on the title's row.
+      const float title_y = ImGui::GetCursorPosY();
+      {
+        const ImVec2 lang(io.DisplaySize.x * 0.06f, io.DisplaySize.y * 0.052f);
+        if (Toggle("##rus", "RUS", language_ == 12, lang, 0.6f)) language_ = 12;
+        ImGui::SameLine(0.0f, 8.0f);
+        if (Toggle("##eng", "ENG", language_ == 1, lang, 0.6f)) language_ = 1;
+      }
+      ImGui::SetCursorPosY(title_y);
       souls::CenteredTitle("Choose Resolution", 1.0f, souls::kParchment);
       souls::Divider();
       const ImVec2 size(io.DisplaySize.x * 0.24f, io.DisplaySize.y * 0.2f);
@@ -260,28 +269,30 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       {
         const ImVec2 small(io.DisplaySize.x * 0.075f, io.DisplaySize.y * 0.065f);
         const float row_w = small.x * 2.0f + 12.0f;
-        souls::PushTitleFont(0.55f);
-        const char* label = "Frame Rate";
-        const ImVec2 label_size = ImGui::CalcTextSize(label);
+        // v114: every item of the row placed at the same top (the label centred on the buttons).
+        const float row_y = ImGui::GetCursorPosY();
         const float right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
-        ImGui::SetCursorPosX(right - row_w - label_size.x - 16.0f);
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (small.y - label_size.y) * 0.5f);
+        const float x30 = right - row_w;
+        souls::PushTitleFont(0.55f);
+        const char* label = "Frame Rate Lock";
+        const ImVec2 label_size = ImGui::CalcTextSize(label);
+        ImGui::SetCursorPos(ImVec2(x30 - label_size.x - 16.0f, row_y + (small.y - label_size.y) * 0.5f));
         ImGui::PushStyleColor(ImGuiCol_Text, souls::kAsh);
         ImGui::TextUnformatted(label);
         ImGui::PopStyleColor();
         souls::PopTitleFont();
-        ImGui::SameLine(0.0f, 16.0f);
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() - (small.y - label_size.y) * 0.5f);
+        ImGui::SetCursorPos(ImVec2(x30, row_y));
         if (Toggle("##fps30", "30", fps_ == 30, small)) fps_ = 30;
-        ImGui::SameLine(0.0f, 12.0f);
+        ImGui::SetCursorPos(ImVec2(x30 + small.x + 12.0f, row_y));
         if (Toggle("##fps60", "60", fps_ == 60, small)) fps_ = 60;
+        ImGui::SetCursorPosY(row_y + small.y);
       }
       ImGui::Dummy(ImVec2(0.0f, 4.0f));
-      souls::CenteredTitle("Select with the D-pad and A", 0.5f, souls::kAsh);
+      souls::CenteredTitle("Select with the D-pad and A", 0.62f, souls::kAsh);  // v114: larger, smoother
       first_frame_ = false;
       if (choice > 0.0) {
         chosen_ = true;
-        on_choice_(choice, fps_);
+        on_choice_(choice, fps_, language_);
       }
     }
     ImGui::End();
@@ -289,7 +300,7 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
   }
 
   // v113: a small toggle; the selected one is lit in ember, the other dimmed.
-  static bool Toggle(const char* id, const char* text, bool selected, ImVec2 size) {
+  static bool Toggle(const char* id, const char* text, bool selected, ImVec2 size, float text_scale = 0.8f) {
     namespace souls = rex::ui::souls;
     ImGui::PushStyleColor(ImGuiCol_Button, selected ? ImVec4(0.42f, 0.23f, 0.07f, 0.95f)
                                                     : ImVec4(0.10f, 0.08f, 0.06f, 0.85f));
@@ -299,7 +310,7 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
     const bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused();
     const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    souls::PushTitleFont(0.8f);
+    souls::PushTitleFont(text_scale);
     const ImVec2 t = ImGui::CalcTextSize(text);
     const ImVec4 color = selected ? souls::kParchment : souls::kAsh;
     dl->AddText(ImVec2((a.x + b.x - t.x) * 0.5f, (a.y + b.y - t.y) * 0.5f),
@@ -334,8 +345,9 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
   }
 
  private:
-  std::function<void(double, int)> on_choice_;
-  int fps_ = 60;  // v113: frame rate cap chosen on the start screen
+  std::function<void(double, int, int)> on_choice_;
+  int fps_ = 60;        // v113: frame rate cap chosen on the start screen
+  int language_ = 12;  // v114: game language (user_language): 12 Russian, 1 English
   bool chosen_ = false;
   bool first_frame_ = true;
 };
@@ -350,9 +362,12 @@ void ChooseResolution(rex::ui::ImGuiDrawer* drawer, std::function<void(std::func
     then();
     return;
   }
-  g_resolution_dialog = std::make_unique<ResolutionDialog>(drawer, [post_to_ui, then](double scale, int fps) {
+  g_resolution_dialog = std::make_unique<ResolutionDialog>(drawer, [post_to_ui, then](double scale, int fps, int language) {
     // From inside the dialog's OnDraw: the dialog is destroyed later, on the UI thread, before the game starts.
-    post_to_ui([scale, fps, then]() {
+    post_to_ui([scale, fps, language, then]() {
+      // v114: game language, read by the game through XamGetLanguage after it starts.
+      rex::cvar::SetFlagByName("user_language", language == 1 ? "1" : "12");
+      REXLOG_INFO("ds2: language chosen on the start screen: {}", language == 1 ? "English" : "Russian");
       rex::cvar::SetFlagByName("ds2_render_scale", scale >= 1.0 ? "1.0" : "0.75");
       // v113: frame rate cap (ds2_fps_cap, even frame spacing): 30, or 60.
       rex::cvar::SetFlagByName("ds2_fps_cap", fps == 30 ? "30" : "60");
