@@ -248,6 +248,11 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
         if (Toggle("##rus", "RUS", language_ == 12, lang, 0.6f)) language_ = 12;
         ImGui::SameLine(0.0f, 8.0f);
         if (Toggle("##eng", "ENG", language_ == 1, lang, 0.6f)) language_ = 1;
+        // v115: another language set in ds2.toml (user_language) gets its own button, selected by default.
+        if (const char* other = OtherLanguageName(toml_language_)) {
+          ImGui::SameLine(0.0f, 8.0f);
+          if (Toggle("##toml_lang", other, language_ == toml_language_, lang, 0.6f)) language_ = toml_language_;
+        }
       }
       ImGui::SetCursorPosY(title_y);
       souls::CenteredTitle("Choose Resolution", 1.0f, souls::kParchment);
@@ -347,7 +352,30 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
  private:
   std::function<void(double, int, int)> on_choice_;
   int fps_ = 60;        // v113: frame rate cap chosen on the start screen
-  int language_ = 12;  // v114: game language (user_language): 12 Russian, 1 English
+  // v114: game language (user_language). v115: starts from ds2.toml (Russian when it holds no language of the
+  // European disc).
+  int toml_language_ = TomlLanguage();
+  int language_ = (toml_language_ == 1 || OtherLanguageName(toml_language_)) ? toml_language_ : 12;
+
+  // Xbox 360 language ids of the European disc other than English and Russian.
+  static const char* OtherLanguageName(int id) {
+    switch (id) {
+      case 3: return "DEU";
+      case 4: return "FRA";
+      case 5: return "ESP";
+      case 6: return "ITA";
+      case 9: return "POR";
+      case 11: return "POL";
+      default: return nullptr;
+    }
+  }
+  static int TomlLanguage() {
+    try {
+      return std::stoi(rex::cvar::GetFlagByName("user_language"));
+    } catch (...) {
+      return 12;
+    }
+  }
   bool chosen_ = false;
   bool first_frame_ = true;
 };
@@ -366,8 +394,8 @@ void ChooseResolution(rex::ui::ImGuiDrawer* drawer, std::function<void(std::func
     // From inside the dialog's OnDraw: the dialog is destroyed later, on the UI thread, before the game starts.
     post_to_ui([scale, fps, language, then]() {
       // v114: game language, read by the game through XamGetLanguage after it starts.
-      rex::cvar::SetFlagByName("user_language", language == 1 ? "1" : "12");
-      REXLOG_INFO("ds2: language chosen on the start screen: {}", language == 1 ? "English" : "Russian");
+      rex::cvar::SetFlagByName("user_language", std::to_string(language));
+      REXLOG_INFO("ds2: language chosen on the start screen: {}", language);
       rex::cvar::SetFlagByName("ds2_render_scale", scale >= 1.0 ? "1.0" : "0.75");
       // v113: frame rate cap (ds2_fps_cap, even frame spacing): 30, or 60.
       rex::cvar::SetFlagByName("ds2_fps_cap", fps == 30 ? "30" : "60");

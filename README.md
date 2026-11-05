@@ -9,7 +9,7 @@
 <h1 align="center">DARK SOULS II: Scholar of the First Sin — Nintendo Switch</h1>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/build-v114-1F1F1F?style=for-the-badge" alt="Build v114">
+  <img src="https://img.shields.io/badge/build-v115-1F1F1F?style=for-the-badge" alt="Build v115">
   <img src="https://img.shields.io/badge/static%20recompilation-PPC→ARM64-1F1F1F?style=for-the-badge" alt="Static recompilation">
   <img src="https://img.shields.io/badge/Horizon-libnx-E60012?style=for-the-badge&logo=nintendoswitch&logoColor=white" alt="Horizon libnx">
   <img src="https://img.shields.io/badge/Vulkan-Mesa%20NVK-AC162C?style=for-the-badge&logo=vulkan" alt="Vulkan NVK">
@@ -23,7 +23,7 @@ Xbox 360 emulator nor a port of the PC version.**
 > You need your **own Xbox 360 game files** and Compatibility Pack 4. No game files, generated game code or keys are
 > distributed here.
 
-## Status (build v114)
+## Status (build v115)
 
 - Playable from the new-game intro through Majula, with multiple bosses and the first DLC area tested.
   Russian or English interface (other disc languages through the emulated region).
@@ -94,8 +94,8 @@ guest-memory buffer and NAK compiler tuning.
 sdmc:/switch/ds2/
   ds2.nro
   ds2.toml
-  ds2_shaders_v114.spvlib        # shader library (name set in ds2.toml)
-  ds2_shaders_v114.spvlib.idx
+  ds2_shaders_v115.spvlib        # shader library (name set in ds2.toml)
+  ds2_shaders_v115.spvlib.idx
   game_root/Default.xex          # your Xbox 360 game files, original structure
   game_root/GameData1.bdt, GameData1.bhd, GameData2.bdt, GameData2.bhd, ...
   dlc/<Compatibility Pack 4 STFS file>   # unpacked on first launch
@@ -109,6 +109,12 @@ An NSP forwarder can start `ds2.nro` from the home menu.
 
 > [!NOTE]
 > For English-speaking players: The European multilanguage version supports English. To enable it, change user_language = 12 to user_language = 1 in ds2.toml.
+
+**Start screen:** before the game loads, choose the internal resolution (720p native or 540p for more FPS), the frame
+rate lock (30 or 60) and the language (RUS or ENG, Russian by default). For another language of the European disc set
+`user_language` in `ds2.toml` (3 German, 4 French, 5 Spanish, 6 Italian, 9 Portuguese, 11 Polish): it appears as a third
+button, selected by default. `ds2_resolution_prompt = false` skips the screen and uses `ds2_render_scale`,
+`ds2_fps_cap` and `user_language` from `ds2.toml`.
 
 **Port menus:** hold **L + R + Plus**, then press a D-pad direction: Up = debug overlay, Right = settings,
 Down = log console, Left = achievements.
