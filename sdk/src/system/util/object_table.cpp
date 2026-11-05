@@ -157,38 +157,15 @@ X_STATUS ObjectTable::RetainHandle(X_HANDLE handle) {
   return X_STATUS_SUCCESS;
 }
 
-X_STATUS ObjectTable::ReleaseHandle(X_HANDLE handle) {
-  auto global_lock = global_critical_region_.Acquire();
-
-  ObjectTableEntry* entry = LookupTable(handle);
+namespace {
+// Takes the handle out of the table; the caller holds the global lock. The object loses its last
+// table reference, returned so it can be released once the lock is dropped.
+template <typename Table, typename Entry>
+X_STATUS QuitarHandle(Table* table, Entry* entry, X_HANDLE handle, rex::system::XObject** out_object) {
+  *out_object = nullptr;
   if (!entry) {
     return X_STATUS_INVALID_HANDLE;
   }
-
-  if (--entry->handle_ref_count == 0) {
-    // No more references. Remove it from the table.
-    return RemoveHandle(handle);
-  }
-
-  // FIXME: Return a status code telling the caller it wasn't released
-  // (but not a failure code)
-  return X_STATUS_SUCCESS;
-}
-
-X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
-  X_STATUS result = X_STATUS_SUCCESS;
-
-  handle = TranslateHandle(handle);
-  if (!handle) {
-    return X_STATUS_INVALID_HANDLE;
-  }
-
-  ObjectTableEntry* entry = LookupTable(handle);
-  if (!entry) {
-    return X_STATUS_INVALID_HANDLE;
-  }
-
-  auto global_lock = global_critical_region_.Acquire();
   if (entry->object) {
     auto object = entry->object;
     entry->object = nullptr;
@@ -205,13 +182,67 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
 
     // Remove object name from mapping to prevent naming collision.
     if (!object->name().empty()) {
-      RemoveNameMapping(object->name());
+      table->RemoveNameMapping(object->name());
     }
-    // Release now that the object has been removed from the table.
-    object->Release();
+    *out_object = object;
+  }
+  return X_STATUS_SUCCESS;
+}
+}  // namespace
+
+/*
+ * v120: the last Release() of a closed handle runs after the global lock is dropped.
+ *
+ * Releasing an XFile closes the host file, and closing a file just written on the Switch SD makes the
+ * file system commit it: tens of ms during a save. Done inside the global critical region, which every
+ * handle lookup in every thread also takes, it stopped the whole game (the hitch at each DS2 autosave).
+ * The handle is still removed from the table under the lock; only the object's destruction moves out.
+ * If the caller already holds the region (it is recursive), the release happens under it as before.
+ */
+X_STATUS ObjectTable::ReleaseHandle(X_HANDLE handle) {
+  XObject* to_release = nullptr;
+  X_STATUS result = X_STATUS_SUCCESS;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+
+    ObjectTableEntry* entry = LookupTable(handle);
+    if (!entry) {
+      return X_STATUS_INVALID_HANDLE;
+    }
+
+    if (--entry->handle_ref_count == 0) {
+      // No more references. Remove it from the table.
+      handle = TranslateHandle(handle);
+      if (!handle) {
+        return X_STATUS_INVALID_HANDLE;
+      }
+      result = QuitarHandle(this, LookupTable(handle), handle, &to_release);
+    }
+  }
+  if (to_release) {
+    to_release->Release();
   }
 
-  return X_STATUS_SUCCESS;
+  // FIXME: Return a status code telling the caller it wasn't released
+  // (but not a failure code)
+  return result;
+}
+
+X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
+  XObject* to_release = nullptr;
+  X_STATUS result;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    handle = TranslateHandle(handle);
+    if (!handle) {
+      return X_STATUS_INVALID_HANDLE;
+    }
+    result = QuitarHandle(this, LookupTable(handle), handle, &to_release);
+  }
+  if (to_release) {
+    to_release->Release();
+  }
+  return result;
 }
 
 std::vector<object_ref<XObject>> ObjectTable::GetAllObjects() {

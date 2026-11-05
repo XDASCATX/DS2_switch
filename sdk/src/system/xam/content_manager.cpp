@@ -553,7 +553,7 @@ X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
 
 X_RESULT ContentManager::GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
                                              std::vector<uint8_t>* buffer) {
-  auto global_lock = global_critical_region_.Acquire();
+  // v120: SD work, so not under the global critical region (see ObjectTable::ReleaseHandle).
   auto package_path = ResolvePackagePath(xuid, data);
   auto thumb_path = package_path / kThumbnailFileName;
   if (SafeExists(thumb_path)) {
@@ -573,7 +573,7 @@ X_RESULT ContentManager::GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
 
 X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
                                              std::vector<uint8_t> buffer) {
-  auto global_lock = global_critical_region_.Acquire();
+  // v120: SD work, so not under the global critical region (see ObjectTable::ReleaseHandle).
   auto package_path = ResolvePackagePath(xuid, data);
   SafeCreateDirectories(package_path);
   if (SafeExists(package_path)) {
@@ -589,11 +589,13 @@ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
 }
 
 X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
-  auto global_lock = global_critical_region_.Acquire();
-
-  if (IsContentOpen(data)) {
-    // TODO(Gliniak): Get real error code for this case.
-    return X_ERROR_ACCESS_DENIED;
+  {
+    // v120: only the open-package check under the global critical region, not the SD work.
+    auto global_lock = global_critical_region_.Acquire();
+    if (IsContentOpen(data)) {
+      // TODO(Gliniak): Get real error code for this case.
+      return X_ERROR_ACCESS_DENIED;
+    }
   }
 
   auto package_path = ResolvePackagePath(xuid, data);

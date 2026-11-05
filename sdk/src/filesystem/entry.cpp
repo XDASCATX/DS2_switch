@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <vector>
 
 #include <rex/filesystem.h>
 #include <rex/filesystem/device.h>
@@ -90,17 +91,41 @@ Entry* Entry::IterateChildren(const rex::filesystem::WildcardEngine& engine,
   return nullptr;
 }
 
+/*
+ * v120: no SD work under the global critical region.
+ *
+ * That region is one process-wide mutex: the kernel object table takes it for every handle lookup
+ * (each wait, each event set), and so do the audio and texture code. Creating or deleting a host file
+ * used to happen inside it, and on the Switch a create (fopen "wb" + stat) or an unlink on the SD
+ * takes 10-100 ms while the card is busy with a save. Every other thread stood still meanwhile: the
+ * ~110 ms frame each time DS2 autosaves (v119 log: the frame ends 3 ms after the 95 ms open of
+ * USER_DATA16, which the game overwrites = delete + create). The tree is still only changed under
+ * the lock; only the host call is made outside it.
+ */
+namespace {
+// Entries whose host file is being deleted outside the lock, so that a second Delete of the same entry
+// does not run on a pointer the first one is about to free.
+std::vector<const Entry*> g_borrando;
+}  // namespace
+
 Entry* Entry::CreateEntry(const std::string_view name, uint32_t attributes) {
-  auto global_lock = global_critical_region_.Acquire();
-  if (is_read_only()) {
-    return nullptr;
-  }
-  if (GetChild(name)) {
-    // Already exists.
-    return nullptr;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    if (is_read_only()) {
+      return nullptr;
+    }
+    if (GetChild(name)) {
+      // Already exists.
+      return nullptr;
+    }
   }
   auto entry = CreateEntryInternal(name, attributes);
   if (!entry) {
+    return nullptr;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  if (GetChild(name)) {
+    // Another thread created it meanwhile: same answer as finding it there before.
     return nullptr;
   }
   children_.push_back(std::move(entry));
@@ -110,14 +135,23 @@ Entry* Entry::CreateEntry(const std::string_view name, uint32_t attributes) {
 }
 
 bool Entry::Delete(Entry* entry) {
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    if (is_read_only()) {
+      return false;
+    }
+    if (entry->parent() != this) {
+      return false;
+    }
+    if (std::find(g_borrando.begin(), g_borrando.end(), entry) != g_borrando.end()) {
+      return false;
+    }
+    g_borrando.push_back(entry);
+  }
+  const bool borrado = DeleteEntryInternal(entry);
   auto global_lock = global_critical_region_.Acquire();
-  if (is_read_only()) {
-    return false;
-  }
-  if (entry->parent() != this) {
-    return false;
-  }
-  if (!DeleteEntryInternal(entry)) {
+  g_borrando.erase(std::find(g_borrando.begin(), g_borrando.end(), entry));
+  if (!borrado) {
     return false;
   }
   for (auto it = children_.begin(); it != children_.end(); ++it) {
