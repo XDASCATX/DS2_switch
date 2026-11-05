@@ -575,6 +575,10 @@ struct NativeImage {
   // depth in the bottom rows: the blurred strip at the bottom of the screen, through depth of field).
   uint32_t epoch_rows = 0;
   bool owned_before = false;
+  // v110: rows received by conversion when it took the range, and from which image: converting them back to
+  // that same image would only replace its own (still current) pixels with a lossy round trip of them.
+  uint32_t inherited_rows = 0;
+  uint64_t inherited_from = 0;
   void Wrote(uint32_t bottom) { epoch_rows = std::max(epoch_rows, std::min(bottom, height)); }
   bool initialized = false;  // transitioned to GENERAL
 };
@@ -2131,7 +2135,12 @@ void NativeCommandProcessor::AdoptRenderTarget(uint32_t base, uint32_t pitch, ui
   const bool first_time = !img.owned_before;
   img.owned_before = true;
   if (mode == kConvertModeCount) {
-    img.epoch_rows = img.height;  // not converted: as before v109, a later conversion takes the whole image
+    // No conversion for this pair (8888 -> depth among them): this image received nothing. v110: count only what
+    // it writes from now on, so converting it back (depth -> 8888) leaves the rows it never wrote to their owner's
+    // pixels (v109 counted the whole image here, which kept the bottom strip).
+    img.epoch_rows = 0;
+    img.inherited_rows = 0;
+    img.inherited_from = 0;
     return;
   }
   // RC71: the conversion reads the owner's sample-space image and writes this one.
@@ -2139,8 +2148,13 @@ void NativeCommandProcessor::AdoptRenderTarget(uint32_t base, uint32_t pitch, ui
   ExportMsaaShadow(img, true);
   // v109: only the rows the owner wrote (or received) while it owned the range; all of them for a new image.
   uint32_t rows = std::min(owner.height, img.height);
-  if (!first_time && REXCVAR_GET(ds2_native_convert_written_rows)) rows = std::min(rows, owner.epoch_rows);
+  if (!first_time && REXCVAR_GET(ds2_native_convert_written_rows)) {
+    const uint32_t inherited = owner.inherited_from == key ? 0u : owner.inherited_rows;
+    rows = std::min(rows, std::max(owner.epoch_rows, inherited));
+  }
   img.epoch_rows = 0;
+  img.inherited_rows = rows;
+  img.inherited_from = owner_key;
   if (!rows) return;
   const VkRect2D rect = {{0, 0}, {std::min(owner.width, img.width), rows}};
   if (Tracing() && mode == kConvertDepthToRgba8) {
@@ -2151,7 +2165,11 @@ void NativeCommandProcessor::AdoptRenderTarget(uint32_t base, uint32_t pitch, ui
   }
   Convert(mode, owner, img, 0, 0, rect,
           owner_depth && xenos::DepthRenderTargetFormat(owner_format) == xenos::DepthRenderTargetFormat::kD24FS8);
-  img.epoch_rows = rows;
+  img.epoch_rows = 0;  // v110: received, not written (Convert marks its destination)
+  if (Tracing()) {
+    REXGPU_INFO("[native trace]   convert at {}: {} rows ({} written + {} inherited from another image)", base, rows,
+                owner.epoch_rows, owner.inherited_from == key ? 0u : owner.inherited_rows);
+  }
   if (Tracing() && mode == kConvertDepthToRgba8) {
     REXGPU_INFO("[native trace]   convert depth->8888 at {}: after color {:08X}", base,
                 ReadPixel(img, 100, 100, VK_IMAGE_ASPECT_COLOR_BIT));
@@ -4688,6 +4706,24 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   scissor.offset[1] *= sy;
   scissor.extent[1] *= sy;
   const uint32_t height_hint = std::max<uint32_t>(scissor.offset[1] + scissor.extent[1], 8);
+  // v109: the lowest pixel row of a rectangle-list draw in window coordinates (clears), NaN otherwise; bounds the
+  // rows a draw writes (EDRAM ownership, NativeImage::epoch_rows; v110: also the rows of a 4x copy to export).
+  float rect_max_y = std::numeric_limits<float>::quiet_NaN();
+  if (prim_type == xenos::PrimitiveType::kRectangleList && !(regs[XE_GPU_REG_PA_CL_VTE_CNTL] & 0xC) &&
+      !regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable && !vs->vertex_bindings().empty()) {
+    const auto& binding = vs->vertex_bindings().front();
+    xenos::xe_gpu_vertex_fetch_t vf;
+    std::memcpy(&vf, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 2], sizeof(vf));
+    const uint32_t stride_words = std::max<uint32_t>(binding.stride_words, 3);
+    const uint32_t size = uint32_t(vf.size) << 2;
+    const uint32_t* vtx = memory_->TranslatePhysical<const uint32_t*>(uint32_t(vf.address) << 2);
+    if (vtx && size >= (2 * stride_words + 2) * 4) {
+      for (uint32_t v = 0; v < 3; ++v) {
+        const float y = xenos::GpuSwap(rex::memory::Reinterpret<float>(vtx[v * stride_words + 1]), vf.endian);
+        if (std::isnan(rect_max_y) || y > rect_max_y) rect_max_y = y;
+      }
+    }
+  }
   // v107: a draw into the scene's render targets at the reduced internal resolution.
   const bool draw_scaled = IsScaledPitch(sample_pitch);
   if (draw_scaled) {
@@ -4794,7 +4830,13 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
     if (host_msaa) {
       rt_width = rt_height = UINT32_MAX;
-      const uint32_t drawn_rows = scissor_pixels.offset[1] + scissor_pixels.extent[1];
+      uint32_t drawn_rows = scissor_pixels.offset[1] + scissor_pixels.extent[1];
+      if (!std::isnan(rect_max_y)) {
+        // v110: a clear rectangle: only its rows (pixel space of the 4x copy).
+        float y = rect_max_y + 0.5f;
+        if (draw_scaled) y *= res_scale_;
+        drawn_rows = std::min(drawn_rows, uint32_t(std::max(std::ceil(y), 1.0f)));
+      }
       for (uint32_t i = 0; i < color_count; ++i) {
         MsaaShadow& csh = msaa_shadows_[color_rts[i]->image];
         csh.newer = !msaa_force_clear_;
@@ -5072,7 +5114,6 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   uint32_t fetch_constants[6 * 32];
   std::memcpy(fetch_constants, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(fetch_constants));
   float rect_first_z = std::numeric_limits<float>::quiet_NaN();
-  float rect_max_y = std::numeric_limits<float>::quiet_NaN();  // v109: lowest row of a rectangle (window coords)
   for (const auto& binding : vs->vertex_bindings()) {
     const uint32_t fc = binding.fetch_constant;
     xenos::xe_gpu_vertex_fetch_t vf;
@@ -5082,13 +5123,6 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (prim_type == xenos::PrimitiveType::kRectangleList && std::isnan(rect_first_z) && size >= 12) {
       if (const uint32_t* vtx = memory_->TranslatePhysical<const uint32_t*>(address)) {
         rect_first_z = xenos::GpuSwap(rex::memory::Reinterpret<float>(vtx[2]), vf.endian);
-        const uint32_t stride_words = std::max<uint32_t>(binding.stride_words, 3);
-        if (size >= (2 * stride_words + 2) * 4) {
-          for (uint32_t v = 0; v < 3; ++v) {
-            const float y = xenos::GpuSwap(rex::memory::Reinterpret<float>(vtx[v * stride_words + 1]), vf.endian);
-            if (std::isnan(rect_max_y) || y > rect_max_y) rect_max_y = y;
-          }
-        }
       }
     }
     if (Tracing()) {
@@ -5794,9 +5828,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     uint32_t bottom = uint32_t(sr.offset.y) + sr.extent.height;
     const float vp_bottom = vp.y + vp.height;
     if (vp_bottom > 0.0f) bottom = std::min(bottom, uint32_t(std::ceil(vp_bottom)));
-    const uint32_t vte = regs[XE_GPU_REG_PA_CL_VTE_CNTL];
-    if (prim_type == xenos::PrimitiveType::kRectangleList && !std::isnan(rect_max_y) && !(vte & 0xC) &&
-        !regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
+    if (!std::isnan(rect_max_y)) {
       // Window coordinates (no y scale or offset): the rectangle's own extent.
       float y = (rect_max_y + 0.5f) * float(sy);
       if (draw_scaled) y *= res_scale_;
