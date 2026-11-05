@@ -85,6 +85,8 @@ if(REXGLUE_PLATFORM_SWITCH)
         AUTHOR "xDASCATx"
         VERSION "${DS2_DISPLAY_VERSION}"
         ICON "${CMAKE_CURRENT_SOURCE_DIR}/resources/icon.jpg")
+    # v116: the version on the start screen (only this file is rebuilt when it changes).
+    set_source_files_properties(src/ds2_dlc.cpp PROPERTIES COMPILE_DEFINITIONS "DS2_VERSION_STRING=\"${DS2_DISPLAY_VERSION}\"")
 else()
     rexglue_configure_target(ds2)
 endif()

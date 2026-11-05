@@ -22,6 +22,7 @@
 #include <functional>
 #include <memory>
 #include <thread>
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <filesystem>
@@ -225,30 +226,96 @@ std::thread g_install_thread;
 
 // v107: start screen with the internal resolution of the scene (ds2_render_scale): two buttons in the centre of the
 // screen, driven with the controller (D-pad + A) or the touch screen.
+// v116: the choices of the start screen, kept on the SD card for the next start.
+struct StartPrefs {
+  bool valid = false;
+  double scale = 1.0;
+  int fps = 60;
+  int language = 0;  // 0 = not saved
+  bool sharpen = true;
+};
+constexpr const char* kStartPrefsPath = "sdmc:/switch/ds2/start_screen.cfg";
+
+StartPrefs LoadStartPrefs() {
+  StartPrefs p;
+  FILE* f = std::fopen(kStartPrefsPath, "r");
+  if (!f) return p;
+  char line[64];
+  while (std::fgets(line, sizeof(line), f)) {
+    double scale;
+    int v;
+    if (std::sscanf(line, "scale=%lf", &scale) == 1) {
+      p.scale = scale < 1.0 ? 0.75 : 1.0;
+      p.valid = true;
+    } else if (std::sscanf(line, "fps=%d", &v) == 1) {
+      p.fps = v == 30 ? 30 : 60;
+    } else if (std::sscanf(line, "lang=%d", &v) == 1) {
+      p.language = v;
+    } else if (std::sscanf(line, "sharpen=%d", &v) == 1) {
+      p.sharpen = v != 0;
+    }
+  }
+  std::fclose(f);
+  return p;
+}
+
+void SaveStartPrefs(const StartPrefs& p) {
+  FILE* f = std::fopen(kStartPrefsPath, "w");
+  if (!f) return;
+  std::fprintf(f, "scale=%.2f\nfps=%d\nlang=%d\nsharpen=%d\n", p.scale, p.fps, p.language, p.sharpen ? 1 : 0);
+  std::fclose(f);
+}
+
+#ifndef DS2_VERSION_STRING
+#define DS2_VERSION_STRING ""
+#endif
+
+// v109: the start screen (v107 resolution, v113 frame rate lock, v114 language; v116: remembered choices with a
+// countdown, ember background, version, button glyphs, sharpening for 540p).
 class ResolutionDialog final : public rex::ui::ImGuiDialog {
  public:
-  ResolutionDialog(rex::ui::ImGuiDrawer* drawer, std::function<void(double, int, int)> on_choice)
-      : ImGuiDialog(drawer), on_choice_(std::move(on_choice)) {}
+  ResolutionDialog(rex::ui::ImGuiDrawer* drawer, std::function<void(const StartPrefs&)> on_choice)
+      : ImGuiDialog(drawer), on_choice_(std::move(on_choice)) {
+    const StartPrefs saved = LoadStartPrefs();
+    toml_language_ = TomlLanguage();
+    language_ = (toml_language_ == 1 || OtherLanguageName(toml_language_)) ? toml_language_ : 12;
+    if (saved.language == 1 || saved.language == 12 || OtherLanguageName(saved.language)) {
+      language_ = saved.language;
+      if (OtherLanguageName(saved.language)) toml_language_ = saved.language;
+    }
+    fps_ = saved.fps;
+    sharpen_ = saved.sharpen;
+    remembered_ = saved.valid;
+    scale_ = saved.valid ? saved.scale : 1.0;
+  }
 
  protected:
   void OnDraw(ImGuiIO& io) override {
     namespace souls = rex::ui::souls;
     if (chosen_) return;
+    time_ += io.DeltaTime;
+    DrawBackground(io);
+    // Countdown: any button or touch stops it.
+    if (counting_) {
+      for (int k = ImGuiKey_GamepadStart; k <= ImGuiKey_GamepadR3; ++k) {
+        if (ImGui::IsKeyDown(ImGuiKey(k))) counting_ = false;
+      }
+      if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) counting_ = false;
+    }
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always,
                             ImVec2(0.5f, 0.5f));
     if (first_frame_) ImGui::SetNextWindowFocus();
     souls::PushWindowStyle();
+    double choice = 0.0;
     if (ImGui::Begin("##ds2_resolution", nullptr, souls::kWindowFlags | ImGuiWindowFlags_AlwaysAutoResize)) {
       souls::DrawFrame();
-      // v109: Dark Souls look (rex/ui/souls_style.h).
-      // v114: game language at the top left (Russian by default), on the title's row.
+      // Language at the top left, on the title's row.
       const float title_y = ImGui::GetCursorPosY();
       {
         const ImVec2 lang(io.DisplaySize.x * 0.06f, io.DisplaySize.y * 0.052f);
         if (Toggle("##rus", "RUS", language_ == 12, lang, 0.6f)) language_ = 12;
         ImGui::SameLine(0.0f, 8.0f);
         if (Toggle("##eng", "ENG", language_ == 1, lang, 0.6f)) language_ = 1;
-        // v115: another language set in ds2.toml (user_language) gets its own button, selected by default.
         if (const char* other = OtherLanguageName(toml_language_)) {
           ImGui::SameLine(0.0f, 8.0f);
           if (Toggle("##toml_lang", other, language_ == toml_language_, lang, 0.6f)) language_ = toml_language_;
@@ -257,24 +324,36 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       ImGui::SetCursorPosY(title_y);
       souls::CenteredTitle("Choose Resolution", 1.0f, souls::kParchment);
       souls::Divider();
+      // The two resolutions; the remembered one has the focus.
       const ImVec2 size(io.DisplaySize.x * 0.24f, io.DisplaySize.y * 0.2f);
+      const float gap = 24.0f;
       ImGui::PushStyleColor(ImGuiCol_Border, souls::kBronze);
       ImGui::PushStyleColor(ImGuiCol_Text, souls::kParchment);
       ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.5f);
-      if (first_frame_) ImGui::SetKeyboardFocusHere();
-      double choice = 0.0;
+      const float cards_x = ImGui::GetCursorPosX();
+      if (first_frame_ && scale_ >= 1.0) ImGui::SetKeyboardFocusHere();
       if (Choice("##720", "720p", "Native, sharp", size)) choice = 1.0;
-      ImGui::SetItemDefaultFocus();
-      ImGui::SameLine(0.0f, 24.0f);
+      if (scale_ >= 1.0) ImGui::SetItemDefaultFocus();
+      ImGui::SameLine(0.0f, gap);
+      if (first_frame_ && scale_ < 1.0) ImGui::SetKeyboardFocusHere();
       if (Choice("##540", "540p", "More FPS, softer", size)) choice = 0.75;
+      if (scale_ < 1.0) ImGui::SetItemDefaultFocus();
       ImGui::PopStyleVar();
       ImGui::PopStyleColor(2);
-      // v113: frame rate cap, a pair of small toggles at the right (60 by default; does not start the game).
+      // Sharpening of the 540p upscale, under its card.
+      const ImVec2 small(io.DisplaySize.x * 0.075f, io.DisplaySize.y * 0.065f);
+      {
+        ImGui::SetCursorPosX(cards_x + size.x + gap);
+        const ImVec2 bar(size.x, small.y * 0.8f);
+        if (Toggle("##sharpen", sharpen_ ? "Sharpening: On" : "Sharpening: Off", sharpen_, bar, 0.55f)) {
+          sharpen_ = !sharpen_;
+          counting_ = false;
+        }
+      }
+      // Frame rate lock at the right.
       ImGui::Dummy(ImVec2(0.0f, 6.0f));
       {
-        const ImVec2 small(io.DisplaySize.x * 0.075f, io.DisplaySize.y * 0.065f);
         const float row_w = small.x * 2.0f + 12.0f;
-        // v114: every item of the row placed at the same top (the label centred on the buttons).
         const float row_y = ImGui::GetCursorPosY();
         const float right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
         const float x30 = right - row_w;
@@ -292,19 +371,111 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
         if (Toggle("##fps60", "60", fps_ == 60, small)) fps_ = 60;
         ImGui::SetCursorPosY(row_y + small.y);
       }
-      ImGui::Dummy(ImVec2(0.0f, 4.0f));
-      souls::CenteredTitle("Select with the D-pad and A", 0.62f, souls::kAsh);  // v114: larger, smoother
-      first_frame_ = false;
-      if (choice > 0.0) {
-        chosen_ = true;
-        on_choice_(choice, fps_, language_);
+      ImGui::Dummy(ImVec2(0.0f, 6.0f));
+      // Countdown with the remembered choice, or the button hints.
+      const float left = counting_ ? kCountdown - time_ : 0.0f;
+      if (counting_ && left <= 0.0f) choice = scale_;
+      if (counting_) {
+        char text[64];
+        std::snprintf(text, sizeof(text), "Starting in %d  -  press any button to choose", int(left) + 1);
+        souls::CenteredTitle(text, 0.62f, souls::kEmber);
+      } else {
+        DrawHints();
       }
+      first_frame_ = false;
     }
     ImGui::End();
     souls::PopWindowStyle();
+    if (choice > 0.0) {
+      chosen_ = true;
+      StartPrefs p;
+      p.valid = true;
+      p.scale = choice;
+      p.fps = fps_;
+      p.language = language_;
+      p.sharpen = sharpen_;
+      SaveStartPrefs(p);
+      on_choice_(p);
+    }
   }
 
-  // v113: a small toggle; the selected one is lit in ember, the other dimmed.
+ private:
+  static constexpr float kCountdown = 10.0f;
+
+  // Dark screen with embers rising from a glow at the bottom, and the port version in the corner.
+  void DrawBackground(ImGuiIO& io) {
+    namespace souls = rex::ui::souls;
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const ImVec2 d = io.DisplaySize;
+    dl->AddRectFilled(ImVec2(0, 0), d, IM_COL32(6, 5, 4, 255));
+    const ImU32 clear = souls::Col(souls::kEmber, 0.0f);
+    const ImU32 glow = souls::Col(souls::kEmber, 0.10f + 0.03f * std::sin(time_ * 1.3f));
+    dl->AddRectFilledMultiColor(ImVec2(0, d.y * 0.55f), d, clear, clear, glow, glow);
+    for (int i = 0; i < kEmbers; ++i) {
+      // Deterministic per ember: start, speed, sway and size from its index.
+      const float h1 = Hash(i * 3 + 1), h2 = Hash(i * 3 + 2), h3 = Hash(i * 3 + 3);
+      const float speed = 18.0f + 42.0f * h2;
+      const float travel = d.y * 0.85f;
+      const float period = travel / speed;
+      const float t = std::fmod(time_ + h1 * period, period) / period;  // 0 at the bottom, 1 at the top
+      const float x = d.x * (0.1f + 0.8f * h1) + std::sin(time_ * (0.6f + h3) + h2 * 6.28f) * (12.0f + 20.0f * h3);
+      const float y = d.y + 10.0f - t * travel;
+      const float fade = std::sin(t * 3.14159f) * (0.55f + 0.45f * std::sin(time_ * (3.0f + 4.0f * h3) + h1 * 9.0f));
+      const float r = 1.2f + 2.2f * h3;
+      dl->AddCircleFilled(ImVec2(x, y), r * 3.5f, souls::Col(souls::kEmber, 0.07f * fade));
+      dl->AddCircleFilled(ImVec2(x, y), r, souls::Col(ImVec4(1.0f, 0.72f, 0.35f, 1.0f), 0.9f * fade));
+    }
+    if (DS2_VERSION_STRING[0]) {
+      souls::PushTitleFont(0.5f);
+      const ImVec2 t = ImGui::CalcTextSize(DS2_VERSION_STRING);
+      dl->AddText(ImVec2(d.x - t.x - 18.0f, d.y - t.y - 12.0f), souls::Col(souls::kAsh, 0.8f), DS2_VERSION_STRING);
+      souls::PopTitleFont();
+    }
+  }
+  static float Hash(int n) {
+    uint32_t x = uint32_t(n) * 0x9E3779B1u;
+    x ^= x >> 15;
+    x *= 0x85EBCA77u;
+    x ^= x >> 13;
+    return float(x & 0xFFFF) / 65535.0f;
+  }
+  static constexpr int kEmbers = 70;
+
+  // "[D-pad] Select    (A) Start" with drawn glyphs.
+  void DrawHints() {
+    namespace souls = rex::ui::souls;
+    souls::PushTitleFont(0.62f);
+    const char* select = "Select";
+    const char* start = "Start";
+    const ImVec2 ts = ImGui::CalcTextSize(select), tt = ImGui::CalcTextSize(start);
+    const float icon = ts.y * 1.1f, space = 10.0f, group_gap = 40.0f;
+    const float total = icon + space + ts.x + group_gap + icon + space + tt.x;
+    const float x0 = ImGui::GetCursorScreenPos().x + (ImGui::GetContentRegionAvail().x - total) * 0.5f;
+    const float y0 = ImGui::GetCursorScreenPos().y;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 ink = souls::Col(souls::kAsh);
+    // D-pad: a cross.
+    {
+      const float c = icon * 0.5f, arm = icon * 0.18f;
+      const ImVec2 m(x0 + c, y0 + ts.y * 0.5f);
+      dl->AddRectFilled(ImVec2(m.x - c, m.y - arm), ImVec2(m.x + c, m.y + arm), ink, 2.0f);
+      dl->AddRectFilled(ImVec2(m.x - arm, m.y - c), ImVec2(m.x + arm, m.y + c), ink, 2.0f);
+    }
+    dl->AddText(ImVec2(x0 + icon + space, y0), ink, select);
+    // A button: a circle with the letter.
+    const float ax = x0 + icon + space + ts.x + group_gap;
+    {
+      const ImVec2 m(ax + icon * 0.5f, y0 + ts.y * 0.5f);
+      dl->AddCircle(m, icon * 0.5f, souls::Col(souls::kEmber), 24, 1.6f);
+      const ImVec2 la = ImGui::CalcTextSize("A");
+      dl->AddText(ImVec2(m.x - la.x * 0.5f, m.y - la.y * 0.5f), souls::Col(souls::kParchment), "A");
+    }
+    dl->AddText(ImVec2(ax + icon + space, y0), ink, start);
+    souls::PopTitleFont();
+    ImGui::Dummy(ImVec2(total, ts.y));
+  }
+
+  // A small toggle; the selected one is lit in ember, the other dimmed.
   static bool Toggle(const char* id, const char* text, bool selected, ImVec2 size, float text_scale = 0.8f) {
     namespace souls = rex::ui::souls;
     ImGui::PushStyleColor(ImGuiCol_Button, selected ? ImVec4(0.42f, 0.23f, 0.07f, 0.95f)
@@ -349,14 +520,6 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
     return pressed;
   }
 
- private:
-  std::function<void(double, int, int)> on_choice_;
-  int fps_ = 60;        // v113: frame rate cap chosen on the start screen
-  // v114: game language (user_language). v115: starts from ds2.toml (Russian when it holds no language of the
-  // European disc).
-  int toml_language_ = TomlLanguage();
-  int language_ = (toml_language_ == 1 || OtherLanguageName(toml_language_)) ? toml_language_ : 12;
-
   // Xbox 360 language ids of the European disc other than English and Russian.
   static const char* OtherLanguageName(int id) {
     switch (id) {
@@ -376,8 +539,21 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       return 12;
     }
   }
+
+  std::function<void(const StartPrefs&)> on_choice_;
+  int fps_ = 60;
+  int toml_language_ = 12;
+  int language_ = 12;
+  bool sharpen_ = true;
+  double scale_ = 1.0;   // remembered resolution (focus and countdown)
+  bool remembered_ = false;
+  bool counting_ = false;  // only with a remembered choice (StartCountdown)
+  float time_ = 0.0f;
   bool chosen_ = false;
   bool first_frame_ = true;
+
+ public:
+  void StartCountdown() { counting_ = remembered_; }
 };
 
 std::unique_ptr<ResolutionDialog> g_resolution_dialog;
@@ -390,21 +566,22 @@ void ChooseResolution(rex::ui::ImGuiDrawer* drawer, std::function<void(std::func
     then();
     return;
   }
-  g_resolution_dialog = std::make_unique<ResolutionDialog>(drawer, [post_to_ui, then](double scale, int fps, int language) {
+  g_resolution_dialog = std::make_unique<ResolutionDialog>(drawer, [post_to_ui, then](const StartPrefs& p) {
     // From inside the dialog's OnDraw: the dialog is destroyed later, on the UI thread, before the game starts.
-    post_to_ui([scale, fps, language, then]() {
+    post_to_ui([p, then]() {
       // v114: game language, read by the game through XamGetLanguage after it starts.
-      rex::cvar::SetFlagByName("user_language", std::to_string(language));
-      REXLOG_INFO("ds2: language chosen on the start screen: {}", language);
-      rex::cvar::SetFlagByName("ds2_render_scale", scale >= 1.0 ? "1.0" : "0.75");
-      // v113: frame rate cap (ds2_fps_cap, even frame spacing): 30, or 60.
-      rex::cvar::SetFlagByName("ds2_fps_cap", fps == 30 ? "30" : "60");
-      REXLOG_INFO("ds2: frame rate cap chosen on the start screen: {}", fps == 30 ? 30 : 60);
-      REXLOG_INFO("ds2: internal resolution chosen on the start screen: {}", scale >= 1.0 ? "720p" : "540p");
+      rex::cvar::SetFlagByName("user_language", std::to_string(p.language));
+      rex::cvar::SetFlagByName("ds2_render_scale", p.scale >= 1.0 ? "1.0" : "0.75");
+      // v113: frame rate lock (ds2_fps_cap): 30, or 60. v116: sharpening of the 540p upscale.
+      rex::cvar::SetFlagByName("ds2_fps_cap", p.fps == 30 ? "30" : "60");
+      rex::cvar::SetFlagByName("ds2_sharpen", p.sharpen ? "true" : "false");
+      REXLOG_INFO("ds2: start screen: {}, {} FPS lock, language {}, sharpening {}",
+                  p.scale >= 1.0 ? "720p" : "540p", p.fps, p.language, p.sharpen ? "on" : "off");
       g_resolution_dialog.reset();
       then();
     });
   });
+  g_resolution_dialog->StartCountdown();
 }
 
 

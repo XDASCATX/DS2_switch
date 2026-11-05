@@ -187,6 +187,12 @@ REXCVAR_DEFINE_DOUBLE(ds2_render_scale, 1.0, "GPU",
 REXCVAR_DEFINE_BOOL(ds2_native_convert_written_rows, true, "GPU",
                     "v109: an EDRAM range taken over by another format converts only the rows written since the "
                     "previous owner took it (bottom strip of the screen blurred by depth of field before)");
+REXCVAR_DEFINE_BOOL(ds2_fps_lock_vsync, true, "GPU",
+                    "v116: with ds2_fps_cap = 30, present on every other display refresh (swap interval 2)");
+REXCVAR_DEFINE_BOOL(ds2_sharpen, true, "GPU",
+                    "v116: at a reduced internal resolution, upscale to 1280x720 with contrast-adaptive sharpening "
+                    "(chosen on the start screen) instead of the presenter's bilinear filter");
+REXCVAR_DEFINE_DOUBLE(ds2_sharpness, 0.6, "GPU", "v116: strength of the sharpening, 0..1");
 REXCVAR_DEFINE_BOOL(ds2_native_dynamic_textures, true, "GPU",
                     "RC86: a texture whose content changed is checked every frame for 120 frames (videos)");
 REXCVAR_DEFINE_BOOL(ds2_native_fast_registers, true, "GPU",
@@ -258,6 +264,10 @@ REXCVAR_DEFINE_INT32(ds2_native_probe, 0, "GPU",
 #if REX_PLATFORM_SWITCH
 extern "C" void RexSwitchPerfCount(unsigned id);  // switch_perf.cpp: 0 = swaps (FPS for the overlay / SaltyNX)
 extern "C" int RexSwitchStickClicksHeld(void);     // switch_perf.cpp: L3 and R3 both held (handheld or pad 1)
+#endif
+
+#if REX_PLATFORM_SWITCH
+extern "C" void RexSwitchPerfIntervaloSwap(unsigned vblanks) __attribute__((weak));  // ui/switch_perf.cpp
 #endif
 
 namespace rex::graphics::vulkan {
@@ -511,10 +521,38 @@ void main() {
 constexpr const char* kPresentShader = R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D t;
 layout(set = 0, binding = 1) uniform Ramp { uvec4 lut[64]; } ramp;
-layout(push_constant) uniform P { vec2 scale; int use_ramp; float inv_gamma; } pc;
+layout(push_constant) uniform P {
+  vec2 scale; int use_ramp; float inv_gamma;
+  // v116: upscale of a reduced internal resolution with contrast-adaptive sharpening (FSR 1 / CAS style).
+  vec2 src_max; int sharpen; float sharpness;
+} pc;
 layout(location = 0) out vec4 o;
+vec3 Bilinear(vec2 out_pos) {
+  vec2 p = out_pos * pc.scale - 0.5;
+  vec2 f = fract(p);
+  ivec2 i = ivec2(floor(p));
+  ivec2 m = ivec2(pc.src_max);
+  vec3 a = texelFetch(t, clamp(i, ivec2(0), m), 0).rgb;
+  vec3 b = texelFetch(t, clamp(i + ivec2(1, 0), ivec2(0), m), 0).rgb;
+  vec3 c = texelFetch(t, clamp(i + ivec2(0, 1), ivec2(0), m), 0).rgb;
+  vec3 d = texelFetch(t, clamp(i + ivec2(1, 1), ivec2(0), m), 0).rgb;
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
 void main() {
-  vec4 c = texelFetch(t, ivec2(gl_FragCoord.xy * pc.scale), 0);
+  vec4 c;
+  if (pc.sharpen != 0) {
+    vec2 q = gl_FragCoord.xy;
+    vec3 e = Bilinear(q);
+    vec3 n = Bilinear(q + vec2(0.0, -1.0)), s = Bilinear(q + vec2(0.0, 1.0));
+    vec3 w = Bilinear(q + vec2(-1.0, 0.0)), x = Bilinear(q + vec2(1.0, 0.0));
+    vec3 mn = min(e, min(min(n, s), min(w, x)));
+    vec3 mx = max(e, max(max(n, s), max(w, x)));
+    vec3 amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, vec3(1.0 / 65536.0)), 0.0, 1.0));
+    vec3 wt = -amp * mix(0.125, 0.2, pc.sharpness);
+    c = vec4(clamp((e + wt * (n + s + w + x)) / (1.0 + 4.0 * wt), 0.0, 1.0), 1.0);
+  } else {
+    c = texelFetch(t, ivec2(gl_FragCoord.xy * pc.scale), 0);
+  }
   if (pc.use_ramp != 0) {
     uvec3 i = uvec3(clamp(c.rgb, 0.0, 1.0) * 255.0 + 0.5);
     uint r = ramp.lut[i.r >> 2][i.r & 3u];
@@ -1142,6 +1180,7 @@ class NativeCommandProcessor final : public CommandProcessor {
   std::unordered_map<VkImage, HalfResTarget> halfres_targets_;
   uint64_t write_counter_ = 0;  // v106: source of NativeImage::write_id
   uint64_t cap_next_us_ = 0;     // v106: ds2_fps_cap, when the next frame may be presented
+  bool swap_interval_set_ = false;  // v116
   // v107: reduced internal resolution. Render targets 1280 samples wide (the DS2 scene: 1280x720 1x and 640x360
   // 4x) are created at res_scale_ of their size; draws into them scale viewport and scissor, and their pixel
   // shaders see guest pixel positions (gl_FragCoord patch, see sdk/src/graphics/vulkan/shader.cpp).
@@ -2253,7 +2292,7 @@ void main() { o0 = vec4(0.5, 0.5, 0.5, 1.0); o1 = o0; o2 = o0; o3 = o0; }
     ci.bindingCount = 2;
     ci.pBindings = b;
     if (dfn().vkCreateDescriptorSetLayout(dev, &ci, nullptr, &present_set_layout_) != VK_SUCCESS) return false;
-    VkPushConstantRange pc = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
+    VkPushConstantRange pc = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32};  // v116: + upscale and sharpening
     VkPipelineLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     lci.setLayoutCount = 1;
     lci.pSetLayouts = &present_set_layout_;
@@ -6449,6 +6488,17 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   if (!frame_open_ && !BeginFrame()) return;
   EndRenderPass();
   // v106: optional frame cap with even spacing (the presentation of this frame waits for its slot).
+#if REX_PLATFORM_SWITCH
+  // v116: a 30 lock also holds every frame for two vblanks in the system compositor (swap interval 2), so the
+  // frames reach the screen on every other refresh instead of whichever one the timer happened to fall into.
+  if (!swap_interval_set_) {
+    swap_interval_set_ = true;
+    if (REXCVAR_GET(ds2_fps_cap) == 30 && REXCVAR_GET(ds2_fps_lock_vsync) && RexSwitchPerfIntervaloSwap) {
+      RexSwitchPerfIntervaloSwap(2);
+      REXGPU_INFO("[native] 30 FPS lock on the display refresh (swap interval 2)");
+    }
+  }
+#endif
   if (const int32_t cap = REXCVAR_GET(ds2_fps_cap); cap > 0) {
     const uint64_t period = 1000000u / uint64_t(std::clamp(cap, 10, 60));
     const uint64_t before = NowUs();
@@ -6479,15 +6529,19 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         frontbuffer_height ? std::min(uint32_t(std::lround(frontbuffer_height * fs)), src.height) : src.height;
     system::X_VIDEO_MODE video_mode;
     kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
+    // v116: a reduced internal resolution is upscaled here, with contrast-adaptive sharpening (ds2_sharpen),
+    // instead of by the presenter's bilinear filter.
+    const bool sharpen = fs < 1.0f && REXCVAR_GET(ds2_sharpen) && frontbuffer_width && frontbuffer_height;
+    const uint32_t out_w = sharpen ? frontbuffer_width : w, out_h = sharpen ? frontbuffer_height : h;
     presenter->RefreshGuestOutput(
-        w, h, std::max<uint32_t>(video_mode.display_width, 1), std::max<uint32_t>(video_mode.display_height, 1),
+        out_w, out_h, std::max<uint32_t>(video_mode.display_width, 1), std::max<uint32_t>(video_mode.display_height, 1),
         [&](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
           auto& vc = static_cast<ui::vulkan::VulkanPresenter::VulkanGuestOutputRefreshContext&>(context);
           VkCommandBuffer cmd = slot().cmd;
           const VkDevice dev = vulkan_device_->device();
           if (!present_pipeline_) return false;
           const uint64_t fb_key = reinterpret_cast<uint64_t>(vc.image_view()) ^ (vc.image_version() << 48) ^
-                                  (uint64_t(w) << 16) ^ h;
+                                  (uint64_t(out_w) << 16) ^ out_h;
           VkFramebuffer fb;
           auto fit = present_framebuffers_.find(fb_key);
           if (fit != present_framebuffers_.end()) {
@@ -6498,8 +6552,8 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             fci.renderPass = present_pass_;
             fci.attachmentCount = 1;
             fci.pAttachments = &view;
-            fci.width = w;
-            fci.height = h;
+            fci.width = out_w;
+            fci.height = out_h;
             fci.layers = 1;
             if (dfn().vkCreateFramebuffer(dev, &fci, nullptr, &fb) != VK_SUCCESS) return false;
             present_framebuffers_.emplace(fb_key, fb);
@@ -6543,7 +6597,7 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
           rbi.renderPass = present_pass_;
           rbi.framebuffer = fb;
-          rbi.renderArea = {{0, 0}, {w, h}};
+          rbi.renderArea = {{0, 0}, {out_w, out_h}};
           work_since_barrier_ = true;
           InvalidateDrawState();
           dfn().vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
@@ -6554,12 +6608,21 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             float scale[2];
             int32_t use_ramp;
             float inv_gamma;
+            float src_max[2];
+            int32_t sharpen;
+            float sharpness;
           } pc = {{1.0f, 1.0f}, REXCVAR_GET(ds2_native_gamma_ramp) ? 1 : 0,
-                  float(1.0 / std::clamp(REXCVAR_GET(ds2_native_present_gamma), 0.5, 2.5))};
+                  float(1.0 / std::clamp(REXCVAR_GET(ds2_native_present_gamma), 0.5, 2.5)),
+                  {float(w) - 1.0f, float(h) - 1.0f}, 0, float(std::clamp(REXCVAR_GET(ds2_sharpness), 0.0, 1.0))};
+          if (sharpen) {
+            pc.scale[0] = float(w) / float(out_w);
+            pc.scale[1] = float(h) / float(out_h);
+            pc.sharpen = 1;
+          }
           LogGammaRamp();
           dfn().vkCmdPushConstants(cmd, present_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-          VkViewport vpp = {0.0f, 0.0f, float(w), float(h), 0.0f, 1.0f};
-          VkRect2D sr = {{0, 0}, {w, h}};
+          VkViewport vpp = {0.0f, 0.0f, float(out_w), float(out_h), 0.0f, 1.0f};
+          VkRect2D sr = {{0, 0}, {out_w, out_h}};
           dfn().vkCmdSetViewport(cmd, 0, 1, &vpp);
           dfn().vkCmdSetScissor(cmd, 0, 1, &sr);
           work_since_barrier_ = true;

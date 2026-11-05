@@ -1,5 +1,8 @@
 #pragma once
 
+#include <mutex>
+#include <vector>
+
 #include <array>
 #include <cstdio>
 #include <filesystem>
@@ -29,9 +32,11 @@ class SpirvShaderLibrary {
   static bool Begin(FILE* file);
   static bool Append(FILE* file, const Shader::Translation& translation, uint64_t signature);
   size_t size() const { return entries_.size(); }
+  using Key = std::array<uint64_t, 4>;
+  // v116: read the records of `keys` into RAM (own file handle; Restore takes them from there).
+  void Prefetch(const std::filesystem::path& path, const std::vector<Key>& keys, size_t max_bytes);
 
  private:
-  using Key = std::array<uint64_t, 4>;
   bool ReadIndex(const std::filesystem::path& path);
   FILE* file_ = nullptr;
   bool writable_ = false;
@@ -41,6 +46,10 @@ class SpirvShaderLibrary {
   uint64_t file_signature_ = 0;
   const char* last_failure_ = "key not found";
   std::map<Key, uint64_t> entries_;
+  std::mutex warm_mutex_;
+  std::map<Key, std::vector<uint8_t>> warm_;
+  size_t warm_bytes_ = 0;
+  uint64_t warm_hits_ = 0;
 };
 
 bool RestoreConfiguredSpirvLibrary(Shader::Translation& translation, uint64_t signature);

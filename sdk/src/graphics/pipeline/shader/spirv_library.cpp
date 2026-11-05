@@ -5,6 +5,7 @@
 #include <cstring>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <vector>
 
 #include <xxhash.h>
@@ -13,6 +14,9 @@
 #include <rex/filesystem.h>
 #include <rex/logging.h>
 
+REXCVAR_DEFINE_INT32(ds2_shader_read_ahead_mb, 32, "GPU",
+                     "v116: at the first shader, read ahead into RAM up to this many MB of the pack variants the "
+                     "previous session used (sdmc:/switch/ds2/ds2_shader_warm.bin); 0 = off");
 REXCVAR_DEFINE_STRING(ds2_shader_library, "", "GPU",
                       "Offline SPIR-V library; empty disables it. Unknown variants use the SDK translator.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -178,19 +182,43 @@ bool SpirvShaderLibrary::Restore(Shader::Translation& translation, uint64_t sign
   auto* shader = dynamic_cast<SpirvShader*>(&translation.shader());
   if (!shader || !file_ || translation.is_translated()) return false;
   last_failure_ = "key not found";
-  const auto found = entries_.find(Key{shader->ucode_data_hash(), translation.modification(), signature,
-                                      uint64_t(shader->type())});
-  if (found == entries_.end() || fseek(file_, long(found->second), SEEK_SET)) return false;
+  const Key key{shader->ucode_data_hash(), translation.modification(), signature, uint64_t(shader->type())};
+  const auto found = entries_.find(key);
+  if (found == entries_.end()) return false;
   last_failure_ = "record/signature mismatch";
   Record record;
-  if (fread(record.data(), 1, sizeof(record), file_) != sizeof(record)) return false;
+  std::vector<uint8_t> payload;
+  // v116: the record may already be in RAM, read ahead from the list of the previous session.
+  std::vector<uint8_t> warm;
+  bool from_warm = false;
+  {
+    std::lock_guard lock(warm_mutex_);
+    auto w = warm_.find(key);
+    if (w != warm_.end()) {
+      warm.swap(w->second);
+      warm_bytes_ -= warm.size();
+      warm_.erase(w);
+      from_warm = warm.size() >= sizeof(record);
+    }
+  }
   uint64_t bytes;
-  if (!PayloadSize(record, bytes) || record[4] != shader->ucode_dword_count() ||
+  if (from_warm) {
+    std::memcpy(record.data(), warm.data(), sizeof(record));
+    if (!PayloadSize(record, bytes) || bytes != warm.size() - sizeof(record)) return false;
+    payload.assign(warm.begin() + sizeof(record), warm.end());
+    ++warm_hits_;
+  } else {
+    if (fseek(file_, long(found->second), SEEK_SET)) return false;
+    if (fread(record.data(), 1, sizeof(record), file_) != sizeof(record)) return false;
+    if (!PayloadSize(record, bytes)) return false;
+    payload.resize(size_t(bytes));
+    if (fread(payload.data(), 1, payload.size(), file_) != payload.size()) return false;
+  }
+  if (record[4] != shader->ucode_dword_count() ||
       record[0] != shader->ucode_data_hash() || record[1] != translation.modification() ||
       record[2] != signature || record[3] != uint64_t(shader->type())) return false;
   last_failure_ = "payload/checksum/microcode mismatch";
-  std::vector<uint8_t> payload(size_t(bytes), 0);
-  if (fread(payload.data(), 1, payload.size(), file_) != payload.size() ||
+  if (payload.size() != bytes ||
       XXH3_64bits(payload.data(), payload.size()) != record[9] ||
       std::memcmp(payload.data(), shader->ucode_dwords(), size_t(record[4] * 4))) return false;
   const size_t binary_start = size_t(record[4] * 4);
@@ -348,6 +376,56 @@ void RecordConfiguredSpirvCache(const Shader::Translation& translation, uint64_t
   }
 }
 
+// v116: reads the records listed in `keys` (in that order) into RAM through its own handle, up to max_bytes.
+void SpirvShaderLibrary::Prefetch(const std::filesystem::path& path, const std::vector<Key>& keys,
+                                  size_t max_bytes) {
+  FILE* f = fopen(path.string().c_str(), "rb");
+  if (!f) return;
+  std::vector<std::pair<uint64_t, Key>> order;
+  for (const Key& k : keys) {
+    auto it = entries_.find(k);
+    if (it != entries_.end()) order.emplace_back(it->second, k);
+  }
+  size_t total = 0, count = 0;
+  const auto start = std::chrono::steady_clock::now();
+  for (const auto& [offset, k] : order) {
+    Record record;
+    uint64_t bytes;
+    if (fseek(f, long(offset), SEEK_SET) || fread(record.data(), 1, sizeof(record), f) != sizeof(record) ||
+        !PayloadSize(record, bytes)) {
+      continue;
+    }
+    if (total + sizeof(record) + bytes > max_bytes) break;
+    std::vector<uint8_t> blob(sizeof(record) + size_t(bytes));
+    std::memcpy(blob.data(), record.data(), sizeof(record));
+    if (fread(blob.data() + sizeof(record), 1, size_t(bytes), f) != size_t(bytes)) continue;
+    total += blob.size();
+    ++count;
+    std::lock_guard lock(warm_mutex_);
+    warm_bytes_ += blob.size();
+    warm_.emplace(k, std::move(blob));
+  }
+  fclose(f);
+  REXGPU_INFO("[shader library] read ahead {} variants used last time ({:.1f} MB) in {:.0f} ms", count,
+              double(total) / 1048576.0,
+              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+}
+
+namespace {
+// v116: the variants restored from the pack, in first-use order, kept on the SD card for the next start.
+constexpr const char* kWarmListPath = "sdmc:/switch/ds2/ds2_shader_warm.bin";
+std::mutex g_warm_list_mutex;
+std::set<std::array<uint64_t, 4>> g_warm_list_known;
+FILE* g_warm_list = nullptr;
+
+void RememberWarm(const std::array<uint64_t, 4>& key) {
+  std::lock_guard lock(g_warm_list_mutex);
+  if (!g_warm_list || !g_warm_list_known.insert(key).second) return;
+  fwrite(key.data(), sizeof(uint64_t), 4, g_warm_list);
+  fflush(g_warm_list);
+}
+}  // namespace
+
 bool RestoreConfiguredSpirvLibrary(Shader::Translation& translation, uint64_t signature) {
   {
     LearnedCache& c = Learned();
@@ -380,10 +458,39 @@ bool RestoreConfiguredSpirvLibrary(Shader::Translation& translation, uint64_t si
     REXGPU_INFO("[shader library] {}: {} entries, translator signature {:016X}, open {:.2f} ms ({})",
                 opened ? "loaded" : "unavailable; runtime fallback", library.size(), signature,
                 open_ms, library.indexed() ? "compact index" : "record scan");
+    // v116: read ahead what the previous session used, on a background thread, and keep the list growing.
+    if (opened && REXCVAR_GET(ds2_shader_read_ahead_mb) > 0) {
+      std::vector<std::array<uint64_t, 4>> keys;
+      if (FILE* f = fopen(kWarmListPath, "rb")) {
+        std::array<uint64_t, 4> k;
+        while (fread(k.data(), sizeof(uint64_t), 4, f) == 4) {
+          if (k[2] == signature) keys.push_back(k);
+        }
+        fclose(f);
+      }
+      {
+        std::lock_guard wl(g_warm_list_mutex);
+        for (const auto& k : keys) g_warm_list_known.insert(k);
+        g_warm_list = fopen(kWarmListPath, "ab");
+      }
+      if (!keys.empty()) {
+        const size_t max_bytes = size_t(REXCVAR_GET(ds2_shader_read_ahead_mb)) << 20;
+        try {  // a thread may not be available at the process limit (v104): then simply no read-ahead
+          std::thread([full_path, keys = std::move(keys), max_bytes]() {
+            library.Prefetch(full_path, keys, max_bytes);
+          }).detach();
+        } catch (...) {
+        }
+      }
+    }
   }
   if (!opened) return false;
   const bool restored = library.Restore(translation, signature);
   if (restored) ++hits; else ++misses;
+  if (restored) {
+    RememberWarm({translation.shader().ucode_data_hash(), translation.modification(), signature,
+                  uint64_t(translation.shader().type())});
+  }
   if (hits + misses <= 8 || (hits + misses) % 64 == 0) {
     REXGPU_INFO("[shader library] {} hits, {} misses; last {:016X}/{:016X} {}",
                 hits, misses, translation.shader().ucode_data_hash(), translation.modification(),
