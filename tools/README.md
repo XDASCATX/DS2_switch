@@ -22,6 +22,7 @@ is explained below.
 | `rc97/` | The optimised code generation used since build 97 (registers as C++ locals, `share_registers` marks, direct calls, guest memory without `volatile`). Steps and pitfalls: [rc97/README.md](rc97/README.md). |
 | `huecos.py`, `huecos_excluir.txt` ("gaps") | Finds code the generator left outside any function and writes candidate entries (`huecos_functions.toml`, not committed); `config/ds2_overrides.gaps.toml` was made from it. |
 | `ds2_find_dataonly_entries.py`, `ds2_find_split_culprits.py`, `ds2_analyze_unresolved.py`, `ds2_classify_unresolved.py` | Find and classify function entries referenced only from data or code pointers, and unresolved branches (the `config/ds2_overrides.*.toml` inputs). |
+| `pgo/restore_gcda.py` | Profile-guided optimisation of the game code: puts the profiles written by a `DS2_PGO=GEN` build on the console (`sdmc:/switch/ds2/pgo`) back next to the objects, for the `DS2_PGO=USE` build of the same build folder. |
 | `build/patch-generated.py` | Brings already generated code up to the current generator output without a full codegen run. |
 
 ## Shaders

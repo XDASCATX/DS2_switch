@@ -16,6 +16,7 @@
 #include <string>
 
 #include <rex/chrono/chrono_steady_cast.h>
+#include <rex/cvar.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/rtl.h>
 #include <rex/kernel/xboxkrnl/threading.h>
@@ -30,6 +31,16 @@
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 #include <rex/thread/atomic.h>
+
+// v108: a contended critical section spins this many times (at least) before the thread goes to sleep. DS2
+// creates its critical sections without a spin count; on the console a sleep and wake-up through the kernel costs
+// far more than the short holds of the game's locks (the main thread spent ~9% of its time waiting in them).
+REXCVAR_DEFINE_INT32(ds2_cs_min_spin, 2048, "Kernel",
+                     "v108: minimum spins of a contended critical section before sleeping (0 = only the game's)");
+
+#if REX_PLATFORM_SWITCH
+extern "C" void RexSwitchPerfCount(unsigned id) __attribute__((weak));
+#endif
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -387,18 +398,32 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
     return;
   }
 
-  // Spin loop
+  // Spin loop. v108: at least ds2_cs_min_spin rounds; the lock word is read before the atomic (-1 = free, the
+  // same in both byte orders) and the core is told it is a spin wait.
+  spin_count = std::max<uint32_t>(spin_count, uint32_t(std::max(REXCVAR_GET(ds2_cs_min_spin), 0)));
+  const volatile int32_t* lock_word = reinterpret_cast<const volatile int32_t*>(&cs->lock_count);
+  bool spun = false;
   while (spin_count--) {
-    if (rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
+    if (*lock_word == -1 && rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
       // Acquired.
       cs->owning_thread = cur_thread;
       cs->recursion_count = 1;
+#if REX_PLATFORM_SWITCH
+      if (spun && RexSwitchPerfCount) RexSwitchPerfCount(88);  // v108: contended, acquired while spinning
+#endif
       return;
     }
+    spun = true;
+#if defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
   }
 
   if (rex::thread::atomic_inc(&cs->lock_count) != 0) {
     // Create a full waiter.
+#if REX_PLATFORM_SWITCH
+    if (RexSwitchPerfCount) RexSwitchPerfCount(89);  // v108: contended, slept in the kernel
+#endif
     xeKeWaitForSingleObject(reinterpret_cast<void*>(cs.host_address()), 8, 0, 0, nullptr);
   }
 

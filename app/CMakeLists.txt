@@ -44,6 +44,19 @@ target_compile_options(ds2_recomp PRIVATE $<$<CXX_COMPILER_ID:Clang,AppleClang>:
 target_compile_options(ds2_recomp PRIVATE -fno-strict-aliasing)
 rexglue_apply_target_settings(ds2_recomp)
 
+# v108: profile-guided optimisation of the recompiled game code. GEN: counters on every branch (-fprofile-arcs;
+# devkitA64's libgcov has no value profilers and no file output, see src/ds2_pgo.cpp). USE: the .gcda files put
+# back next to the objects of the same build folder (tools/pgo/restore_gcda.py).
+set(DS2_PGO "OFF" CACHE STRING "Profile-guided optimisation of the game code: OFF, GEN or USE")
+if(DS2_PGO STREQUAL "GEN")
+    target_compile_options(ds2_recomp PRIVATE -fprofile-arcs -fprofile-update=single
+                           -fprofile-info-section=ds2_gcov_info)
+elseif(DS2_PGO STREQUAL "USE")
+    target_compile_options(ds2_recomp PRIVATE -fbranch-probabilities -fprofile-use -fno-profile-values
+                           -fprofile-partial-training -fprofile-correction -Wno-missing-profile
+                           -Wno-coverage-mismatch)
+endif()
+
 set(DS2_SOURCES
     src/main.cpp
     src/ds2_capture.cpp
@@ -54,10 +67,15 @@ set(DS2_SOURCES
     src/ds2_editor_wait.cpp
     src/ds2_switch_platform.cpp
     src/ds2_mode_overlay.cpp
+    src/ds2_pgo.cpp
 )
 add_executable(ds2 ${DS2_SOURCES})
 target_include_directories(ds2 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${DS2_GENERATED_DIR}")
 target_link_libraries(ds2 PRIVATE ds2_recomp rex::runtime)
+if(DS2_PGO STREQUAL "GEN")
+    target_compile_definitions(ds2 PRIVATE DS2_PGO_GEN=1)
+    target_link_options(ds2 PRIVATE -fprofile-arcs)
+endif()
 if(REXGLUE_PLATFORM_SWITCH)
     # One static executable: the GPU plugin is linked in instead of loaded from a shared library.
     rexglue_configure_target(ds2 GPU_PLUGINS xenos)

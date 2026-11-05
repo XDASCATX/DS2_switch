@@ -110,7 +110,7 @@ constexpr u64 kReportSeconds = 10;
 constexpr u64 kStartDelayNs = 8000000000ULL;
 constexpr size_t kMaxSamples = 1 << 15;
 constexpr size_t kFrames = 10;
-constexpr unsigned kCounterCount = 87;  // DS2: 76/77 direct resolves / fallbacks, 78-80 memexport, 81 hoisted uploads
+constexpr unsigned kCounterCount = 90;  // v108: 87 recovered guest faults, 88/89 critical sections. DS2: 76/77 direct resolves / fallbacks, 78-80 memexport, 81 hoisted uploads
 // In <NRO folder>/logs/rex/ (switch_crash_hooks.c computes it at startup).
 std::string ReportPath() {
   return std::string(RexSwitchLogDir()) + "rex_perfil.log";
@@ -442,7 +442,7 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
   std::fprintf(f,
                "==== %.1f s | modo: %s | juego %.1f fps | CPU total %.0f%% (400%% = 4 nucleos) | fallos/s: "
                "lectura emulada %.0f, manejador SDK %.0f, reintento emulado %.0f, SEH %.0f, "
-               "fisica confirmada %.0f, vistas %.0f, invalidos recuperados %.0f (total %llu) | invitado %zu/%zu MB (respaldo/mapeado) | "
+               "fisica confirmada %.0f, vistas %.0f, invalidos recuperados %.0f (total %llu), secciones criticas: girando %.0f, durmiendo %.0f | invitado %zu/%zu MB (respaldo/mapeado) | "
                "limite de mapeo %llu/%llu MB, proceso %llu/%llu MB | "
                "muestras %zu | vigilancia: %s | samplers: %.0f nuevos/s, %.0f parones/s\n",
                seconds, mode, double(counters_now[0] - counters_last[0]) / seconds, total_cpu,
@@ -452,8 +452,10 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
                double(counters_now[4] - counters_last[4]) / seconds,
                double(counters_now[17] - counters_last[17]) / seconds,
                double(counters_now[18] - counters_last[18]) / seconds,
-               double(counters_now[82] - counters_last[82]) / seconds,
-               (unsigned long long)counters_now[82],
+               double(counters_now[87] - counters_last[87]) / seconds,
+               (unsigned long long)counters_now[87],
+               double(counters_now[88] - counters_last[88]) / seconds,
+               double(counters_now[89] - counters_last[89]) / seconds,
                RexGmCommittedBytes() >> 20, RexGmMappedBytes() >> 20,
                (u64)lim_usado, (u64)lim_tope, (u64)proc_usado, (u64)proc_total, g_sample_count,
                 (RexGmModoProteccion() == 1   ? "permisos (paginas legibles)"

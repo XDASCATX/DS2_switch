@@ -774,7 +774,7 @@ void WriteBack(const Exception& ex, const HostThreadContext& tc, ThreadException
                                    : "acceso invalido del juego recuperado (lectura = 0)",
                           ctx, ctx->sp.x, pc);
       }
-      RexSwitchPerfCount(82);  // v105: stray guest accesses recovered
+      RexSwitchPerfCount(87);  // v105: stray guest accesses recovered (v108: counter 87)
       RexResumeFromException(ctx);
     }
   }

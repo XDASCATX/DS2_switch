@@ -11,6 +11,7 @@
 #include "ds2_dlc.h"
 #include "ds2_input_script.h"
 #include "ds2_mode_overlay.h"
+#include "ds2_pgo.h"
 #include "ds2_watchdog.h"
 #include "ds2_func_counts.h"
 
@@ -89,11 +90,13 @@ class Ds2App : public rex::ReXApp {
     (void)thread;
     ds2::capture::Start(runtime());
     ds2::watchdog::Start(runtime());
+    ds2::pgo::Start();  // v108: DS2_PGO=GEN builds only
     ds2::mode_overlay::Start(imgui_drawer(), [this](std::function<void()> f) {
       app_context().CallInUIThreadDeferred(std::move(f));
     });
   }
   void OnShutdown() override {
+    ds2::pgo::Stop();
     ds2::mode_overlay::Stop();
     ds2::watchdog::Stop();
     ds2::capture::Stop();
