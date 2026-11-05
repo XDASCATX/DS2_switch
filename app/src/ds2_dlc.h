@@ -25,4 +25,9 @@ void InstallConfigured(rex::Runtime* runtime);
 void InstallWithProgress(rex::Runtime* runtime, rex::ui::ImGuiDrawer* drawer,
                          std::function<void(std::function<void()>)> post_to_ui, std::function<void()> then);
 
+// v107: start screen with two buttons (720p / 540p internal resolution), then `then` on the UI thread. Without
+// ds2_resolution_prompt, `then` at once (ds2_render_scale from ds2.toml). Called from the UI thread.
+void ChooseResolution(rex::ui::ImGuiDrawer* drawer, std::function<void(std::function<void()>)> post_to_ui,
+                      std::function<void()> then);
+
 }  // namespace ds2::dlc

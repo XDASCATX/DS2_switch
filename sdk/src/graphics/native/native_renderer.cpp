@@ -181,6 +181,9 @@ REXCVAR_DEFINE_BOOL(ds2_native_resolve_skip_unchanged, true, "GPU",
 REXCVAR_DEFINE_INT32(ds2_fps_cap, 0, "GPU",
                      "v106: frame rate cap with even frame spacing (30 = a steady 30 instead of 28-40 jumping); "
                      "0 = off");
+REXCVAR_DEFINE_DOUBLE(ds2_render_scale, 1.0, "GPU",
+                      "v107: internal resolution of the scene (1 = 720p, 0.75 = 540p); chosen on the start screen "
+                      "when ds2_resolution_prompt is on");
 REXCVAR_DEFINE_BOOL(ds2_native_dynamic_textures, true, "GPU",
                     "RC86: a texture whose content changed is checked every frame for 120 frames (videos)");
 REXCVAR_DEFINE_BOOL(ds2_native_fast_registers, true, "GPU",
@@ -253,6 +256,11 @@ REXCVAR_DEFINE_INT32(ds2_native_probe, 0, "GPU",
 extern "C" void RexSwitchPerfCount(unsigned id);  // switch_perf.cpp: 0 = swaps (FPS for the overlay / SaltyNX)
 extern "C" int RexSwitchStickClicksHeld(void);     // switch_perf.cpp: L3 and R3 both held (handheld or pad 1)
 #endif
+
+namespace rex::graphics::vulkan {
+extern std::atomic<bool> g_fragcoord_scale_patch;  // shader.cpp (v107)
+constexpr uint32_t kFragCoordScaleSpecId = 0x5400;  // same value as in shader.cpp
+}  // namespace rex::graphics::vulkan
 
 namespace rex::graphics::native {
 
@@ -556,6 +564,7 @@ struct NativeImage {
   bool depth = false;
   uint32_t samples = 1;      // RC71: 4 for the host MSAA copies of 4x render targets
   uint64_t write_id = 0;     // v106: changes on every GPU write recorded into this image (0 = unknown)
+  bool scaled = false;       // v107: a render target at the reduced internal resolution (ds2_render_scale)
   bool initialized = false;  // transitioned to GENERAL
 };
 
@@ -860,6 +869,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     bool rb_swapped = false;  // RB_COPY_DEST_INFO.copy_dest_swap: red and blue swapped in the guest copy
     uint32_t guest_pitch = 0, guest_height = 0, bpp_log2 = 2;  // guest texture layout (tiled), for sub-resolves
     uint32_t sample_scale_x = 1, sample_scale_y = 1;
+    float scale = 1.0f;  // v107: resolved from a render target at the reduced internal resolution
     uint64_t generation = 0;
     uint64_t frame = 0;
     // v106: the last plain copy into this entry, to skip a resolve that would copy the same unchanged pixels.
@@ -1117,6 +1127,23 @@ class NativeCommandProcessor final : public CommandProcessor {
   std::unordered_map<VkImage, HalfResTarget> halfres_targets_;
   uint64_t write_counter_ = 0;  // v106: source of NativeImage::write_id
   uint64_t cap_next_us_ = 0;     // v106: ds2_fps_cap, when the next frame may be presented
+  // v107: reduced internal resolution. Render targets 1280 samples wide (the DS2 scene: 1280x720 1x and 640x360
+  // 4x) are created at res_scale_ of their size; draws into them scale viewport and scissor, and their pixel
+  // shaders see guest pixel positions (gl_FragCoord patch, see sdk/src/graphics/vulkan/shader.cpp).
+  float res_scale_ = 1.0f;
+  bool res_scale_latched_ = false;
+  void LatchRenderScale();
+  bool IsScaledPitch(uint32_t sample_pitch) const { return res_scale_ < 1.0f && sample_pitch == 1280; }
+  uint32_t Sc(uint32_t v) const { return uint32_t(std::lround(double(v) * double(res_scale_))); }
+  int32_t Sc(int32_t v) const { return int32_t(std::lround(double(v) * double(res_scale_))); }
+  void ScaleScissor(draw_util::Scissor& sc) const {
+    const uint32_t x0 = Sc(sc.offset[0]), y0 = Sc(sc.offset[1]);
+    const uint32_t x1 = Sc(sc.offset[0] + sc.extent[0]), y1 = Sc(sc.offset[1] + sc.extent[1]);
+    sc.offset[0] = x0;
+    sc.offset[1] = y0;
+    sc.extent[0] = x1 - x0;
+    sc.extent[1] = y1 - y0;
+  }
   void Written(NativeImage& img) { img.write_id = ++write_counter_; }
   VkPipeline halfres_composite_pipeline_ = VK_NULL_HANDLE;
   VkPipeline halfres_composite_pipeline_msaa_ = VK_NULL_HANDLE;  // v105: into a host 4x MSAA copy
@@ -2006,6 +2033,10 @@ NativeImage* NativeCommandProcessor::GetRenderTarget(uint32_t base, uint32_t pit
   }
   if (vk_format == VK_FORMAT_UNDEFINED || !pitch) return nullptr;
   uint32_t height = std::clamp<uint32_t>(rex::align<uint32_t>(height_hint, 8), 8, 2048);
+  // v107: reduced internal resolution for the scene's render targets.
+  const bool scaled = IsScaledPitch(pitch);
+  const uint32_t image_width = scaled ? std::max<uint32_t>(Sc(pitch), 8) : pitch;
+  if (scaled) height = std::max<uint32_t>(Sc(height), 8);
   auto it = render_targets_.find(key);
   if (it != render_targets_.end()) {
     if (it->second.height >= height) {
@@ -2031,9 +2062,10 @@ NativeImage* NativeCommandProcessor::GetRenderTarget(uint32_t base, uint32_t pit
   VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                             VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                             (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
-  if (!CreateImage(img, vk_format, pitch, height, depth, usage)) return nullptr;
+  if (!CreateImage(img, vk_format, image_width, height, depth, usage)) return nullptr;
   EnsureGeneral(img);
   Written(img);
+  img.scaled = scaled;
   // Start from zero like a fresh EDRAM range would look after a clear.
   VkImageSubresourceRange r = ui::vulkan::util::InitializeSubresourceRange(
       depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_COLOR_BIT);
@@ -3466,17 +3498,32 @@ VkPipeline NativeCommandProcessor::CreatePipelineObject(const PipelineKey& key, 
     ++stage_count;
   }
   // RC96: texture signs (IDs kSpecTextureSignsBase + word); unused IDs in a module are ignored by Vulkan.
-  VkSpecializationMapEntry sign_entries[8];
+  // v107: + the gl_FragCoord scale of pixel shaders drawing into reduced-resolution targets.
+  VkSpecializationMapEntry sign_entries[9];
   VkSpecializationInfo sign_info = {};
+  struct {
+    uint32_t signs[8];
+    float frag_scale;
+  } spec_data = {};
+  static_assert(sizeof(key.texture_signs) == sizeof(spec_data.signs), "texture signs: 8 words");
+  uint32_t spec_count = 0;
   if (REXCVAR_GET(ds2_native_fold_texture_signs)) {
+    std::memcpy(spec_data.signs, key.texture_signs, sizeof(spec_data.signs));
     for (uint32_t w = 0; w < 8; ++w) {
-      sign_entries[w] = {SpirvShaderTranslator::kSpecTextureSignsBase + w, uint32_t(w * sizeof(uint32_t)),
-                         sizeof(uint32_t)};
+      sign_entries[spec_count++] = {SpirvShaderTranslator::kSpecTextureSignsBase + w, uint32_t(w * sizeof(uint32_t)),
+                                    sizeof(uint32_t)};
     }
-    sign_info.mapEntryCount = 8;
+  }
+  if (key.samples_reserved && res_scale_ < 1.0f) {
+    spec_data.frag_scale = 1.0f / res_scale_;
+    sign_entries[spec_count++] = {vulkan::kFragCoordScaleSpecId, uint32_t(offsetof(decltype(spec_data), frag_scale)),
+                                  sizeof(float)};
+  }
+  if (spec_count) {
+    sign_info.mapEntryCount = spec_count;
     sign_info.pMapEntries = sign_entries;
-    sign_info.dataSize = sizeof(key.texture_signs);
-    sign_info.pData = key.texture_signs;
+    sign_info.dataSize = sizeof(spec_data);
+    sign_info.pData = &spec_data;
     for (uint32_t i = 0; i < stage_count; ++i) stages[i].pSpecializationInfo = &sign_info;
   }
   VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -3695,8 +3742,9 @@ NativeCommandProcessor::ResolveLogicalImage* NativeCommandProcessor::GetResolveL
   if (!REXCVAR_GET(ds2_native_resolve_logical_size)) return nullptr;
   // Preserve sample-space MSAA (not downsampling): only discard layout padding.
   // Check in 64 bits before narrowing, including a defensive zero-size check.
-  const uint64_t scaled_width = uint64_t(width) * entry.sample_scale_x;
-  const uint64_t scaled_height = uint64_t(height) * entry.sample_scale_y;
+  // v107: and the reduced internal resolution of the source.
+  const uint64_t scaled_width = uint64_t(std::lround(double(width) * entry.sample_scale_x * entry.scale));
+  const uint64_t scaled_height = uint64_t(std::lround(double(height) * entry.sample_scale_y * entry.scale));
   if (!scaled_width || !scaled_height || scaled_width > entry.image.width ||
       scaled_height > entry.image.height ||
       (scaled_width == entry.image.width && scaled_height == entry.image.height)) {
@@ -4017,8 +4065,10 @@ VkImageView NativeCommandProcessor::GetResolveDepthView(ResolvedEntry& entry, ui
                                                        bool float24, uint32_t guest_swizzle) {
   if (!convert_fs_[kConvertRgba8ToDepth]) return VK_NULL_HANDLE;
   // Logical (fetch) size in the resolve's sample space, clamped to the image.
-  const uint32_t w = std::min<uint32_t>(width * entry.sample_scale_x, entry.image.width);
-  const uint32_t h = std::min<uint32_t>(height * entry.sample_scale_y, entry.image.height);
+  const uint32_t w = std::min<uint32_t>(uint32_t(std::lround(double(width) * entry.sample_scale_x * entry.scale)),
+                                        entry.image.width);
+  const uint32_t h = std::min<uint32_t>(uint32_t(std::lround(double(height) * entry.sample_scale_y * entry.scale)),
+                                        entry.image.height);
   if (!w || !h) return VK_NULL_HANDLE;
   const uint64_t key = uint64_t(w) | (uint64_t(h) << 24) | (uint64_t(float24) << 48);
   ResolveLogicalImage& d = entry.depth_decoded[key];
@@ -4358,9 +4408,22 @@ Shader* NativeCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
 
 // --- Draws -----------------------------------------------------------------------------------------------------
 
+void NativeCommandProcessor::LatchRenderScale() {
+  if (res_scale_latched_) return;
+  res_scale_latched_ = true;
+  const double s = REXCVAR_GET(ds2_render_scale);
+  if (s >= 0.5 && s < 0.999) {
+    res_scale_ = float(s);
+    vulkan::g_fragcoord_scale_patch.store(true, std::memory_order_relaxed);
+  }
+  REXGPU_INFO("[native] internal resolution: {:.2f} ({}x{} for the 1280x720 scene)", double(res_scale_),
+              Sc(uint32_t(1280)), Sc(uint32_t(720)));
+}
+
 bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info, bool major_mode_explicit) {
   (void)major_mode_explicit;
+  LatchRenderScale();
   if (!msaa_force_clear_) msaa_replay_clear_ = false;
   const RegisterFile& regs = *register_file_;
   const xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
@@ -4589,7 +4652,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   const uint32_t sample_pitch = surface_info.surface_pitch * sx;
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
-  const draw_util::Scissor scissor_pixels = scissor;
+  draw_util::Scissor scissor_pixels = scissor;
   // RC71: host 4x MSAA candidates (the lookups below then leave the 4x copies as they are).
   const bool msaa_candidate = msaa_supported_ && REXCVAR_GET(ds2_native_msaa_host) &&
                               surface_info.msaa_samples == xenos::MsaaSamples::k4X;
@@ -4599,6 +4662,12 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   scissor.offset[1] *= sy;
   scissor.extent[1] *= sy;
   const uint32_t height_hint = std::max<uint32_t>(scissor.offset[1] + scissor.extent[1], 8);
+  // v107: a draw into the scene's render targets at the reduced internal resolution.
+  const bool draw_scaled = IsScaledPitch(sample_pitch);
+  if (draw_scaled) {
+    ScaleScissor(scissor);
+    ScaleScissor(scissor_pixels);
+  }
   NativeImage* color_rts[4] = {};
   VkFormat color_formats[4] = {};
   uint32_t color_count = 0;
@@ -4920,6 +4989,7 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   key.has_ps = ps ? 1 : 0;
   key.depth_clamp = regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable ? 1 : 0;
   key.samples = host_msaa ? 4 : 0;
+  key.samples_reserved = (draw_scaled && ps) ? 1u : 0u;  // v107: pixel shader sees guest pixel positions
   if (native_vertex) {
     key.native_binding_count = uint32_t(native_plan.bindings.size());
     key.native_attribute_count = uint32_t(native_plan.words.size());
@@ -5652,6 +5722,12 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   vp.y = float(viewport.xy_offset[1]);
   vp.width = float(std::max(viewport.xy_extent[0], 1u));
   vp.height = float(std::max(viewport.xy_extent[1], 1u));
+  if (draw_scaled) {
+    vp.x *= res_scale_;
+    vp.y *= res_scale_;
+    vp.width *= res_scale_;
+    vp.height *= res_scale_;
+  }
   const draw_util::Scissor full_scissor = scissor;
   if (halfres_draw_) {
     const float inv = 1.0f / float(halfres_divisor_);
@@ -5912,6 +5988,7 @@ void NativeCommandProcessor::EndOcclusionQuery(uint32_t result_address) {
 }
 
 bool NativeCommandProcessor::IssueCopy() {
+  LatchRenderScale();
   FlushHalfRes();
   ScopedUs copy_timer(stats_.us_copies);
   const RegisterFile& regs = *register_file_;
@@ -5962,6 +6039,15 @@ bool NativeCommandProcessor::IssueCopy() {
     src = GetRenderTarget(ci.color_base, sample_pitch, uint32_t(ci.color_format), false, uint32_t(y1));
   }
   if (!src) return true;
+  // v107: a source at the reduced internal resolution: the rectangle (and the copy) in its pixels.
+  const bool copy_scaled = src->scaled;
+  const uint32_t guest_y1 = uint32_t(y1);
+  if (copy_scaled) {
+    x0 = Sc(x0);
+    y0 = Sc(y0);
+    x1 = Sc(x1);
+    y1 = Sc(y1);
+  }
   x1 = std::min<int32_t>(x1, int32_t(src->width));
   y1 = std::min<int32_t>(y1, int32_t(src->height));
   if (x1 <= x0 || y1 <= y0) return true;
@@ -5978,15 +6064,17 @@ bool NativeCommandProcessor::IssueCopy() {
     // RC70: a resolve rectangle is aligned to 8-pixel EDRAM tiles (320x184 for a 320x180 texture). Clipping the
     // copy to the destination size keeps the image at the texture size, so sampling it needs no extra
     // "logical size" copy (2 more copies and 4 barriers for every such step of the post-processing chains).
+    // v107: destination sizes in the source's pixels (reduced internal resolution).
+    const uint32_t dest_w = copy_scaled ? Sc(uint32_t(dest_pitch.copy_dest_pitch)) : uint32_t(dest_pitch.copy_dest_pitch);
+    const uint32_t dest_h = copy_scaled ? Sc(uint32_t(dest_pitch.copy_dest_height)) : uint32_t(dest_pitch.copy_dest_height);
     const bool clip_to_dest = REXCVAR_GET(ds2_native_resolve_clip_to_dest) && sx == 1 && sy == 1 &&
-                              dest_pitch.copy_dest_pitch && dest_pitch.copy_dest_height &&
-                              x0 < int32_t(dest_pitch.copy_dest_pitch) && y0 < int32_t(dest_pitch.copy_dest_height);
+                              dest_w && dest_h && x0 < int32_t(dest_w) && y0 < int32_t(dest_h);
     if (clip_to_dest) {
-      x1 = std::min<int32_t>(x1, int32_t(dest_pitch.copy_dest_pitch));
-      y1 = std::min<int32_t>(y1, int32_t(dest_pitch.copy_dest_height));
+      x1 = std::min<int32_t>(x1, int32_t(dest_w));
+      y1 = std::min<int32_t>(y1, int32_t(dest_h));
     }
-    const uint32_t dw = std::max<uint32_t>(dest_pitch.copy_dest_pitch * uint32_t(sx), uint32_t(x1));
-    const uint32_t dh = std::max<uint32_t>(dest_pitch.copy_dest_height * uint32_t(sy), uint32_t(y1));
+    const uint32_t dw = std::max<uint32_t>(dest_w * uint32_t(sx), uint32_t(x1));
+    const uint32_t dh = std::max<uint32_t>(dest_h * uint32_t(sy), uint32_t(y1));
     // Depth resolved into a color texture (DS2 reads its depth buffers as k_8_8_8_8 and rebuilds depth in the
     // shader): the resolved image holds the guest 32-bit words as RGBA8.
     const xenos::TextureFormat dest_tex_format = xenos::TextureFormat(dest_info.copy_dest_format);
@@ -6067,8 +6155,13 @@ bool NativeCommandProcessor::IssueCopy() {
       r.bpp_log2 = dest_bpp_log2;
       r.sample_scale_x = uint32_t(sx);
       r.sample_scale_y = uint32_t(sy);
+      r.scale = copy_scaled ? res_scale_ : 1.0f;
     }
     // Destination offset: the source position plus the sub-texture tile (in the source's sample space).
+    if (copy_scaled) {
+      sub_x = Sc(sub_x);
+      sub_y = Sc(sub_y);
+    }
     const int32_t dst_x0 = x0 + sub_x * sx, dst_y0 = y0 + sub_y * sy;
     if (r.image.format != resolved_format || dst_x0 + (x1 - x0) > int32_t(r.image.width) ||
         dst_y0 + (y1 - y0) > int32_t(r.image.height)) {
@@ -6158,7 +6251,7 @@ bool NativeCommandProcessor::IssueCopy() {
   const VkRect2D rect = {{x0, y0}, {uint32_t(clear_x1 - x0), uint32_t(clear_y1 - y0)}};
   if (info.IsClearingDepth()) {
     const auto di = regs.Get<reg::RB_DEPTH_INFO>();
-    NativeImage* d = GetRenderTarget(di.depth_base, sample_pitch, uint32_t(di.depth_format), true, uint32_t(y1));
+    NativeImage* d = GetRenderTarget(di.depth_base, sample_pitch, uint32_t(di.depth_format), true, guest_y1);
     if (d) {
       VkClearValue cv = {};
       const uint32_t raw = info.rb_depth_clear;
@@ -6274,8 +6367,11 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   bool presented_this_swap = false;
   if (presenter && rit != resolved_.end()) {
     NativeImage& src = rit->second.image;
-    const uint32_t w = frontbuffer_width ? std::min(frontbuffer_width, src.width) : src.width;
-    const uint32_t h = frontbuffer_height ? std::min(frontbuffer_height, src.height) : src.height;
+    // v107: a front buffer at the reduced internal resolution covers the same part of its image.
+    const float fs = rit->second.scale;
+    const uint32_t w = frontbuffer_width ? std::min(uint32_t(std::lround(frontbuffer_width * fs)), src.width) : src.width;
+    const uint32_t h =
+        frontbuffer_height ? std::min(uint32_t(std::lround(frontbuffer_height * fs)), src.height) : src.height;
     system::X_VIDEO_MODE video_mode;
     kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
     presenter->RefreshGuestOutput(

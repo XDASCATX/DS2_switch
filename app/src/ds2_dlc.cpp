@@ -35,6 +35,8 @@ REXCVAR_DEFINE_STRING(ds2_install_dlc, "", "DS2",
                       "Empty: every file of <executable folder>/dlc/ is installed.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(ds2_resolution_prompt, true, "DS2",
+                    "v107: ask for the internal resolution (720p / 540p) on the start screen; off = ds2_render_scale");
 REXCVAR_DEFINE_STRING(ds2_calibration_file, "", "DS2",
                       "RC92: the game's online calibration (the regulation the 360 downloads into the save, file "
                       "USER_DATA15 of the -GAME_0000 save, e.g. Calibration 1.15 of the release). At start it is copied "
@@ -207,7 +209,69 @@ class InstallDialog final : public rex::ui::ImGuiDialog {
 std::unique_ptr<InstallDialog> g_dialog;
 std::thread g_install_thread;
 
+// v107: start screen with the internal resolution of the scene (ds2_render_scale): two buttons in the centre of the
+// screen, driven with the controller (D-pad + A) or the touch screen.
+class ResolutionDialog final : public rex::ui::ImGuiDialog {
+ public:
+  ResolutionDialog(rex::ui::ImGuiDrawer* drawer, std::function<void(double)> on_choice)
+      : ImGuiDialog(drawer), on_choice_(std::move(on_choice)) {}
+
+ protected:
+  void OnDraw(ImGuiIO& io) override {
+    if (chosen_) return;
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always,
+                            ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowBgAlpha(0.9f);
+    if (first_frame_) ImGui::SetNextWindowFocus();
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize;
+    if (ImGui::Begin("##ds2_resolution", nullptr, flags)) {
+      ImGui::SetWindowFontScale(2.0f);
+      ImGui::TextUnformatted("Resolution");
+      ImGui::SetWindowFontScale(1.6f);
+      const ImVec2 size(io.DisplaySize.x * 0.24f, io.DisplaySize.y * 0.2f);
+      if (first_frame_) ImGui::SetKeyboardFocusHere();
+      double choice = 0.0;
+      if (ImGui::Button("720p\nNative, sharp", size)) choice = 1.0;
+      ImGui::SetItemDefaultFocus();
+      ImGui::SameLine();
+      if (ImGui::Button("540p\nMore FPS, softer", size)) choice = 0.75;
+      first_frame_ = false;
+      if (choice > 0.0) {
+        chosen_ = true;
+        on_choice_(choice);
+      }
+    }
+    ImGui::End();
+  }
+
+ private:
+  std::function<void(double)> on_choice_;
+  bool chosen_ = false;
+  bool first_frame_ = true;
+};
+
+std::unique_ptr<ResolutionDialog> g_resolution_dialog;
+
 }  // namespace
+
+void ChooseResolution(rex::ui::ImGuiDrawer* drawer, std::function<void(std::function<void()>)> post_to_ui,
+                      std::function<void()> then) {
+  if (!drawer || !post_to_ui || !REXCVAR_GET(ds2_resolution_prompt)) {
+    then();
+    return;
+  }
+  g_resolution_dialog = std::make_unique<ResolutionDialog>(drawer, [post_to_ui, then](double scale) {
+    // From inside the dialog's OnDraw: the dialog is destroyed later, on the UI thread, before the game starts.
+    post_to_ui([scale, then]() {
+      rex::cvar::SetFlagByName("ds2_render_scale", scale >= 1.0 ? "1.0" : "0.75");
+      REXLOG_INFO("ds2: internal resolution chosen on the start screen: {}", scale >= 1.0 ? "720p" : "540p");
+      g_resolution_dialog.reset();
+      then();
+    });
+  });
+}
+
 
 void InstallWithProgress(rex::Runtime* runtime, rex::ui::ImGuiDrawer* drawer,
                          std::function<void(std::function<void()>)> post_to_ui, std::function<void()> then) {

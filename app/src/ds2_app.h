@@ -76,11 +76,12 @@ class Ds2App : public rex::ReXApp {
 
   // v101: the packages are unpacked on a worker thread while the UI thread draws a progress bar (on the first boot
   // this takes minutes and the screen used to stay black); the game is launched when it is done.
+  // v107: first the start screen with the internal resolution (720p / 540p).
   void LaunchModule() override {
-    ds2::dlc::InstallWithProgress(
-        runtime(), imgui_drawer(),
-        [this](std::function<void()> f) { app_context().CallInUIThreadDeferred(std::move(f)); },
-        [this]() { rex::ReXApp::LaunchModule(); });
+    auto post = [this](std::function<void()> f) { app_context().CallInUIThreadDeferred(std::move(f)); };
+    ds2::dlc::ChooseResolution(imgui_drawer(), post, [this, post]() {
+      ds2::dlc::InstallWithProgress(runtime(), imgui_drawer(), post, [this]() { rex::ReXApp::LaunchModule(); });
+    });
   }
 
   // Diagnostic frame capture (off unless --ds2_capture_dir is given), see ds2_capture.h.
