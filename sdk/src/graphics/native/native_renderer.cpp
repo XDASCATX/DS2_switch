@@ -5144,6 +5144,16 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                     f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8],
                     uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch),
                     uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples));
+        // v112: the rest of the first vertex (DS2's clear rectangles carry their color there) and the exponent
+        // bias of the first color target (the clear color is scaled by it).
+        float extra[4] = {};
+        for (uint32_t c = 0; vtx && c < 4 && (3 + c) < stride_words && (3 + c) * 4 < size; ++c) {
+          extra[c] = xenos::GpuSwap(rex::memory::Reinterpret<float>(vtx[3 + c]), vf.endian);
+        }
+        const auto ci0 = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+        REXGPU_INFO("[native trace]     rect vertex 0 data ({} {} {} {}) stride {} | RT0 format {} exp bias {}",
+                    extra[0], extra[1], extra[2], extra[3], stride_words, uint32_t(ci0.color_format),
+                    int32_t(ci0.color_exp_bias));
       }
     }
     if (!size) {
