@@ -405,9 +405,9 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
         char text[64];
         std::snprintf(text, sizeof(text), "Auto start in %d s  -  any button to stay", int(left) + 1);
         souls::CenteredTitle(text, 0.75f, souls::kEmber);
-      } else {
-        DrawHints();
+        ImGui::Dummy(ImVec2(0.0f, 4.0f));
       }
+      DrawHints();  // v121: also under the countdown, so the touch hint is always visible
       first_frame_ = false;
     }
     ImGui::End();
@@ -426,7 +426,7 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
   }
 
  private:
-  static constexpr float kCountdown = 10.0f;
+  static constexpr float kCountdown = 20.0f;  // v121: 20 s (was 10)
 
   // Dark screen with embers rising from a glow at the bottom, and the port version in the corner.
   void DrawBackground(ImGuiIO& io) {
@@ -467,15 +467,19 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
   }
   static constexpr int kEmbers = 70;
 
-  // "[D-pad] Select    (A) Start" with drawn glyphs.
+  // "[D-pad] Select    (A) Start   or   [finger] Tap" with drawn glyphs (v121: the touch hint).
   void DrawHints() {
     namespace souls = rex::ui::souls;
     souls::PushTitleFont(0.62f);
     const char* select = "Select";
     const char* start = "Start";
+    const char* or_text = "or";
+    const char* tap = "Tap";
     const ImVec2 ts = ImGui::CalcTextSize(select), tt = ImGui::CalcTextSize(start);
-    const float icon = ts.y * 1.1f, space = 10.0f, group_gap = 40.0f;
-    const float total = icon + space + ts.x + group_gap + icon + space + tt.x;
+    const ImVec2 to = ImGui::CalcTextSize(or_text), tp = ImGui::CalcTextSize(tap);
+    const float icon = ts.y * 1.1f, space = 10.0f, group_gap = 40.0f, or_gap = 28.0f;
+    const float total = icon + space + ts.x + group_gap + icon + space + tt.x + or_gap + to.x + or_gap + icon +
+                        space + tp.x;
     const float x0 = ImGui::GetCursorScreenPos().x + (ImGui::GetContentRegionAvail().x - total) * 0.5f;
     const float y0 = ImGui::GetCursorScreenPos().y;
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -497,6 +501,31 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       dl->AddText(ImVec2(m.x - la.x * 0.5f, m.y - la.y * 0.5f), souls::Col(souls::kParchment), "A");
     }
     dl->AddText(ImVec2(ax + icon + space, y0), ink, start);
+    // "or", dimmer.
+    const float ox = ax + icon + space + tt.x + or_gap;
+    dl->AddText(ImVec2(ox, y0), souls::Col(souls::kAsh, 0.6f), or_text);
+    // Finger: a pointing finger over a palm, with two tap arcs at the tip.
+    const float fx = ox + to.x + or_gap;
+    {
+      const float h = icon * 1.15f;
+      const float top = y0 + ts.y * 0.5f - h * 0.5f;
+      const float cx = fx + icon * 0.5f;
+      const float fw = icon * 0.22f;                 // finger width
+      const ImVec2 tip(cx, top + h * 0.12f);
+      // finger
+      dl->AddRect(ImVec2(cx - fw * 0.5f, tip.y), ImVec2(cx + fw * 0.5f, top + h * 0.62f), ink, fw * 0.5f,
+                  ImDrawFlags_RoundCornersTop, 1.6f);
+      // palm
+      dl->AddRect(ImVec2(cx - icon * 0.36f, top + h * 0.55f), ImVec2(cx + icon * 0.36f, top + h),
+                  ink, icon * 0.14f, 0, 1.6f);
+      // tap arcs
+      const ImU32 ember = souls::Col(souls::kEmber);
+      dl->PathArcTo(tip, fw * 1.3f, 3.14159f * 1.15f, 3.14159f * 1.85f, 10);
+      dl->PathStroke(ember, 0, 1.4f);
+      dl->PathArcTo(tip, fw * 2.1f, 3.14159f * 1.15f, 3.14159f * 1.85f, 12);
+      dl->PathStroke(ember, 0, 1.4f);
+    }
+    dl->AddText(ImVec2(fx + icon + space, y0), ink, tap);
     souls::PopTitleFont();
     ImGui::Dummy(ImVec2(total, ts.y));
   }
@@ -531,15 +560,20 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
     const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     // v118: both cards breathe in ember while the screen waits for a choice; the focused one more strongly.
+    // v121: much stronger (the v118 thin border was not visible on the console): the whole card fills and
+    // fades with ember light (~1.6 s cycle), a thick border and a wide halo around it.
     {
-      const float pulse = 0.5f + 0.5f * std::sin(float(ImGui::GetTime()) * 2.4f);
-      const float strength = hot ? 0.55f + 0.45f * pulse : 0.18f + 0.22f * pulse;
-      for (int i = 3; i >= 1; --i) {
+      const float pulse = 0.5f + 0.5f * std::sin(float(ImGui::GetTime()) * 3.9f);
+      const float strength = hot ? 0.55f + 0.45f * pulse : 0.25f + 0.45f * pulse;
+      const ImU32 fill_top = souls::Col(souls::kEmber, strength * (hot ? 0.10f : 0.06f));
+      const ImU32 fill_bottom = souls::Col(souls::kEmber, strength * (hot ? 0.30f : 0.20f));
+      dl->AddRectFilledMultiColor(a, b, fill_top, fill_top, fill_bottom, fill_bottom);
+      for (int i = 6; i >= 1; --i) {
         const float g = float(i) * 3.0f;
         dl->AddRect(ImVec2(a.x - g, a.y - g), ImVec2(b.x + g, b.y + g),
-                    souls::Col(souls::kEmber, strength * 0.22f / float(i)), 0.0f, 0, 2.0f);
+                    souls::Col(souls::kEmber, strength * 0.40f / float(i)), 0.0f, 0, 3.0f);
       }
-      dl->AddRect(a, b, souls::Col(souls::kEmber, strength), 0.0f, 0, hot ? 2.5f : 1.5f);
+      dl->AddRect(a, b, souls::Col(souls::kEmber, 0.35f + 0.65f * strength), 0.0f, 0, hot ? 3.5f : 2.5f);
     }
     souls::PushTitleFont(1.3f);
     ImVec2 t = ImGui::CalcTextSize(title);

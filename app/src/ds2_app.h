@@ -54,9 +54,64 @@ class Ds2App : public rex::ReXApp {
     // 16 MB host stacks for ~44 guest threads exhausted the heap (PC measurement: <= 3.6 MB used).
     SetIfDefault("host_thread_stack_mb", "6");
 #endif
+    ResolveShaderLibrary();
     ds2::watchdog::ApplyPlatformSwitches();
     ds2::func_counts::Configure();
     ds2::mode_overlay::ApplyConfig();
+  }
+
+  /*
+   * v121: the shader pack keeps one name, ds2_shaders.spvlib (+ .idx), so an update replaces only ds2.nro and
+   * ds2.toml. If the file named in ds2.toml is not next to the NRO, the versioned pack of an older build
+   * (ds2_shaders_vNNN.spvlib, the newest number) is used instead, so nothing has to be renamed when updating.
+   * Done here, before the renderer opens the pack; the pack loader itself is untouched (its sources are part of
+   * the translator signature).
+   */
+  static void ResolveShaderLibrary() {
+    if (rex::cvar::GetFlagInfo("ds2_shader_library") == nullptr) return;
+    const auto dir = rex::filesystem::GetExecutableFolder();
+    if (dir.empty()) return;
+    std::error_code ec;
+    auto usable = [](const std::filesystem::path& p) {
+      std::error_code e;
+      auto idx = p;
+      idx += ".idx";
+      return std::filesystem::is_regular_file(p, e) && std::filesystem::is_regular_file(idx, e);
+    };
+    std::string name = rex::cvar::GetFlagByName("ds2_shader_library");
+    if (name.empty()) name = "ds2_shaders.spvlib";
+    std::filesystem::path wanted(name);
+    if (wanted.is_relative()) wanted = dir / wanted;
+    if (usable(wanted)) {
+      rex::cvar::SetFlagByName("ds2_shader_library", name);
+      return;
+    }
+    std::filesystem::path best;
+    int best_version = -1;
+    for (auto it = std::filesystem::directory_iterator(dir, ec); !ec && it != std::filesystem::directory_iterator();
+         it.increment(ec)) {
+      const std::string file = it->path().filename().string();
+      int version = -1;
+      if (file == "ds2_shaders.spvlib") {
+        version = 1 << 30;
+      } else if (file.rfind("ds2_shaders_v", 0) == 0 && file.size() > 20 &&
+                 file.compare(file.size() - 7, 7, ".spvlib") == 0) {
+        const std::string digits = file.substr(13, file.size() - 20);
+        if (!digits.empty() && digits.find_first_not_of("0123456789") == std::string::npos && digits.size() < 9)
+          version = std::stoi(digits);
+      }
+      if (version > best_version && usable(it->path())) {
+        best_version = version;
+        best = it->path();
+      }
+    }
+    if (best.empty()) {
+      REXLOG_WARN("ds2: shader pack {} not found next to the NRO (no ds2_shaders*.spvlib + .idx either)", name);
+      return;
+    }
+    const std::string found = best.filename().string();
+    rex::cvar::SetFlagByName("ds2_shader_library", found);
+    REXLOG_INFO("ds2: shader pack {} not found, using {}", name, found);
   }
 
   static void SetIfDefault(const char* name, const char* value) {
