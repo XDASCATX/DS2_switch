@@ -478,8 +478,8 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
     const ImVec2 ts = ImGui::CalcTextSize(select), tt = ImGui::CalcTextSize(start);
     const ImVec2 to = ImGui::CalcTextSize(or_text), tp = ImGui::CalcTextSize(tap);
     const float icon = ts.y * 1.1f, space = 10.0f, group_gap = 40.0f, or_gap = 28.0f;
-    const float total = icon + space + ts.x + group_gap + icon + space + tt.x + or_gap + to.x + or_gap + icon +
-                        space + tp.x;
+    const float total = icon + space + ts.x + group_gap + icon + space + tt.x + or_gap + to.x + or_gap +
+                        icon * 1.2f + space + tp.x;
     const float x0 = ImGui::GetCursorScreenPos().x + (ImGui::GetContentRegionAvail().x - total) * 0.5f;
     const float y0 = ImGui::GetCursorScreenPos().y;
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -504,28 +504,46 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
     // "or", dimmer.
     const float ox = ax + icon + space + tt.x + or_gap;
     dl->AddText(ImVec2(ox, y0), souls::Col(souls::kAsh, 0.6f), or_text);
-    // Finger: a pointing finger over a palm, with two tap arcs at the tip.
+    // Hand pointing with the index finger (a silhouette), turned 90 degrees left so the finger points left:
+    // index finger out, the other three fingers curled as knuckles, thumb folded; two tap arcs at the fingertip.
+    // Drawn upright in local coordinates and rotated: (dx, dy) -> (dy, -dx) around the icon centre.
     const float fx = ox + to.x + or_gap;
+    const float hand_w = icon * 1.2f;  // the upright hand's height becomes the width
     {
-      const float h = icon * 1.15f;
-      const float top = y0 + ts.y * 0.5f - h * 0.5f;
-      const float cx = fx + icon * 0.5f;
-      const float fw = icon * 0.22f;                 // finger width
-      const ImVec2 tip(cx, top + h * 0.12f);
-      // finger
-      dl->AddRect(ImVec2(cx - fw * 0.5f, tip.y), ImVec2(cx + fw * 0.5f, top + h * 0.62f), ink, fw * 0.5f,
-                  ImDrawFlags_RoundCornersTop, 1.6f);
+      const float h = icon * 1.2f;
+      const ImVec2 c(fx + hand_w * 0.5f, y0 + ts.y * 0.5f);
+      // Upright layout, relative to the centre (y grows down).
+      const float top = -h * 0.5f;
+      const float fw = icon * 0.20f;
+      const float fl = -icon * 0.26f + icon * 0.0f;
+      auto rot = [&](float dx, float dy) { return ImVec2(c.x + dy, c.y - dx); };
+      auto rect = [&](float x0, float y0r, float x1, float y1, float rounding, ImDrawFlags flags) {
+        const ImVec2 p0 = rot(x0, y0r), p1 = rot(x1, y1);
+        dl->AddRectFilled(ImVec2(std::min(p0.x, p1.x), std::min(p0.y, p1.y)),
+                          ImVec2(std::max(p0.x, p1.x), std::max(p0.y, p1.y)), ink, rounding, flags);
+      };
+      const float tip_y = top + h * 0.06f;
+      // index finger (its rounded top end becomes the left end)
+      rect(fl, tip_y, fl + fw, top + h * 0.60f, fw * 0.5f, ImDrawFlags_RoundCornersLeft);
       // palm
-      dl->AddRect(ImVec2(cx - icon * 0.36f, top + h * 0.55f), ImVec2(cx + icon * 0.36f, top + h),
-                  ink, icon * 0.14f, 0, 1.6f);
-      // tap arcs
+      rect(fl, top + h * 0.50f, icon * 0.36f, top + h, icon * 0.12f, 0);
+      // curled fingers
+      const float kr = icon * 0.085f;
+      for (int k = 0; k < 3; ++k) {
+        dl->AddCircleFilled(rot(fl + fw + kr * (1.1f + 2.0f * float(k)), top + h * 0.50f), kr, ink, 12);
+      }
+      // thumb
+      rect(fl - icon * 0.14f, top + h * 0.62f, fl + fw * 0.6f, top + h * 0.80f, icon * 0.08f, 0);
+      // tap arcs around the fingertip (angles turned by -90 degrees with the hand)
+      const ImVec2 tip = rot(fl + fw * 0.5f, tip_y);
       const ImU32 ember = souls::Col(souls::kEmber);
-      dl->PathArcTo(tip, fw * 1.3f, 3.14159f * 1.15f, 3.14159f * 1.85f, 10);
+      const float a0 = 3.14159f * 0.65f, a1 = 3.14159f * 1.35f;
+      dl->PathArcTo(tip, fw * 1.4f, a0, a1, 10);
       dl->PathStroke(ember, 0, 1.4f);
-      dl->PathArcTo(tip, fw * 2.1f, 3.14159f * 1.15f, 3.14159f * 1.85f, 12);
+      dl->PathArcTo(tip, fw * 2.3f, a0, a1, 12);
       dl->PathStroke(ember, 0, 1.4f);
     }
-    dl->AddText(ImVec2(fx + icon + space, y0), ink, tap);
+    dl->AddText(ImVec2(fx + hand_w + space, y0), ink, tap);
     souls::PopTitleFont();
     ImGui::Dummy(ImVec2(total, ts.y));
   }
@@ -560,20 +578,21 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
     const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     // v118: both cards breathe in ember while the screen waits for a choice; the focused one more strongly.
-    // v121: much stronger (the v118 thin border was not visible on the console): the whole card fills and
-    // fades with ember light (~1.6 s cycle), a thick border and a wide halo around it.
+    // v121: much stronger (the v118 thin border was not visible on the console): the whole card is a full
+    // ember gradient that swells and fades (~1.6 s cycle), with a thick border and a wide halo.
     {
       const float pulse = 0.5f + 0.5f * std::sin(float(ImGui::GetTime()) * 3.9f);
-      const float strength = hot ? 0.55f + 0.45f * pulse : 0.25f + 0.45f * pulse;
-      const ImU32 fill_top = souls::Col(souls::kEmber, strength * (hot ? 0.10f : 0.06f));
-      const ImU32 fill_bottom = souls::Col(souls::kEmber, strength * (hot ? 0.30f : 0.20f));
+      const float strength = hot ? 0.45f + 0.55f * pulse : 0.15f + 0.85f * pulse;
+      const float peak = hot ? 0.85f : 0.65f;
+      const ImU32 fill_top = souls::Col(souls::kEmber, strength * peak * 0.15f);
+      const ImU32 fill_bottom = souls::Col(souls::kEmber, strength * peak);
       dl->AddRectFilledMultiColor(a, b, fill_top, fill_top, fill_bottom, fill_bottom);
-      for (int i = 6; i >= 1; --i) {
+      for (int i = 8; i >= 1; --i) {
         const float g = float(i) * 3.0f;
         dl->AddRect(ImVec2(a.x - g, a.y - g), ImVec2(b.x + g, b.y + g),
-                    souls::Col(souls::kEmber, strength * 0.40f / float(i)), 0.0f, 0, 3.0f);
+                    souls::Col(souls::kEmber, strength * 0.55f / float(i)), 0.0f, 0, 3.0f);
       }
-      dl->AddRect(a, b, souls::Col(souls::kEmber, 0.35f + 0.65f * strength), 0.0f, 0, hot ? 3.5f : 2.5f);
+      dl->AddRect(a, b, souls::Col(souls::kEmber, 0.4f + 0.6f * strength), 0.0f, 0, hot ? 3.5f : 2.5f);
     }
     souls::PushTitleFont(1.3f);
     ImVec2 t = ImGui::CalcTextSize(title);
