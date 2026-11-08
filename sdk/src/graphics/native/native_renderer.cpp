@@ -218,6 +218,13 @@ REXCVAR_DEFINE_BOOL(ds2_native_dynamic_new_textures, false, "GPU",
 REXCVAR_DEFINE_BOOL(ds2_native_resolve_skip_quantized_copy, true, "GPU",
                     "v123: a D24FS8 depth resolve that is quantized to float24 is not copied first (the quantize pass "
                     "writes every pixel); false = copy, then quantize, as before");
+REXCVAR_DEFINE_INT32(ds2_native_geometry_cache_mb, 48, "GPU",
+                     "v124: MB of vertex and index data kept on the GPU between frames; a buffer the game did not "
+                     "change since it was uploaded is not copied again (only its hash is compared). 0 = copied every "
+                     "frame, as before. Read at start");
+REXCVAR_DEFINE_BOOL(ds2_native_geometry_cache_trust, true, "GPU",
+                    "v124: a cached vertex/index buffer unchanged for a while is compared with the guest bytes every "
+                    "2nd, then every 4th submission instead of every one (false = compared every time)");
 REXCVAR_DEFINE_BOOL(ds2_native_fast_untile, true, "GPU",
                     "RC77: untile 2D textures 16 bytes at a time with the offset computed inline");
 REXCVAR_DEFINE_BOOL(ds2_native_pipeline_steal, true, "GPU",
@@ -884,6 +891,9 @@ class NativeCommandProcessor final : public CommandProcessor {
     VkDeviceSize upload_memory_size = 0;
     uint8_t* upload_mapping = nullptr;
     VkDeviceSize upload_used = 0;
+    // v124: the slot's part of the shared upload buffer (upload = upload_arena_): its offset there. Upload() returns
+    // offsets in the whole buffer, so every binding of slot().upload keeps working unchanged.
+    VkDeviceSize upload_base = 0;
     UploadContentCache content_cache;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSet shared_memory_set = VK_NULL_HANDLE;
@@ -973,6 +983,8 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t constant_uploads_reused = 0, us_prelude = 0, us_translate = 0, us_pipeline_sync = 0, pipelines_sync = 0;
     uint64_t shader_restores_async = 0, draws_shader_pending = 0, halfres_draws = 0, halfres_composites = 0;
     uint64_t dynamic_texture_updates = 0, halfres_depth_downsamples = 0, texture_lazy_hashes = 0;
+    uint64_t geometry_hits = 0, geometry_hashes = 0, geometry_inserts = 0, geometry_changes = 0, geometry_full = 0,
+             geometry_evictions = 0, geometry_saved_bytes = 0, geometry_copied_bytes = 0;
     uint64_t constant_sets_reused = 0, constant_sets_created = 0, resolve_image_barriers = 0;
     uint64_t native_vertex_draws = 0, legacy_vertex_draws = 0;
     uint64_t content_hits = 0, content_saved_bytes = 0;
@@ -1177,6 +1189,34 @@ class NativeCommandProcessor final : public CommandProcessor {
 
   // Per-frame vertex buffer dedupe: (guest address << 32 | size) -> upload offset.
   std::unordered_map<uint64_t, VkDeviceSize> frame_vertex_uploads_;
+
+  // v124: one upload buffer for all frame slots, with a vertex/index cache at its start (see CachedGuestUpload).
+  VkBuffer upload_arena_ = VK_NULL_HANDLE;
+  VkDeviceMemory upload_arena_memory_ = VK_NULL_HANDLE;
+  uint32_t upload_arena_memory_type_ = 0;
+  VkDeviceSize upload_arena_memory_size_ = 0;
+  uint8_t* upload_arena_mapping_ = nullptr;
+  VkDeviceSize geometry_cache_size_ = 0;
+  struct GeometryCacheEntry {
+    VkDeviceSize offset = 0;
+    uint32_t size = 0;
+    bool resident = false;    // false = seen once (uploaded per frame); cached from its second frame on
+    uint64_t hash = 0;
+    uint64_t first_seen = 0;
+    uint64_t last_check = 0;  // submission of the last hash comparison
+    uint64_t last_use = 0;    // last submission that bound it (its region is reused only after that one completed)
+    uint32_t interval = 1;    // submissions between hash comparisons once stable (1, 2, 4)
+  };
+  std::unordered_map<uint64_t, GeometryCacheEntry> geometry_cache_;
+  std::map<VkDeviceSize, VkDeviceSize> geometry_free_;                 // offset -> size
+  std::vector<std::array<VkDeviceSize, 3>> geometry_retired_;          // {offset, size, submission of last use}
+  VkDeviceSize geometry_dirty_begin_ = ~VkDeviceSize(0), geometry_dirty_end_ = 0;
+  uint64_t geometry_last_sweep_ = 0;
+  bool CachedGuestUpload(uint32_t address, const uint8_t* src, uint32_t size, VkDeviceSize alignment, uint32_t tag,
+                         VkDeviceSize& offset);
+  bool GeometryAllocate(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset);
+  void GeometryFree(VkDeviceSize offset, VkDeviceSize size);
+  void GeometrySweep(bool urgent);
   std::unordered_map<uint64_t, NativeVertexLayout> native_vertex_layouts_;
   std::vector<uint32_t> native_indices_;
   std::vector<VkWriteDescriptorSet> descriptor_writes_;
@@ -1417,6 +1457,30 @@ bool NativeCommandProcessor::SetupContext() {
     }
   }
 
+  // v124: one upload buffer: [geometry cache | slot 0 | slot 1 | slot 2]. The "shared memory" descriptor of every slot
+  // is the whole buffer, so a vertex shader can fetch from the cache as from its own slot's uploads.
+  {
+    const int32_t cache_mb = std::clamp<int32_t>(REXCVAR_GET(ds2_native_geometry_cache_mb), 0, 256);
+    geometry_cache_size_ = VkDeviceSize(cache_mb) << 20;
+    const VkDeviceSize arena = geometry_cache_size_ + kUploadBufferSize * kFrameSlots;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device_, arena,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            ui::vulkan::util::MemoryPurpose::kUpload, upload_arena_, upload_arena_memory_,
+            &upload_arena_memory_type_, &upload_arena_memory_size_)) {
+      REXGPU_ERROR("[native] upload buffer creation failed ({} MB)", arena >> 20);
+      return false;
+    }
+    void* map = nullptr;
+    if (dfn().vkMapMemory(dev, upload_arena_memory_, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) return false;
+    upload_arena_mapping_ = static_cast<uint8_t*>(map);
+    geometry_free_.clear();
+    if (geometry_cache_size_) geometry_free_.emplace(0, geometry_cache_size_);
+    REXGPU_INFO("[native] upload buffer {} MB: geometry cache {} MB + {} frame slots of {} MB", arena >> 20,
+                geometry_cache_size_ >> 20, kFrameSlots, kUploadBufferSize >> 20);
+  }
+  uint32_t slot_index = 0;
   for (FrameSlot& s : slots_) {
     VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
@@ -1429,19 +1493,12 @@ bool NativeCommandProcessor::SetupContext() {
     if (dfn().vkAllocateCommandBuffers(dev, &ai, &s.cmd) != VK_SUCCESS) return false;
     VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     if (dfn().vkCreateFence(dev, &fci, nullptr, &s.fence) != VK_SUCCESS) return false;
-    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-            vulkan_device_, kUploadBufferSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            ui::vulkan::util::MemoryPurpose::kUpload, s.upload, s.upload_memory, &s.upload_memory_type,
-            &s.upload_memory_size)) {
-      REXGPU_ERROR("[native] upload buffer creation failed");
-      return false;
-    }
-    void* map = nullptr;
-    if (dfn().vkMapMemory(dev, s.upload_memory, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) return false;
-    s.upload_mapping = static_cast<uint8_t*>(map);
+    s.upload = upload_arena_;
+    s.upload_memory = upload_arena_memory_;
+    s.upload_memory_type = upload_arena_memory_type_;
+    s.upload_memory_size = upload_arena_memory_size_;
+    s.upload_base = geometry_cache_size_ + kUploadBufferSize * slot_index++;
+    s.upload_mapping = upload_arena_mapping_ + s.upload_base;
     VkDescriptorPoolSize sizes[5] = {
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, kMaxSetsPerFrame * 2},
@@ -1635,11 +1692,17 @@ void NativeCommandProcessor::ShutdownContext() {
     if (s.query_pool) dfn().vkDestroyQueryPool(dev, s.query_pool, nullptr);
     if (s.occlusion_pool) dfn().vkDestroyQueryPool(dev, s.occlusion_pool, nullptr);
     if (s.descriptor_pool) dfn().vkDestroyDescriptorPool(dev, s.descriptor_pool, nullptr);
-    if (s.upload) dfn().vkDestroyBuffer(dev, s.upload, nullptr);
-    if (s.upload_memory) dfn().vkFreeMemory(dev, s.upload_memory, nullptr);
+    s.upload = VK_NULL_HANDLE;  // v124: the shared upload buffer, destroyed below
+    s.upload_memory = VK_NULL_HANDLE;
+    s.upload_mapping = nullptr;
     if (s.fence) dfn().vkDestroyFence(dev, s.fence, nullptr);
     if (s.pool) dfn().vkDestroyCommandPool(dev, s.pool, nullptr);
   }
+  if (upload_arena_) dfn().vkDestroyBuffer(dev, upload_arena_, nullptr);
+  if (upload_arena_memory_) dfn().vkFreeMemory(dev, upload_arena_memory_, nullptr);
+  upload_arena_ = VK_NULL_HANDLE;
+  upload_arena_memory_ = VK_NULL_HANDLE;
+  upload_arena_mapping_ = nullptr;
   dfn().vkDestroyDescriptorSetLayout(dev, set_layout_shared_memory_, nullptr);
   dfn().vkDestroyDescriptorSetLayout(dev, set_layout_constants_, nullptr);
   dfn().vkDestroyDescriptorSetLayout(dev, set_layout_empty_, nullptr);
@@ -1829,9 +1892,16 @@ void NativeCommandProcessor::SubmitFrame() {
   ++stats_.submits;
   dfn().vkEndCommandBuffer(s.cmd);
   if (s.upload_used) {
-    ui::vulkan::util::FlushMappedMemoryRange(vulkan_device_, s.upload_memory, s.upload_memory_type, 0,
+    ui::vulkan::util::FlushMappedMemoryRange(vulkan_device_, s.upload_memory, s.upload_memory_type, s.upload_base,
                                              s.upload_memory_size, s.upload_used);
   }
+  if (geometry_dirty_end_ > geometry_dirty_begin_) {
+    ui::vulkan::util::FlushMappedMemoryRange(vulkan_device_, upload_arena_memory_, upload_arena_memory_type_,
+                                             geometry_dirty_begin_, upload_arena_memory_size_,
+                                             geometry_dirty_end_ - geometry_dirty_begin_);
+  }
+  geometry_dirty_begin_ = ~VkDeviceSize(0);
+  geometry_dirty_end_ = 0;
   VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
   si.commandBufferCount = 1;
   si.pCommandBuffers = &s.cmd;
@@ -1857,13 +1927,188 @@ uint8_t* NativeCommandProcessor::Upload(VkDeviceSize size, VkDeviceSize alignmen
     offset = 0;
     if (size > kUploadBufferSize) return nullptr;
     n.upload_used = size;
-    offset_out = 0;
+    offset_out = n.upload_base;
+    stats_.upload_bytes += size;
     return n.upload_mapping;
   }
   s.upload_used = offset + size;
-  offset_out = offset;
+  offset_out = s.upload_base + offset;
   stats_.upload_bytes += size;
   return s.upload_mapping + offset;
+}
+
+/*
+ * v124: vertex and index data kept on the GPU between frames.
+ *
+ * Before v124 every vertex buffer a frame used was copied from guest memory into the frame's upload buffer (Majula,
+ * v122 log: ~14 MB per frame, memmove 17 % of the GPU Commands thread, which had become the limit in v123), although
+ * almost all of it (the level's static geometry) does not change from frame to frame. Now a buffer seen in two
+ * different submissions gets a region of the geometry cache (the start of the shared upload buffer, so the vertex
+ * shaders' "shared memory" descriptor covers it); later submissions compare the guest bytes' XXH3 with the cached
+ * one and reuse the region when equal. A changed buffer gets a new region (the old one may still be read by the GPU:
+ * it is reused only after the submission that last bound it has completed, i.e. kFrameSlots submissions later).
+ * With ds2_native_geometry_cache_trust a buffer that matched its hash is compared every 2nd, then every 4th
+ * submission (as textures are rechecked every 30 frames): a buffer rewritten in place at the same address and size
+ * after being stable shows its old contents for up to 3 frames.
+ */
+bool NativeCommandProcessor::GeometryAllocate(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset) {
+  for (auto it = geometry_free_.begin(); it != geometry_free_.end(); ++it) {
+    const VkDeviceSize start = (it->first + alignment - 1) & ~(alignment - 1);
+    const VkDeviceSize end = it->first + it->second;
+    if (start + size > end) continue;
+    const VkDeviceSize block = it->first;
+    geometry_free_.erase(it);
+    if (start > block) geometry_free_.emplace(block, start - block);
+    if (start + size < end) geometry_free_.emplace(start + size, end - (start + size));
+    offset = start;
+    return true;
+  }
+  return false;
+}
+
+void NativeCommandProcessor::GeometryFree(VkDeviceSize offset, VkDeviceSize size) {
+  if (!size) return;
+  auto next = geometry_free_.lower_bound(offset);
+  if (next != geometry_free_.begin()) {
+    auto prev = std::prev(next);
+    if (prev->first + prev->second == offset) {
+      offset = prev->first;
+      size += prev->second;
+      geometry_free_.erase(prev);
+    }
+  }
+  next = geometry_free_.lower_bound(offset);
+  if (next != geometry_free_.end() && offset + size == next->first) {
+    size += next->second;
+    geometry_free_.erase(next);
+  }
+  geometry_free_.emplace(offset, size);
+}
+
+void NativeCommandProcessor::GeometrySweep(bool urgent) {
+  // Regions of replaced or dropped entries return once the GPU is done with them.
+  for (size_t i = 0; i < geometry_retired_.size();) {
+    if (geometry_retired_[i][2] + kFrameSlots <= frame_) {
+      GeometryFree(geometry_retired_[i][0], geometry_retired_[i][1]);
+      geometry_retired_[i] = geometry_retired_.back();
+      geometry_retired_.pop_back();
+    } else {
+      ++i;
+    }
+  }
+  // Entries unused for a while (urgent: any the GPU is done with, oldest first) are dropped.
+  const uint64_t idle = urgent ? kFrameSlots : 240;
+  if (urgent) {
+    std::vector<std::pair<uint64_t, uint64_t>> candidates;
+    for (auto& [key, e] : geometry_cache_) {
+      if (e.resident && e.last_use + idle <= frame_) candidates.emplace_back(e.last_use, key);
+    }
+    std::sort(candidates.begin(), candidates.end());
+    const size_t drop = std::max<size_t>(candidates.size() / 2, std::min<size_t>(candidates.size(), 16));
+    for (size_t i = 0; i < drop; ++i) {
+      auto it = geometry_cache_.find(candidates[i].second);
+      GeometryFree(it->second.offset, it->second.size);
+      geometry_cache_.erase(it);
+      ++stats_.geometry_evictions;
+    }
+    return;
+  }
+  for (auto it = geometry_cache_.begin(); it != geometry_cache_.end();) {
+    if (it->second.last_use + idle <= frame_) {
+      if (it->second.resident) GeometryFree(it->second.offset, it->second.size);
+      it = geometry_cache_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+bool NativeCommandProcessor::CachedGuestUpload(uint32_t address, const uint8_t* src, uint32_t size,
+                                               VkDeviceSize alignment, uint32_t tag, VkDeviceSize& offset) {
+  // Small buffers (rectangles, UI quads) cost less to copy than to track.
+  if (!geometry_cache_size_ || !src || size < 4096 || size > geometry_cache_size_ / 4) return false;
+  if (frame_ - geometry_last_sweep_ >= 60) {
+    geometry_last_sweep_ = frame_;
+    GeometrySweep(false);
+  }
+  const uint64_t key = (uint64_t(address) << 32 | size) ^ (uint64_t(tag) << 62);
+  GeometryCacheEntry& e = geometry_cache_[key];
+  if (!e.resident) {
+    if (e.first_seen == 0 || e.first_seen == frame_) {
+      // First submission that uses it: copied per frame as before (one-off buffers never enter the cache).
+      if (e.first_seen == 0) e.first_seen = frame_;
+      e.last_use = frame_;
+      return false;
+    }
+    VkDeviceSize at;
+    if (!GeometryAllocate(size, alignment, at)) {
+      GeometrySweep(true);
+      if (!GeometryAllocate(size, alignment, at)) {
+        e.last_use = frame_;
+        ++stats_.geometry_full;
+        return false;
+      }
+    }
+    std::memcpy(upload_arena_mapping_ + at, src, size);
+    geometry_dirty_begin_ = std::min(geometry_dirty_begin_, at);
+    geometry_dirty_end_ = std::max<VkDeviceSize>(geometry_dirty_end_, at + size);
+    e.resident = true;
+    e.offset = at;
+    e.size = size;
+    e.hash = XXH3_64bits(src, size);
+    e.last_check = frame_;
+    e.last_use = frame_;
+    e.interval = 1;
+    offset = at;
+    ++stats_.geometry_inserts;
+    stats_.geometry_copied_bytes += size;
+    return true;
+  }
+  const bool trust = REXCVAR_GET(ds2_native_geometry_cache_trust);
+  if (e.last_check == frame_ || (trust && frame_ - e.last_check < e.interval)) {
+    e.last_use = frame_;
+    offset = e.offset;
+    ++stats_.geometry_hits;
+    stats_.geometry_saved_bytes += size;
+    return true;
+  }
+  const uint64_t hash = XXH3_64bits(src, size);
+  ++stats_.geometry_hashes;
+  if (hash == e.hash) {
+    e.last_check = frame_;
+    e.last_use = frame_;
+    if (e.interval < 4) e.interval *= 2;
+    offset = e.offset;
+    ++stats_.geometry_hits;
+    stats_.geometry_saved_bytes += size;
+    return true;
+  }
+  // Changed: a new region; the old one goes back once the GPU is done with it.
+  VkDeviceSize at;
+  geometry_retired_.push_back({e.offset, VkDeviceSize(e.size), e.last_use});
+  e.resident = false;
+  if (!GeometryAllocate(size, alignment, at)) {
+    GeometrySweep(true);
+    if (!GeometryAllocate(size, alignment, at)) {
+      e.first_seen = frame_;
+      e.last_use = frame_;
+      ++stats_.geometry_full;
+      return false;
+    }
+  }
+  std::memcpy(upload_arena_mapping_ + at, src, size);
+  geometry_dirty_begin_ = std::min(geometry_dirty_begin_, at);
+  geometry_dirty_end_ = std::max<VkDeviceSize>(geometry_dirty_end_, at + size);
+  e.resident = true;
+  e.offset = at;
+  e.hash = hash;
+  e.last_check = frame_;
+  e.last_use = frame_;
+  e.interval = 1;
+  offset = at;
+  ++stats_.geometry_changes;
+  stats_.geometry_copied_bytes += size;
+  return true;
 }
 
 bool NativeCommandProcessor::UploadImmutable(const void* data, size_t size, VkDeviceSize alignment,
@@ -1872,8 +2117,9 @@ bool NativeCommandProcessor::UploadImmutable(const void* data, size_t size, VkDe
   const bool cache = REXCVAR_GET(ds2_native_cpu_cache);
   const uint64_t hash = cache ? XXH3_64bits(data, size) : 0;
   uint64_t cached_offset;
-  if (cache && slot().content_cache.Find(hash, tag, data, size, slot().upload_mapping,
-                                         slot().upload_used, cached_offset) && cached_offset % alignment == 0) {
+  if (cache && slot().content_cache.Find(hash, tag, data, size, upload_arena_mapping_,
+                                         slot().upload_base + slot().upload_used, cached_offset) &&
+      cached_offset % alignment == 0) {
     offset = cached_offset;
     ++stats_.content_hits;
     stats_.content_saved_bytes += size;
@@ -5257,12 +5503,14 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       offset = vit->second;
     } else {
       const uint8_t* src = memory_->TranslatePhysical<const uint8_t*>(address);
-      uint8_t* dst = src ? Upload(size, 256, offset) : nullptr;
-      if (!dst) {
-        ++stats_.draws_failed;
-        return true;
+      if (!CachedGuestUpload(address, src, size, 256, 0, offset)) {
+        uint8_t* dst = src ? Upload(size, 256, offset) : nullptr;
+        if (!dst) {
+          ++stats_.draws_failed;
+          return true;
+        }
+        std::memcpy(dst, src, size);
       }
-      std::memcpy(dst, src, size);
       frame_vertex_uploads_.emplace(vkey, offset);
     }
     if (native_vertex) {
@@ -5380,7 +5628,8 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                    ? VkDeviceSize(index_buffer_info->length)
                                    : VkDeviceSize(index_count) * (index_type == VK_INDEX_TYPE_UINT32 ? 4 : 2);
     const uint8_t* src = memory_->TranslatePhysical<const uint8_t*>(index_buffer_info->guest_base);
-    if (!UploadImmutable(src, size_t(bytes), 16, 101, index_offset)) {
+    if (!CachedGuestUpload(index_buffer_info->guest_base, src, uint32_t(bytes), 16, 1, index_offset) &&
+        !UploadImmutable(src, size_t(bytes), 16, 101, index_offset)) {
       ++stats_.draws_failed;
       return true;
     }
@@ -7045,6 +7294,16 @@ void NativeCommandProcessor::LogStats() {
   }
   REXGPU_INFO("[native] immutable uploads/frame: {:.1f} hits, {:.2f} MB saved",
               stats_.content_hits / n, stats_.content_saved_bytes / n / 1048576.0);
+  if (geometry_cache_size_) {
+    VkDeviceSize free_bytes = 0;
+    for (const auto& [o, sz] : geometry_free_) free_bytes += sz;
+    REXGPU_INFO("[native] geometry cache/frame: {:.1f} hits ({:.2f} MB not copied), {:.1f} hashed, {:.2f} inserted, "
+                "{:.2f} changed, {:.2f} MB copied | {:.2f} full, {:.2f} evicted | {} entries, {:.1f} of {} MB free",
+                stats_.geometry_hits / n, stats_.geometry_saved_bytes / n / 1048576.0, stats_.geometry_hashes / n,
+                stats_.geometry_inserts / n, stats_.geometry_changes / n, stats_.geometry_copied_bytes / n / 1048576.0,
+                stats_.geometry_full / n, stats_.geometry_evictions / n, geometry_cache_.size(),
+                free_bytes / 1048576.0, geometry_cache_size_ >> 20);
+  }
   REXGPU_INFO("[native] vertex draws/frame: {:.1f} hardware inputs, {:.1f} legacy fetch",
               stats_.native_vertex_draws / n, stats_.legacy_vertex_draws / n);
   if (profile_capable_ && profile_buffers_) {
