@@ -9,7 +9,7 @@
 <h1 align="center">DARK SOULS II: Scholar of the First Sin — Nintendo Switch</h1>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/build-v121-1F1F1F?style=for-the-badge" alt="Build v121">
+  <img src="https://img.shields.io/badge/build-v122-1F1F1F?style=for-the-badge" alt="Build v122">
   <img src="https://img.shields.io/badge/static%20recompilation-PPC→ARM64-1F1F1F?style=for-the-badge" alt="Static recompilation">
   <img src="https://img.shields.io/badge/Horizon-libnx-E60012?style=for-the-badge&logo=nintendoswitch&logoColor=white" alt="Horizon libnx">
   <img src="https://img.shields.io/badge/Vulkan-Mesa%20NVK-AC162C?style=for-the-badge&logo=vulkan" alt="Vulkan NVK">
@@ -23,9 +23,9 @@ Xbox 360 emulator nor a port of the PC version.**
 > You need your **own Xbox 360 game files** and Compatibility Pack 4. No game files, generated game code or keys are
 > distributed here.
 
-## Status (build v121)
+## Status (build v122)
 
-v121: the shader pack has one fixed name, ds2_shaders.spvlib (+ .idx), so updates replace only ds2.nro and ds2.toml (an older ds2_shaders_vNNN.spvlib is still picked up if present); the start screen cards pulse, the countdown is 20 s and the hints show touch input. v120 removes the ~110 ms stall at every autosave: SD work (file create/delete, closing a written file) no longer runs under the process-wide global lock. v119 restores the shader pack signature: v116 changed spirv_library.cpp, which is hashed into the translator signature, so v116-v117 rejected the pack and translated every shader at runtime (the stutters). v119 = v118 (countdown that survives the launch press, breathing resolution cards) + spirv_library.cpp/.h byte-identical to v115.
+v122: the game's Direct3D GPU wait sleeps until the command processor makes progress instead of spinning on a core (`ds2_gpu_wait_sleep`); new textures are no longer rehashed every frame for 2 s after an area loads, and their first hash is deferred by a few frames (ideas from ds2scholar-nx). v121: the shader pack has one fixed name, ds2_shaders.spvlib (+ .idx), so updates replace only ds2.nro and ds2.toml (an older ds2_shaders_vNNN.spvlib is still picked up if present); the start screen cards pulse, the countdown is 20 s and the hints show touch input. v120 removes the ~110 ms stall at every autosave: SD work (file create/delete, closing a written file) no longer runs under the process-wide global lock. v119 restores the shader pack signature: v116 changed spirv_library.cpp, which is hashed into the translator signature, so v116-v117 rejected the pack and translated every shader at runtime (the stutters). v119 = v118 (countdown that survives the launch press, breathing resolution cards) + spirv_library.cpp/.h byte-identical to v115.
 
 - Playable from the new-game intro through Majula, with multiple bosses and the first DLC area tested.
   Russian or English interface (other disc languages through the emulated region).

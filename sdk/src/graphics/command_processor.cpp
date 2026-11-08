@@ -9,7 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <unordered_map>
 #include <algorithm>
@@ -90,6 +92,37 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
 namespace rex::graphics {
 
 using namespace rex::graphics::xenos;
+
+/*
+ * v122: progress of the command processor, for the game's Direct3D GPU wait (app/src/ds2_gpu_wait.cpp). Bumped each
+ * time the read pointer is published back to the guest, at the end of each ring segment and after each interrupt;
+ * a guest thread that found nothing changed sleeps until the next bump instead of spinning on the same word.
+ */
+namespace {
+std::atomic<uint32_t> g_ds2_ring_progress{0};
+std::atomic<int> g_ds2_ring_waiters{0};
+std::mutex g_ds2_ring_mutex;
+std::condition_variable g_ds2_ring_cv;
+inline void BumpRingProgress() {
+  g_ds2_ring_progress.fetch_add(1);
+  if (g_ds2_ring_waiters.load() > 0) {
+    std::lock_guard<std::mutex> lock(g_ds2_ring_mutex);
+    g_ds2_ring_cv.notify_all();
+  }
+}
+}  // namespace
+
+uint32_t Ds2RingProgress() { return g_ds2_ring_progress.load(); }
+
+void Ds2WaitRingProgress(uint32_t seen, uint32_t max_us) {
+  g_ds2_ring_waiters.fetch_add(1);
+  {
+    std::unique_lock<std::mutex> lock(g_ds2_ring_mutex);
+    g_ds2_ring_cv.wait_for(lock, std::chrono::microseconds(max_us),
+                           [seen] { return g_ds2_ring_progress.load() != seen; });
+  }
+  g_ds2_ring_waiters.fetch_sub(1);
+}
 
 namespace {
 
@@ -266,6 +299,7 @@ void CommandProcessor::WorkerThreadMain() {
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
                                        read_ptr_index_);
     }
+    BumpRingProgress();
 
     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
     // but no games seem to actually use it.
@@ -691,6 +725,7 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
         memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
                                          ahora);
         publicado = ahora;
+        BumpRingProgress();
       }
     }
   } while (reader.read_count());
@@ -990,6 +1025,7 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
       }
     }
   }
+  BumpRingProgress();
   return true;
 }
 

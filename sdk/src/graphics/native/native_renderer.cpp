@@ -209,6 +209,12 @@ REXCVAR_DEFINE_BOOL(ds2_native_constant_reuse, true, "GPU",
                     "RC78: a constant buffer equal to the previous draw's reuses its upload");
 REXCVAR_DEFINE_BOOL(ds2_native_persistent_texture_sets, true, "GPU",
                     "RC77: keep texture descriptor sets across frames (dropped when a view they use is destroyed)");
+REXCVAR_DEFINE_BOOL(ds2_native_texture_lazy_hash, true, "GPU",
+                    "v122: a new 2D texture is uploaded without hashing its guest bytes; its first recheck takes the "
+                    "hash (shorter frames when entering an area). false = hashed when uploaded, as before");
+REXCVAR_DEFINE_BOOL(ds2_native_dynamic_new_textures, false, "GPU",
+                    "v122: true = a new 2D texture is also checked every frame for its first 120 frames (as before "
+                    "v122); false = only textures the game rewrote");
 REXCVAR_DEFINE_BOOL(ds2_native_fast_untile, true, "GPU",
                     "RC77: untile 2D textures 16 bytes at a time with the offset computed inline");
 REXCVAR_DEFINE_BOOL(ds2_native_pipeline_steal, true, "GPU",
@@ -909,6 +915,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t last_check_frame = 0;
     uint64_t last_use_frame = 0;
     uint64_t dynamic_until = 0;  // RC86: content changed recently (videos): checked every frame until this frame
+    bool hash_pending = false;   // v122: uploaded without hashing; the first recheck takes the hash as the content
     uint64_t resolve_signature = 0;  // cube faces copied from resolve targets: their generations
     std::unordered_map<uint32_t, VkImageView> swizzle_views;
   };
@@ -962,7 +969,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t texture_sets_reused = 0, texture_sets_created = 0, texture_sets_kept = 0, texture_sets_dropped = 0;
     uint64_t constant_uploads_reused = 0, us_prelude = 0, us_translate = 0, us_pipeline_sync = 0, pipelines_sync = 0;
     uint64_t shader_restores_async = 0, draws_shader_pending = 0, halfres_draws = 0, halfres_composites = 0;
-    uint64_t dynamic_texture_updates = 0, halfres_depth_downsamples = 0;
+    uint64_t dynamic_texture_updates = 0, halfres_depth_downsamples = 0, texture_lazy_hashes = 0;
     uint64_t constant_sets_reused = 0, constant_sets_created = 0, resolve_image_barriers = 0;
     uint64_t native_vertex_draws = 0, legacy_vertex_draws = 0;
     uint64_t content_hits = 0, content_saved_bytes = 0;
@@ -4005,13 +4012,33 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
     guest_mips = memory_->TranslatePhysical<const uint8_t*>(mip_page << 12);
     if (!guest_mips || !layout.mips_total_extent_bytes) return white_view_;
   }
-  uint64_t content = XXH3_64bits(guest, std::min<size_t>(guest_size, 64 << 20));
-  if (guest_mips) {
-    content ^= XXH3_64bits(guest_mips, std::min<size_t>(layout.mips_total_extent_bytes, 64 << 20)) * 31;
+  /*
+   * v122: a new texture is uploaded without hashing its guest bytes (entering an area creates ~100 textures in one
+   * frame and the hash of all of them was part of that frame's spike); its first recheck, 2-30 frames later and
+   * spread by the key, takes the hash as the content. A change of the guest bytes in those frames is seen at the
+   * next recheck. Idea and measurement from ds2scholar-nx (ds2_texture_lazy_fingerprint: loading frames -9..12 ms).
+   */
+  const bool lazy_new = !t.image.image && REXCVAR_GET(ds2_native_texture_lazy_hash);
+  uint64_t content = 0;
+  if (!lazy_new) {
+    content = XXH3_64bits(guest, std::min<size_t>(guest_size, 64 << 20));
+    if (guest_mips) {
+      content ^= XXH3_64bits(guest_mips, std::min<size_t>(layout.mips_total_extent_bytes, 64 << 20)) * 31;
+    }
+  }
+  if (t.image.image && t.hash_pending) {
+    t.hash_pending = false;
+    t.content_hash = content;
+    // Checked again 2 frames later against this hash: a texture the game rewrites every frame (the intro video)
+    // is caught there and switches to per-frame checks.
+    t.last_check_frame = frame_ - std::min<uint64_t>(frame_, 28);
+    ++stats_.texture_lazy_hashes;
+    return GetSwizzleView(t.swizzle_views, t.image, fetch.swizzle | (fi.host_swizzle << 12));
   }
   if (t.image.image && content == t.content_hash) {
     return GetSwizzleView(t.swizzle_views, t.image, fetch.swizzle | (fi.host_swizzle << 12));
   }
+  const bool existed = t.image.image != VK_NULL_HANDLE;
   if (!t.image.image) {
     if (!CreateImage(t.image, fi.format, width, height, false,
                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, levels)) {
@@ -4019,13 +4046,25 @@ VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::
       return white_view_;
     }
   }
-  if (t.image.image && REXCVAR_GET(ds2_native_dynamic_textures)) {
+  if (lazy_new) {
+    // First recheck (the hash) 1-8 frames from now, spread by the key.
+    t.last_check_frame = frame_ - std::min<uint64_t>(frame_, 29 - key % 8);
+  }
+  /*
+   * v122: only a texture that existed and changed is "rewritten by the game". Before v122 every new texture got
+   * here too (t.image.image is set right above), so each texture of an area just entered was hashed again every
+   * frame for 120 frames: ~100 textures, tens of MB of XXH3 per frame on the GPU command thread for 2 s after each
+   * transition. ds2_native_dynamic_new_textures = true restores that.
+   */
+  if (t.image.image && (existed || REXCVAR_GET(ds2_native_dynamic_new_textures)) &&
+      REXCVAR_GET(ds2_native_dynamic_textures)) {
     // RC86: the game rewrote this texture (a video frame, a texture streamed in place): check it every frame for a
     // while instead of every 30 frames (the intro video stuttered and showed old frames).
     t.dynamic_until = frame_ + 120;
     ++stats_.dynamic_texture_updates;
   }
   t.content_hash = content;
+  t.hash_pending = lazy_new;
   // Untile / copy every level into the upload buffer, swapping the byte order.
   VkDeviceSize level_offsets[xenos::kTextureMaxMips + 1];
   VkDeviceSize total = 0;
@@ -4338,6 +4377,7 @@ VkImageView NativeCommandProcessor::GetCubeTextureView(const xenos::xe_gpu_textu
     t.resolve_signature = resolve_signature;
     return GetSwizzleView(t.swizzle_views, t.image, swz);
   }
+  const bool existed = t.image.image != VK_NULL_HANDLE;
   if (!t.image.image) {
     if (!CreateImage(t.image, fi.format, width, height, false,
                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, levels, true)) {
@@ -4346,7 +4386,9 @@ VkImageView NativeCommandProcessor::GetCubeTextureView(const xenos::xe_gpu_textu
       return VK_NULL_HANDLE;
     }
   }
-  if (t.image.image && REXCVAR_GET(ds2_native_dynamic_textures)) {
+  // v122: only a cube that existed and changed (see the 2D path).
+  if (t.image.image && (existed || REXCVAR_GET(ds2_native_dynamic_new_textures)) &&
+      REXCVAR_GET(ds2_native_dynamic_textures)) {
     // RC86: the game rewrote this texture (a video frame, a texture streamed in place): check it every frame for a
     // while instead of every 30 frames (the intro video stuttered and showed old frames).
     t.dynamic_until = frame_ + 120;
@@ -6925,9 +6967,9 @@ void NativeCommandProcessor::LogStats() {
               stats_.msaa_draws / n, stats_.msaa_imports / n, stats_.msaa_imports_skipped / n,
               stats_.msaa_exports / n, stats_.face_clears / n);
   REXGPU_INFO("[native] reduced-resolution particle draws/frame: {:.2f} (1/{} resolution), composites/frame {:.2f} | "
-              "textures rewritten by the game/frame {:.2f} | reduced depth buffers/frame {:.2f}",
+              "textures rewritten by the game/frame {:.2f} (lazily hashed {:.2f}) | reduced depth buffers/frame {:.2f}",
               stats_.halfres_draws / n, halfres_divisor_, stats_.halfres_composites / n,
-              stats_.dynamic_texture_updates / n, stats_.halfres_depth_downsamples / n);
+              stats_.dynamic_texture_updates / n, stats_.texture_lazy_hashes / n, stats_.halfres_depth_downsamples / n);
   REXGPU_INFO("[native] texture fetches/frame: {:.1f} 1D, {:.1f} cube ({:.2f} faces copied from resolves), {:.1f} 3D, "
               "{:.1f} white (unsupported 3D/cube/other dimension), {:.1f} depth from 8888 ({:.2f} decodes), "
               "{:.2f} float24 depth resolves",
