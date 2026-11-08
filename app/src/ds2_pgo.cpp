@@ -82,11 +82,12 @@ void DumpAll() {
 namespace ds2::pgo {
 
 void Start() {
-  REXLOG_INFO("ds2 pgo: profile build; the profile is written every 3 minutes to {}", kDir);
+  // v126: every minute (v125-pgo: a 2-minute session ended before the first 3-minute write) and at exit.
+  REXLOG_INFO("ds2 pgo: profile build; the profile is written every minute and at exit to {}", kDir);
   g_thread = std::thread([]() {
     while (!g_stop.load()) {
-      for (int i = 0; i < 180 && !g_stop.load(); ++i) std::this_thread::sleep_for(std::chrono::seconds(1));
-      DumpAll();
+      for (int i = 0; i < 60 && !g_stop.load(); ++i) std::this_thread::sleep_for(std::chrono::seconds(1));
+      if (!g_stop.load()) DumpAll();
     }
   });
 }
@@ -94,6 +95,7 @@ void Start() {
 void Stop() {
   g_stop.store(true);
   if (g_thread.joinable()) g_thread.join();
+  DumpAll();
 }
 
 }  // namespace ds2::pgo

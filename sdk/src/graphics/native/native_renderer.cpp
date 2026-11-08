@@ -27,7 +27,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include <filesystem>
+#include <string>
 #include <xxhash.h>
+#include <rex/filesystem.h>
 
 #include <SPIRV/GlslangToSpv.h>
 #include <glslang/Public/ShaderLang.h>
@@ -101,9 +104,10 @@ REXCVAR_DEFINE_BOOL(ds2_native_textures_1d, true, "GPU",
 REXCVAR_DEFINE_BOOL(ds2_native_clamp_7e3, true, "GPU",
                     "Clamp pixel shader color output for k_2_10_10_10_FLOAT render targets to the "
                     "Xenos 7e3 range [0, 31.875] (NaN -> 0), as the guest render target would store it");
-REXCVAR_DEFINE_BOOL(ds2_native_7e3_as_r11g11b10, false, "GPU",
-                    "DS2 native renderer (RC67 test): store k_2_10_10_10_FLOAT render targets as B10G11R11_UFLOAT "
-                    "instead of RGBA16F (half the bandwidth, no alpha); restart");
+REXCVAR_DEFINE_BOOL(ds2_native_7e3_as_r11g11b10, true, "GPU",
+                    "DS2 native renderer: store k_2_10_10_10_FLOAT render targets as B10G11R11_UFLOAT instead of "
+                    "RGBA16F (half the bandwidth, no alpha; v126 default after the v125 test: +1-3 fps, same smoke "
+                    "and fog); false = RGBA16F; restart");
 REXCVAR_DEFINE_BOOL(ds2_native_resolve_depth_only, true, "GPU",
                     "Depth resolves copy only the depth plane (textures never sample the stencil of a resolve)");
 REXCVAR_DEFINE_BOOL(ds2_native_state_filter, true, "GPU",
@@ -231,6 +235,12 @@ REXCVAR_DEFINE_BOOL(ds2_native_texture_view_memo, true, "GPU",
 REXCVAR_DEFINE_BOOL(ds2_native_constant_memo, true, "GPU",
                     "v125: a draw whose vertex or pixel shader float constants were not written since the previous "
                     "draw with the same shader reuses that draw's upload without packing and comparing them");
+REXCVAR_DEFINE_STRING(ds2_native_pipeline_cache, "ds2_pipeline_cache.bin", "GPU",
+                      "v126: file of compiled pipelines next to the NRO, loaded at start and rewritten (when new "
+                      "pipelines appeared) at most every 90 s and at exit; \"\" = off");
+REXCVAR_DEFINE_INT32(ds2_native_texture_budget_ms, 32, "GPU",
+                     "v126: milliseconds per submission for preparing new textures; the textures past it are drawn "
+                     "with a neutral grey for a frame or more and prepared in the next submissions (0 = no limit)");
 REXCVAR_DEFINE_BOOL(ds2_native_fast_untile, true, "GPU",
                     "RC77: untile 2D textures 16 bytes at a time with the offset computed inline");
 REXCVAR_DEFINE_BOOL(ds2_native_pipeline_steal, true, "GPU",
@@ -865,16 +875,33 @@ class NativeCommandProcessor final : public CommandProcessor {
            index == XE_GPU_REG_DC_LUT_SEQ_COLOR || index == XE_GPU_REG_DC_LUT_PWL_DATA ||
            index == XE_GPU_REG_DC_LUT_30_COLOR;
   }
-  // v125: writes into the float constants (vertex 0x4000-0x43FF, pixel 0x4400-0x47FF), for ds2_native_constant_memo.
+  // v125: changes of the float constants (vertex 0x4000-0x43FF, pixel 0x4400-0x47FF), for ds2_native_constant_memo.
+  // v126: only a value that differs counts (v125 logs: DS2 writes the same constants again before nearly every draw,
+  // so counting writes left 100-190 of ~1700 uploads per frame to the memo).
   uint64_t float_constant_writes_[2] = {0, 0};
-  void NoteConstantWrites(uint32_t start, uint32_t count) {
-    constexpr uint32_t kVs = XE_GPU_REG_SHADER_CONSTANT_000_X, kPs = XE_GPU_REG_SHADER_CONSTANT_256_X;
-    const uint64_t end = uint64_t(start) + count;
-    if (start < kPs && end > kVs) ++float_constant_writes_[0];
-    if (start < kPs + 1024 && end > kPs) ++float_constant_writes_[1];
+  static constexpr uint32_t kConstFirst = XE_GPU_REG_SHADER_CONSTANT_000_X;
+  static constexpr uint32_t kConstPs = XE_GPU_REG_SHADER_CONSTANT_256_X;
+  static constexpr uint32_t kConstEnd = XE_GPU_REG_SHADER_CONSTANT_256_X + 1024;
+  void NoteConstantWrite(uint32_t index, uint32_t value) {
+    if (index < kConstFirst || index >= kConstEnd) return;
+    if (register_file_->values[index] != value) ++float_constant_writes_[index < kConstPs ? 0 : 1];
+  }
+  void NoteConstantWrites(uint32_t start, const uint32_t* base, uint32_t count) {
+    if (uint64_t(start) + count <= kConstFirst || start >= kConstEnd) return;
+    bool changed[2] = {false, false};
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t index = start + i;
+      if (index < kConstFirst || index >= kConstEnd) continue;
+      const uint32_t bank = index < kConstPs ? 0 : 1;
+      if (!changed[bank] && register_file_->values[index] != memory::load_and_swap<uint32_t>(base + i)) {
+        changed[bank] = true;
+      }
+    }
+    if (changed[0]) ++float_constant_writes_[0];
+    if (changed[1]) ++float_constant_writes_[1];
   }
   void WriteRegister(uint32_t index, uint32_t value) override {
-    NoteConstantWrites(index, 1);
+    NoteConstantWrite(index, value);
     if (fast_registers_ && index < RegisterFile::kRegisterCount && !IsSpecialRegister(index)) {
       const_cast<volatile uint32_t&>(register_file_->values[index]) = value;
       return;
@@ -882,7 +909,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     CommandProcessor::WriteRegister(index, value);
   }
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override {
-    NoteConstantWrites(start_index, num_registers);
+    NoteConstantWrites(start_index, base, num_registers);
     // Entirely above the gamma ramp registers (all constants) or below the scratch registers: no side effects.
     if (fast_registers_ && uint64_t(start_index) + num_registers <= RegisterFile::kRegisterCount &&
         (start_index > XE_GPU_REG_DC_LUT_30_COLOR || uint64_t(start_index) + num_registers <= XE_GPU_REG_SCRATCH_REG0)) {
@@ -999,7 +1026,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t constant_uploads_reused = 0, us_prelude = 0, us_translate = 0, us_pipeline_sync = 0, pipelines_sync = 0;
     uint64_t shader_restores_async = 0, draws_shader_pending = 0, halfres_draws = 0, halfres_composites = 0;
     uint64_t dynamic_texture_updates = 0, halfres_depth_downsamples = 0, texture_lazy_hashes = 0;
-    uint64_t texture_view_memo_hits = 0, constant_memo_hits = 0;
+    uint64_t texture_view_memo_hits = 0, constant_memo_hits = 0, textures_postponed = 0;
     uint64_t geometry_hits = 0, geometry_hashes = 0, geometry_inserts = 0, geometry_changes = 0, geometry_full = 0,
              geometry_evictions = 0, geometry_saved_bytes = 0, geometry_copied_bytes = 0;
     uint64_t constant_sets_reused = 0, constant_sets_created = 0, resolve_image_barriers = 0;
@@ -1147,6 +1174,9 @@ class NativeCommandProcessor final : public CommandProcessor {
   PFN_vkCmdBlitImage cmd_blit_image_ = nullptr;
   PFN_vkCmdCopyImage cmd_copy_image_ = nullptr;
   PFN_vkCmdSetDepthBias2EXT cmd_set_depth_bias2_ = nullptr;
+  PFN_vkCreatePipelineCache create_pipeline_cache_ = nullptr;    // v126
+  PFN_vkDestroyPipelineCache destroy_pipeline_cache_ = nullptr;
+  PFN_vkGetPipelineCacheData get_pipeline_cache_data_ = nullptr;
   PFN_vkFreeDescriptorSets free_descriptor_sets_ = nullptr;  // RC76: absolute (unorm24) constant depth bias
   std::unique_ptr<SpirvShaderTranslator> translator_;
   // RC79: shader pack restores (SD reads, ~10 ms each) on a worker. A draw whose shader is still being restored is
@@ -1193,6 +1223,9 @@ class NativeCommandProcessor final : public CommandProcessor {
   std::unordered_map<uint64_t, TextureEntry> textures_;
   std::unordered_map<uint32_t, ResolvedEntry> resolved_;
   NativeImage white_;
+  NativeImage grey_;  // v126: stands in for a new texture postponed by ds2_native_texture_budget_ms
+  uint64_t texture_budget_frame_ = UINT64_MAX;
+  uint64_t texture_budget_used_us_ = 0;
   NativeImage white_cube_;  // RC63+: cube bindings need a cube view (a 2D view there is undefined on NVK)
   NativeImage white_3d_;    // v104: same for 3D bindings
   VkImageView GetCubeTextureView(const xenos::xe_gpu_texture_fetch_t& fetch);
@@ -1354,6 +1387,19 @@ class NativeCommandProcessor final : public CommandProcessor {
   pthread_t pipeline_thread_{};
   bool pipeline_thread_started_ = false;
   bool pipeline_quit_ = false;
+  // v126: our own pipeline cache, kept in a file next to the NRO (v125 logs: the same pipelines were compiled again
+  // on every start, 30-300 ms each where a full-screen pass needs one at once, 1.0-1.4 s for 32 at the first frame:
+  // the driver's disk cache did not serve them).
+  VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
+  std::string pipeline_cache_path_;
+  std::atomic<uint32_t> pipeline_cache_new_{0};    // pipelines created (not from the cache) since the last save
+  std::atomic<uint64_t> pipeline_cache_saved_us_{0};
+  bool pipeline_save_requested_ = false;           // under pipeline_mutex_
+  std::atomic<bool> pipeline_cache_saving_{false};
+  std::atomic<uint64_t> pipelines_fb_hits_{0}, pipelines_fb_misses_{0}, pipelines_fb_us_{0};
+  void LoadPipelineCache();
+  void SavePipelineCache();
+  void MaybeRequestPipelineCacheSave();
   std::atomic<uint64_t> pipeline_async_us_{0};
   // Hitch report: the counters at the previous swap.
   uint64_t hitch_prev_[6] = {};
@@ -1440,6 +1486,12 @@ bool NativeCommandProcessor::SetupContext() {
   }
   free_descriptor_sets_ =
       reinterpret_cast<PFN_vkFreeDescriptorSets>(ifn.vkGetDeviceProcAddr(dev, "vkFreeDescriptorSets"));
+  create_pipeline_cache_ =
+      reinterpret_cast<PFN_vkCreatePipelineCache>(ifn.vkGetDeviceProcAddr(dev, "vkCreatePipelineCache"));
+  destroy_pipeline_cache_ =
+      reinterpret_cast<PFN_vkDestroyPipelineCache>(ifn.vkGetDeviceProcAddr(dev, "vkDestroyPipelineCache"));
+  get_pipeline_cache_data_ =
+      reinterpret_cast<PFN_vkGetPipelineCacheData>(ifn.vkGetDeviceProcAddr(dev, "vkGetPipelineCacheData"));
   if (!free_descriptor_sets_) REXCVAR_SET(ds2_native_persistent_texture_sets, false);
   if (vulkan_device_->extensions().ext_EXT_depth_bias_control && props.depthBiasControl &&
       props.leastRepresentableValueForceUnormRepresentation) {
@@ -1596,6 +1648,7 @@ bool NativeCommandProcessor::SetupContext() {
                 pdp.limits.timestampPeriod);
   }
 
+  LoadPipelineCache();
   if (!BeginFrame()) return false;
   // 1x1 white texture for fetches that cannot be served.
   if (!CreateImage(white_, VK_FORMAT_R8G8B8A8_UNORM, 1, 1, false,
@@ -1612,6 +1665,17 @@ bool NativeCommandProcessor::SetupContext() {
     Barrier();
   }
   white_view_ = white_.view;
+  if (CreateImage(grey_, VK_FORMAT_R8G8B8A8_UNORM, 1, 1, false,
+                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+    EnsureGeneral(grey_);
+    VkClearColorValue c = {};
+    c.float32[0] = c.float32[1] = c.float32[2] = 0.5f;
+    c.float32[3] = 1.0f;
+    VkImageSubresourceRange r = ui::vulkan::util::InitializeSubresourceRange();
+    work_since_barrier_ = true;
+    dfn().vkCmdClearColorImage(slot().cmd, grey_.image, VK_IMAGE_LAYOUT_GENERAL, &c, 1, &r);
+    Barrier();
+  }
   if (CreateImage(white_cube_, VK_FORMAT_R8G8B8A8_UNORM, 1, 1, false,
                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 1, true)) {
     EnsureGeneral(white_cube_);
@@ -1670,6 +1734,7 @@ void NativeCommandProcessor::ShutdownContext() {
     DestroyImage(r.image, false);
   }
   DestroyImage(white_, false);
+  DestroyImage(grey_, false);
   DestroyImage(white_cube_, false);
   DestroyImage(white_3d_, false);
   DestroyImage(color_resolve_scratch_, false);
@@ -1708,6 +1773,11 @@ void NativeCommandProcessor::ShutdownContext() {
   }
   StopPipelineThread();
   StopRestoreThread();
+  if (pipeline_cache_) {
+    if (pipeline_cache_new_.load()) SavePipelineCache();
+    destroy_pipeline_cache_(dev, pipeline_cache_, nullptr);
+    pipeline_cache_ = VK_NULL_HANDLE;
+  }
   for (auto& [k, p] : pipelines_) {
     if (p) dfn().vkDestroyPipeline(dev, p, nullptr);
   }
@@ -1952,6 +2022,7 @@ void NativeCommandProcessor::SubmitFrame() {
   s.submitted = true;
   frame_open_ = false;
   ++frame_;
+  MaybeRequestPipelineCacheSave();
   BeginFrame();
 }
 
@@ -3737,8 +3808,17 @@ void* NativeCommandProcessor::PipelineThreadMain(void* param) {
     PipelineJob job;
     {
       std::unique_lock<std::mutex> lock(self->pipeline_mutex_);
-      self->pipeline_cv_.wait(lock, [self] { return self->pipeline_quit_ || !self->pipeline_jobs_.empty(); });
+      self->pipeline_cv_.wait(lock, [self] {
+        return self->pipeline_quit_ || !self->pipeline_jobs_.empty() || self->pipeline_save_requested_;
+      });
       if (self->pipeline_quit_) return nullptr;
+      if (self->pipeline_jobs_.empty() && self->pipeline_save_requested_) {
+        // v126: the pipeline cache is written here, between compile jobs, off the command thread.
+        self->pipeline_save_requested_ = false;
+        lock.unlock();
+        self->SavePipelineCache();
+        continue;
+      }
       job = self->pipeline_jobs_.front();
       self->pipeline_jobs_.pop_front();
     }
@@ -3843,6 +3923,96 @@ bool NativeCommandProcessor::PrepareTranslation(VulkanShader::VulkanTranslation*
     REXGPU_ERROR("[native] shader {:016X} translation failed", t->shader().ucode_data_hash());
   }
   return true;
+}
+
+void NativeCommandProcessor::LoadPipelineCache() {
+  const std::string name = REXCVAR_GET(ds2_native_pipeline_cache);
+  std::vector<uint8_t> data;
+  if (!name.empty()) {
+    std::filesystem::path path(name);
+    if (path.is_relative()) path = rex::filesystem::GetExecutableFolder() / path;
+    pipeline_cache_path_ = path.string();
+    if (FILE* f = std::fopen(pipeline_cache_path_.c_str(), "rb")) {
+      std::fseek(f, 0, SEEK_END);
+      const long size = std::ftell(f);
+      std::fseek(f, 0, SEEK_SET);
+      if (size > 0 && size < (256l << 20)) {
+        data.resize(size_t(size));
+        if (std::fread(data.data(), 1, data.size(), f) != data.size()) data.clear();
+      }
+      std::fclose(f);
+    }
+  }
+  if (!create_pipeline_cache_ || !get_pipeline_cache_data_ || !destroy_pipeline_cache_) {
+    REXGPU_WARN("[native] pipeline cache functions not available");
+    return;
+  }
+  VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+  ci.initialDataSize = data.size();
+  ci.pInitialData = data.empty() ? nullptr : data.data();
+  const uint64_t start = NowUs();
+  if (create_pipeline_cache_(vulkan_device_->device(), &ci, nullptr, &pipeline_cache_) != VK_SUCCESS) {
+    ci.initialDataSize = 0;
+    ci.pInitialData = nullptr;
+    if (create_pipeline_cache_(vulkan_device_->device(), &ci, nullptr, &pipeline_cache_) != VK_SUCCESS) {
+      pipeline_cache_ = VK_NULL_HANDLE;
+    }
+  }
+  pipeline_cache_saved_us_ = NowUs();
+  REXGPU_INFO("[native] pipeline cache {}: {:.1f} MB loaded in {:.0f} ms{}", pipeline_cache_path_.empty() ? "(memory)" :
+              pipeline_cache_path_, data.size() / 1048576.0, (NowUs() - start) / 1000.0,
+              pipeline_cache_ ? "" : " - unavailable");
+}
+
+void NativeCommandProcessor::SavePipelineCache() {
+  if (!pipeline_cache_ || pipeline_cache_path_.empty()) return;
+  if (pipeline_cache_saving_.exchange(true)) return;
+  const uint32_t new_count = pipeline_cache_new_.exchange(0);
+  const uint64_t start = NowUs();
+  const VkDevice dev = vulkan_device_->device();
+  size_t size = 0;
+  std::vector<uint8_t> data;
+  bool ok = get_pipeline_cache_data_(dev, pipeline_cache_, &size, nullptr) == VK_SUCCESS && size > 0;
+  if (ok) {
+    data.resize(size);
+    ok = get_pipeline_cache_data_(dev, pipeline_cache_, &size, data.data()) == VK_SUCCESS;
+    data.resize(size);
+  }
+  if (ok) {
+    // Written beside it, then renamed: a console switched off mid-write keeps the previous file.
+    const std::string tmp = pipeline_cache_path_ + ".tmp";
+    if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
+      ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
+      ok = (std::fclose(f) == 0) && ok;
+      if (ok) {
+        std::remove(pipeline_cache_path_.c_str());
+        ok = std::rename(tmp.c_str(), pipeline_cache_path_.c_str()) == 0;
+      }
+    } else {
+      ok = false;
+    }
+  }
+  if (!ok) pipeline_cache_new_.fetch_add(new_count);
+  pipeline_cache_saved_us_ = NowUs();
+  REXGPU_INFO("[native] pipeline cache {}: {:.1f} MB ({} new pipelines) in {:.0f} ms", ok ? "saved" : "NOT saved",
+              data.size() / 1048576.0, new_count, (NowUs() - start) / 1000.0);
+  pipeline_cache_saving_.store(false);
+}
+
+void NativeCommandProcessor::MaybeRequestPipelineCacheSave() {
+  // At most every 90 s, and 15 s after the first new pipelines of a session (they come in bursts while an area
+  // loads). The worker thread writes it between jobs.
+  const uint32_t pending = pipeline_cache_new_.load(std::memory_order_relaxed);
+  if (!pending || !pipeline_thread_started_ || pipeline_cache_path_.empty()) return;
+  const uint64_t since = NowUs() - pipeline_cache_saved_us_;
+  if (since < 15000000ull || (since < 90000000ull && pending < 64)) return;
+  {
+    std::lock_guard<std::mutex> lock(pipeline_mutex_);
+    if (pipeline_save_requested_ || pipeline_cache_saving_.load()) return;
+    pipeline_save_requested_ = true;
+  }
+  pipeline_cache_saved_us_ = NowUs();  // no new request until this one is done or 15 s passed
+  pipeline_cv_.notify_all();
 }
 
 void NativeCommandProcessor::StopPipelineThread() {
@@ -3994,10 +4164,25 @@ VkPipeline NativeCommandProcessor::CreatePipelineObject(const PipelineKey& key, 
   ci.renderPass = reinterpret_cast<VkRenderPass>(key.render_pass);
   ci.subpass = 0;
   VkPipeline pipeline = VK_NULL_HANDLE;
-  if (dfn().vkCreateGraphicsPipelines(vulkan_device_->device(), VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline) !=
+  // v126: through our pipeline cache, with creation feedback (was it found in the cache, how long it took).
+  VkPipelineCreationFeedback feedback = {};
+  VkPipelineCreationFeedbackCreateInfo feedback_info = {VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO};
+  feedback_info.pPipelineCreationFeedback = &feedback;
+  feedback_info.pNext = ci.pNext;
+  ci.pNext = &feedback_info;
+  const uint64_t create_start = NowUs();
+  if (dfn().vkCreateGraphicsPipelines(vulkan_device_->device(), pipeline_cache_, 1, &ci, nullptr, &pipeline) !=
       VK_SUCCESS) {
     REXGPU_ERROR("[native] pipeline creation failed (vs {:016X} ps {:016X})", key.vs_hash, key.ps_hash);
     pipeline = VK_NULL_HANDLE;
+  }
+  pipelines_fb_us_.fetch_add(NowUs() - create_start, std::memory_order_relaxed);
+  if ((feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) &&
+      (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)) {
+    pipelines_fb_hits_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    pipelines_fb_misses_.fetch_add(1, std::memory_order_relaxed);
+    pipeline_cache_new_.fetch_add(1, std::memory_order_relaxed);
   }
   return pipeline;
 }
@@ -4320,6 +4505,29 @@ VkImageView NativeCommandProcessor::GetTextureViewUncached(uint32_t fetch_index,
   if (!need_check) {
     return GetSwizzleView(t.swizzle_views, t.image, fetch.swizzle | (fi.host_swizzle << 12));
   }
+  /*
+   * v126: a budget for new textures per submission. Entering Heide's Tower prepared 131 textures (31 MB) in one frame
+   * (170-190 ms) and 218 more on the way back (190 ms), the same in every run. Past the budget a new texture is drawn
+   * with a neutral grey (a flat normal, mid albedo, opaque) and prepared in the following submissions.
+   */
+  const bool new_texture = !t.image.image;
+  if (texture_budget_frame_ != frame_) {
+    texture_budget_frame_ = frame_;
+    texture_budget_used_us_ = 0;
+  }
+  static const int32_t budget_ms = REXCVAR_GET(ds2_native_texture_budget_ms);
+  if (new_texture && budget_ms > 0 && grey_.view && texture_budget_used_us_ >= uint64_t(budget_ms) * 1000u) {
+    textures_.erase(key);
+    ++stats_.textures_postponed;
+    return grey_.view;
+  }
+  struct NewTextureTimer {
+    uint64_t* total;
+    uint64_t start;
+    ~NewTextureTimer() {
+      if (total) *total += NowUs() - start;
+    }
+  } new_texture_timer{new_texture ? &texture_budget_used_us_ : nullptr, NowUs()};
   ScopedUs texture_timer(stats_.us_textures);
   // RC77: textures created together (entering an area) are rehashed on different frames, not all every 30th.
   t.last_check_frame = frame_ - (t.image.image ? 0 : std::min<uint64_t>(frame_, key % 29));
@@ -7376,6 +7584,17 @@ void NativeCommandProcessor::LogStats() {
               stats_.us_prelude / n / 1000.0, stats_.constant_uploads_reused / n, stats_.constant_memo_hits / n,
               stats_.texture_view_memo_hits / n, stats_.us_translate / 1000.0,
               stats_.pipelines_sync, stats_.us_pipeline_sync / 1000.0);
+  {
+    const uint64_t hits = pipelines_fb_hits_.exchange(0), misses = pipelines_fb_misses_.exchange(0),
+                   us = pipelines_fb_us_.exchange(0);
+    if (hits + misses) {
+      REXGPU_INFO("[native] pipelines in the interval: {} from the cache, {} compiled, {:.1f} ms each | textures "
+                  "postponed by the budget/frame {:.2f}",
+                  hits, misses, us / 1000.0 / double(hits + misses), stats_.textures_postponed / n);
+    } else if (stats_.textures_postponed) {
+      REXGPU_INFO("[native] textures postponed by the budget/frame {:.2f}", stats_.textures_postponed / n);
+    }
+  }
   {
     const uint64_t rc = restore_count_.exchange(0), rus = restore_us_.exchange(0);
     REXGPU_INFO("[native] shader pack restores on the worker in the interval: {} queued, {} done, {:.1f} ms ({:.2f} "
