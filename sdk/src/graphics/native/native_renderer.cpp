@@ -215,6 +215,9 @@ REXCVAR_DEFINE_BOOL(ds2_native_texture_lazy_hash, true, "GPU",
 REXCVAR_DEFINE_BOOL(ds2_native_dynamic_new_textures, false, "GPU",
                     "v122: true = a new 2D texture is also checked every frame for its first 120 frames (as before "
                     "v122); false = only textures the game rewrote");
+REXCVAR_DEFINE_BOOL(ds2_native_resolve_skip_quantized_copy, true, "GPU",
+                    "v123: a D24FS8 depth resolve that is quantized to float24 is not copied first (the quantize pass "
+                    "writes every pixel); false = copy, then quantize, as before");
 REXCVAR_DEFINE_BOOL(ds2_native_fast_untile, true, "GPU",
                     "RC77: untile 2D textures 16 bytes at a time with the offset computed inline");
 REXCVAR_DEFINE_BOOL(ds2_native_pipeline_steal, true, "GPU",
@@ -952,7 +955,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t texture_1d = 0, texture_white_dimension = 0, texture_cube = 0, cube_faces_from_resolves = 0;
     uint64_t texture_3d = 0;  // v104
     uint64_t resolves_skipped = 0;  // v106
-    uint64_t depth_decoded_fetches = 0, depth_decodes = 0, depth_float24_quantized = 0;
+    uint64_t depth_decoded_fetches = 0, depth_decodes = 0, depth_float24_quantized = 0, resolve_copies_saved = 0;
     uint64_t barriers_issued = 0, barriers_elided = 0;
     uint64_t state_calls = 0, state_calls_skipped = 0;
     uint64_t face_clears = 0;
@@ -6404,14 +6407,36 @@ bool NativeCommandProcessor::IssueCopy() {
     c.srcOffset = {x0, y0, 0};
     c.dstOffset = {dst_x0, dst_y0, 0};
     c.extent = {uint32_t(x1 - x0), uint32_t(y1 - y0), 1};
-    work_since_barrier_ = true;
-    cmd_copy_image_(slot().cmd, copy_src->image, VK_IMAGE_LAYOUT_GENERAL, r.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    /*
+     * v123: a D24FS8 depth resolve is quantized to float24 by a pass that reads the source and writes every pixel
+     * of the destination rectangle (no discard, depth test always): the copy before it was overwritten entirely.
+     * Majula (v122 log): 3 depth resolves of 1280x720 per frame, "resolve copy depth 1280x2048" 1.29 ms of 32 ms
+     * GPU. The copy stays when the stencil plane is copied too or when the pass cannot be made.
+     */
+    const bool quantize = is_depth && REXCVAR_GET(ds2_native_resolve_float24) &&
+                          xenos::DepthRenderTargetFormat(regs.Get<reg::RB_DEPTH_INFO>().depth_format) ==
+                              xenos::DepthRenderTargetFormat::kD24FS8;
+    const bool copy_needed = !quantize || !REXCVAR_GET(ds2_native_resolve_depth_only) ||
+                             !REXCVAR_GET(ds2_native_resolve_skip_quantized_copy);
+    if (copy_needed) {
+      work_since_barrier_ = true;
+      cmd_copy_image_(slot().cmd, copy_src->image, VK_IMAGE_LAYOUT_GENERAL, r.image.image, VK_IMAGE_LAYOUT_GENERAL, 1,
+                      &c);
+    }
     ResolveBarrier(*copy_src, r.image, false);
-    if (is_depth && REXCVAR_GET(ds2_native_resolve_float24) &&
-        xenos::DepthRenderTargetFormat(regs.Get<reg::RB_DEPTH_INFO>().depth_format) ==
-            xenos::DepthRenderTargetFormat::kD24FS8) {
-      QuantizeDepthFloat24(*copy_src, r.image, x0, y0,
-                           {{dst_x0, dst_y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}});
+    if (quantize) {
+      const bool quantized = QuantizeDepthFloat24(*copy_src, r.image, x0, y0,
+                                                  {{dst_x0, dst_y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}});
+      if (!quantized && !copy_needed) {
+        // The pass could not be made: copy after all (the float32 depth, as without ds2_native_resolve_float24).
+        ResolveBarrier(*copy_src, r.image, true);
+        work_since_barrier_ = true;
+        cmd_copy_image_(slot().cmd, copy_src->image, VK_IMAGE_LAYOUT_GENERAL, r.image.image, VK_IMAGE_LAYOUT_GENERAL,
+                        1, &c);
+        ResolveBarrier(*copy_src, r.image, false);
+      } else if (quantized && !copy_needed) {
+        ++stats_.resolve_copies_saved;
+      }
     }
     ++r.generation;
     Written(r.image);
@@ -6972,10 +6997,10 @@ void NativeCommandProcessor::LogStats() {
               stats_.dynamic_texture_updates / n, stats_.texture_lazy_hashes / n, stats_.halfres_depth_downsamples / n);
   REXGPU_INFO("[native] texture fetches/frame: {:.1f} 1D, {:.1f} cube ({:.2f} faces copied from resolves), {:.1f} 3D, "
               "{:.1f} white (unsupported 3D/cube/other dimension), {:.1f} depth from 8888 ({:.2f} decodes), "
-              "{:.2f} float24 depth resolves",
+              "{:.2f} float24 depth resolves ({:.2f} without a copy)",
               stats_.texture_1d / n, stats_.texture_cube / n, stats_.cube_faces_from_resolves / n, stats_.texture_3d / n,
               stats_.texture_white_dimension / n, stats_.depth_decoded_fetches / n, stats_.depth_decodes / n,
-              stats_.depth_float24_quantized / n);
+              stats_.depth_float24_quantized / n, stats_.resolve_copies_saved / n);
   std::string prims;
   for (uint32_t i = 0; i < 32; ++i) {
     if (stats_.prim_counts[i]) prims += fmt::format(" {}:{:.0f}", i, stats_.prim_counts[i] / n);
