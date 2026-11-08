@@ -1392,7 +1392,8 @@ class NativeCommandProcessor final : public CommandProcessor {
   // the driver's disk cache did not serve them).
   VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
   std::string pipeline_cache_path_;
-  std::atomic<uint32_t> pipeline_cache_new_{0};    // pipelines created (not from the cache) since the last save
+  std::atomic<uint32_t> pipeline_cache_new_{0};
+  size_t pipeline_cache_file_size_ = 0;  // serialized size of what the file holds    // pipelines created (not from the cache) since the last save
   std::atomic<uint64_t> pipeline_cache_saved_us_{0};
   bool pipeline_save_requested_ = false;           // under pipeline_mutex_
   std::atomic<bool> pipeline_cache_saving_{false};
@@ -3959,6 +3960,12 @@ void NativeCommandProcessor::LoadPipelineCache() {
     }
   }
   pipeline_cache_saved_us_ = NowUs();
+  if (pipeline_cache_ && !data.empty()) {
+    size_t loaded = 0;
+    if (get_pipeline_cache_data_(vulkan_device_->device(), pipeline_cache_, &loaded, nullptr) == VK_SUCCESS) {
+      pipeline_cache_file_size_ = loaded;
+    }
+  }
   REXGPU_INFO("[native] pipeline cache {}: {:.1f} MB loaded in {:.0f} ms{}", pipeline_cache_path_.empty() ? "(memory)" :
               pipeline_cache_path_, data.size() / 1048576.0, (NowUs() - start) / 1000.0,
               pipeline_cache_ ? "" : " - unavailable");
@@ -3973,6 +3980,12 @@ void NativeCommandProcessor::SavePipelineCache() {
   size_t size = 0;
   std::vector<uint8_t> data;
   bool ok = get_pipeline_cache_data_(dev, pipeline_cache_, &size, nullptr) == VK_SUCCESS && size > 0;
+  if (ok && size == pipeline_cache_file_size_) {
+    // Nothing new reached the cache (all from the loaded file): the file on the SD is already this.
+    pipeline_cache_saving_.store(false);
+    pipeline_cache_saved_us_ = NowUs();
+    return;
+  }
   if (ok) {
     data.resize(size);
     ok = get_pipeline_cache_data_(dev, pipeline_cache_, &size, data.data()) == VK_SUCCESS;
@@ -3993,6 +4006,7 @@ void NativeCommandProcessor::SavePipelineCache() {
     }
   }
   if (!ok) pipeline_cache_new_.fetch_add(new_count);
+  if (ok) pipeline_cache_file_size_ = data.size();
   pipeline_cache_saved_us_ = NowUs();
   REXGPU_INFO("[native] pipeline cache {}: {:.1f} MB ({} new pipelines) in {:.0f} ms", ok ? "saved" : "NOT saved",
               data.size() / 1048576.0, new_count, (NowUs() - start) / 1000.0);
@@ -4182,8 +4196,12 @@ VkPipeline NativeCommandProcessor::CreatePipelineObject(const PipelineKey& key, 
     pipelines_fb_hits_.fetch_add(1, std::memory_order_relaxed);
   } else {
     pipelines_fb_misses_.fetch_add(1, std::memory_order_relaxed);
-    pipeline_cache_new_.fetch_add(1, std::memory_order_relaxed);
   }
+  // v127: every pipeline counts. v126 logs: all of them were "cache hits" (the driver's disk cache on the SD), so
+  // nothing was ever saved, and a hit still took 10-40 ms (reading the SD); the objects found that way are added to
+  // our in-memory cache, and saving them lets the next start find them in memory. SavePipelineCache skips the write
+  // when the serialized size did not change.
+  pipeline_cache_new_.fetch_add(1, std::memory_order_relaxed);
   return pipeline;
 }
 
