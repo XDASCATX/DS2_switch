@@ -57,6 +57,20 @@ elseif(DS2_PGO STREQUAL "USE")
                            -Wno-coverage-mismatch)
 endif()
 
+# v125: profile-guided optimisation of the renderer (the SDK's rexgpu-xenos: native renderer, command processor),
+# independent of the game code's DS2_PGO. GEN: counters, written with the game code's ones by src/ds2_pgo.cpp.
+set(DS2_SDK_PGO "OFF" CACHE STRING "Profile-guided optimisation of the renderer: OFF, GEN or USE")
+if(TARGET rexgpu-xenos)
+    if(DS2_SDK_PGO STREQUAL "GEN")
+        target_compile_options(rexgpu-xenos PRIVATE -fprofile-arcs -fprofile-update=single
+                               -fprofile-info-section=ds2_gcov_info)
+    elseif(DS2_SDK_PGO STREQUAL "USE")
+        target_compile_options(rexgpu-xenos PRIVATE -fbranch-probabilities -fprofile-use -fno-profile-values
+                               -fprofile-partial-training -fprofile-correction -Wno-missing-profile
+                               -Wno-coverage-mismatch)
+    endif()
+endif()
+
 set(DS2_SOURCES
     src/main.cpp
     src/ds2_capture.cpp
@@ -73,7 +87,7 @@ set(DS2_SOURCES
 add_executable(ds2 ${DS2_SOURCES})
 target_include_directories(ds2 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${DS2_GENERATED_DIR}")
 target_link_libraries(ds2 PRIVATE ds2_recomp rex::runtime)
-if(DS2_PGO STREQUAL "GEN")
+if(DS2_PGO STREQUAL "GEN" OR DS2_SDK_PGO STREQUAL "GEN")
     target_compile_definitions(ds2 PRIVATE DS2_PGO_GEN=1)
     target_link_options(ds2 PRIVATE -fprofile-arcs)
 endif()

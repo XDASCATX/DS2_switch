@@ -225,6 +225,12 @@ REXCVAR_DEFINE_INT32(ds2_native_geometry_cache_mb, 48, "GPU",
 REXCVAR_DEFINE_BOOL(ds2_native_geometry_cache_trust, true, "GPU",
                     "v124: a cached vertex/index buffer unchanged for a while is compared with the guest bytes every "
                     "2nd, then every 4th submission instead of every one (false = compared every time)");
+REXCVAR_DEFINE_BOOL(ds2_native_texture_view_memo, true, "GPU",
+                    "v125: a texture binding repeated within a submission (same fetch constant, no resolve since) "
+                    "reuses the view found the first time; false = looked up for every binding, as before");
+REXCVAR_DEFINE_BOOL(ds2_native_constant_memo, true, "GPU",
+                    "v125: a draw whose vertex or pixel shader float constants were not written since the previous "
+                    "draw with the same shader reuses that draw's upload without packing and comparing them");
 REXCVAR_DEFINE_BOOL(ds2_native_fast_untile, true, "GPU",
                     "RC77: untile 2D textures 16 bytes at a time with the offset computed inline");
 REXCVAR_DEFINE_BOOL(ds2_native_pipeline_steal, true, "GPU",
@@ -859,7 +865,16 @@ class NativeCommandProcessor final : public CommandProcessor {
            index == XE_GPU_REG_DC_LUT_SEQ_COLOR || index == XE_GPU_REG_DC_LUT_PWL_DATA ||
            index == XE_GPU_REG_DC_LUT_30_COLOR;
   }
+  // v125: writes into the float constants (vertex 0x4000-0x43FF, pixel 0x4400-0x47FF), for ds2_native_constant_memo.
+  uint64_t float_constant_writes_[2] = {0, 0};
+  void NoteConstantWrites(uint32_t start, uint32_t count) {
+    constexpr uint32_t kVs = XE_GPU_REG_SHADER_CONSTANT_000_X, kPs = XE_GPU_REG_SHADER_CONSTANT_256_X;
+    const uint64_t end = uint64_t(start) + count;
+    if (start < kPs && end > kVs) ++float_constant_writes_[0];
+    if (start < kPs + 1024 && end > kPs) ++float_constant_writes_[1];
+  }
   void WriteRegister(uint32_t index, uint32_t value) override {
+    NoteConstantWrites(index, 1);
     if (fast_registers_ && index < RegisterFile::kRegisterCount && !IsSpecialRegister(index)) {
       const_cast<volatile uint32_t&>(register_file_->values[index]) = value;
       return;
@@ -867,6 +882,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     CommandProcessor::WriteRegister(index, value);
   }
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override {
+    NoteConstantWrites(start_index, num_registers);
     // Entirely above the gamma ramp registers (all constants) or below the scratch registers: no side effects.
     if (fast_registers_ && uint64_t(start_index) + num_registers <= RegisterFile::kRegisterCount &&
         (start_index > XE_GPU_REG_DC_LUT_30_COLOR || uint64_t(start_index) + num_registers <= XE_GPU_REG_SCRATCH_REG0)) {
@@ -983,6 +999,7 @@ class NativeCommandProcessor final : public CommandProcessor {
     uint64_t constant_uploads_reused = 0, us_prelude = 0, us_translate = 0, us_pipeline_sync = 0, pipelines_sync = 0;
     uint64_t shader_restores_async = 0, draws_shader_pending = 0, halfres_draws = 0, halfres_composites = 0;
     uint64_t dynamic_texture_updates = 0, halfres_depth_downsamples = 0, texture_lazy_hashes = 0;
+    uint64_t texture_view_memo_hits = 0, constant_memo_hits = 0;
     uint64_t geometry_hits = 0, geometry_hashes = 0, geometry_inserts = 0, geometry_changes = 0, geometry_full = 0,
              geometry_evictions = 0, geometry_saved_bytes = 0, geometry_copied_bytes = 0;
     uint64_t constant_sets_reused = 0, constant_sets_created = 0, resolve_image_barriers = 0;
@@ -1051,6 +1068,27 @@ class NativeCommandProcessor final : public CommandProcessor {
   void StopPipelineThread();
   VkSampler GetSampler(const VulkanShader::SamplerBinding& binding, const xenos::xe_gpu_texture_fetch_t& fetch);
   VkImageView GetTextureView(uint32_t fetch_index, xenos::FetchOpDimension dimension, bool& resolved_out);
+  VkImageView GetTextureViewUncached(uint32_t fetch_index, xenos::FetchOpDimension dimension, bool& resolved_out);
+  // v125: the result of GetTextureView for a fetch constant, valid for the rest of the submission (until a resolve).
+  struct TextureViewMemo {
+    uint32_t words[6] = {};
+    uint32_t dimension = 0xFFFFFFFFu;
+    uint64_t frame = UINT64_MAX;
+    uint64_t generation = 0;
+    VkImageView view = VK_NULL_HANDLE;
+    bool resolved = false;
+  };
+  std::array<TextureViewMemo, 128> texture_view_memo_{};
+  struct ConstantMemo {
+    const void* shader = nullptr;
+    uint64_t frame = UINT64_MAX;
+    uint64_t writes = 0;
+    uint32_t halfres_key = 0;
+    size_t size = 0;
+    VkDeviceSize offset = 0;
+  };
+  ConstantMemo constant_memo_[2];
+  uint64_t texture_view_memo_generation_ = 1;
   VkImageView GetSwizzleView(std::unordered_map<uint32_t, VkImageView>& views, const NativeImage& image,
                              uint32_t swizzle);
   ResolveLogicalImage* GetResolveLogicalImage(ResolvedEntry& entry, uint32_t width, uint32_t height);
@@ -4129,8 +4167,40 @@ NativeCommandProcessor::ResolveLogicalImage* NativeCommandProcessor::GetResolveL
   return &logical;
 }
 
+/*
+ * v125: within one submission, the same fetch constant gives the same view: a texture is checked at most once per
+ * submission (need_check uses frame_), and only a resolve (IssueCopy) can change what an address resolves to. The
+ * dense rooms of Heide's Tower (v124 log: ~1100 draws, 2200 texture bindings per frame, the GPU Commands thread at its
+ * limit) paid the key hash, two hash-map lookups and the swizzle-view lookup for every binding of every draw.
+ */
 VkImageView NativeCommandProcessor::GetTextureView(uint32_t fetch_index, xenos::FetchOpDimension dimension,
                                                    bool& resolved_out) {
+  static const bool memo_on = REXCVAR_GET(ds2_native_texture_view_memo);
+  if (!memo_on || Tracing()) return GetTextureViewUncached(fetch_index, dimension, resolved_out);
+  uint32_t words[6];
+  std::memcpy(words, &register_file_->values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 6 * fetch_index],
+              sizeof(words));
+  uint32_t h = uint32_t(dimension) * 0x9E3779B1u;
+  for (uint32_t w : words) h = (h ^ w) * 0x85EBCA6Bu;
+  TextureViewMemo& m = texture_view_memo_[(h >> 7) & 127];
+  if (m.frame == frame_ && m.generation == texture_view_memo_generation_ && m.dimension == uint32_t(dimension) &&
+      std::memcmp(m.words, words, sizeof(words)) == 0) {
+    resolved_out = m.resolved;
+    ++stats_.texture_view_memo_hits;
+    return m.view;
+  }
+  const VkImageView view = GetTextureViewUncached(fetch_index, dimension, resolved_out);
+  std::memcpy(m.words, words, sizeof(words));
+  m.dimension = uint32_t(dimension);
+  m.frame = frame_;
+  m.generation = texture_view_memo_generation_;
+  m.view = view;
+  m.resolved = resolved_out;
+  return view;
+}
+
+VkImageView NativeCommandProcessor::GetTextureViewUncached(uint32_t fetch_index, xenos::FetchOpDimension dimension,
+                                                           bool& resolved_out) {
   resolved_out = false;
   const RegisterFile& regs = *register_file_;
   const xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(fetch_index);
@@ -5736,6 +5806,18 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   auto put_float = [&](uint32_t index, const Shader& shader, uint32_t first_register) -> bool {
     const auto& map = shader.constant_register_map();
     const size_t size = sizeof(float) * 4 * std::max(map.float_count, 1u);
+    // v125: same shader, no write into its constant range since the previous upload in this submission, same
+    // half-resolution adjustment: the packed constants are the same bytes, reuse that upload.
+    const uint32_t bank = first_register == XE_GPU_REG_SHADER_CONSTANT_000_X ? 0u : 1u;
+    const uint32_t halfres_key = (halfres_draw_ && halfres_mode_ == 1 && bank == 1) ? halfres_divisor_ : 0u;
+    ConstantMemo& memo = constant_memo_[bank];
+    static const bool memo_on = REXCVAR_GET(ds2_native_constant_memo);
+    if (memo_on && memo.shader == &shader && memo.frame == frame_ && memo.writes == float_constant_writes_[bank] &&
+        memo.halfres_key == halfres_key && memo.size == size) {
+      cbuf[index] = {slot().upload, memo.offset, size};
+      ++stats_.constant_memo_hits;
+      return true;
+    }
     alignas(16) std::array<float, 256 * 4> packed;
     if (size > sizeof(packed)) return false;
     uint8_t* p = reinterpret_cast<uint8_t*>(packed.data());
@@ -5757,7 +5839,14 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       }
     }
     if (w == p) std::memset(p, 0, 16);
-    return put(index, p, size);
+    if (!put(index, p, size)) return false;
+    memo.shader = &shader;
+    memo.frame = frame_;
+    memo.writes = float_constant_writes_[bank];
+    memo.halfres_key = halfres_key;
+    memo.size = size;
+    memo.offset = cbuf[index].offset;
+    return true;
   };
   bool ok = put(SpirvShaderTranslator::kConstantBufferSystem, &sc, sizeof(sc)) &&
             put_float(SpirvShaderTranslator::kConstantBufferFloatVertex, *vs, XE_GPU_REG_SHADER_CONSTANT_000_X);
@@ -6427,6 +6516,7 @@ void NativeCommandProcessor::EndOcclusionQuery(uint32_t result_address) {
 }
 
 bool NativeCommandProcessor::IssueCopy() {
+  ++texture_view_memo_generation_;  // v125: a resolve can change what a texture address samples
   LatchRenderScale();
   FlushHalfRes();
   ScopedUs copy_timer(stats_.us_copies);
@@ -7281,9 +7371,10 @@ void NativeCommandProcessor::LogStats() {
   REXGPU_INFO("[native] constant sets/frame: {:.1f} reused, {:.1f} created | image resolve barriers/frame {:.1f}",
               stats_.constant_sets_reused / n, stats_.constant_sets_created / n, stats_.resolve_image_barriers / n);
   REXGPU_INFO("[native] draw setup ms/frame {:.2f} (before geometry, without textures and shaders) | constant "
-              "uploads reused/frame {:.1f} | in the interval: shaders translated or restored {:.1f} ms, {} pipelines "
-              "created at once {:.1f} ms",
-              stats_.us_prelude / n / 1000.0, stats_.constant_uploads_reused / n, stats_.us_translate / 1000.0,
+              "uploads reused/frame {:.1f} (unpacked {:.1f}), texture views remembered/frame {:.1f} | in the interval: "
+              "shaders translated or restored {:.1f} ms, {} pipelines created at once {:.1f} ms",
+              stats_.us_prelude / n / 1000.0, stats_.constant_uploads_reused / n, stats_.constant_memo_hits / n,
+              stats_.texture_view_memo_hits / n, stats_.us_translate / 1000.0,
               stats_.pipelines_sync, stats_.us_pipeline_sync / 1000.0);
   {
     const uint64_t rc = restore_count_.exchange(0), rus = restore_us_.exchange(0);
