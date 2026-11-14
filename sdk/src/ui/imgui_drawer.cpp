@@ -225,6 +225,18 @@ void ImGuiDrawer::Initialize() {
     rex::ui::souls::TitleFont() =
         io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(kCinzelTtf), int(sizeof(kCinzelTtf)),
                                        rex::ui::souls::kTitleFontSize, &cinzel_config, font_glyph_ranges);
+    // v131: larger bakes for big text (souls_style.h), with only the glyphs it uses.
+    static const ImWchar mid_ranges[] = {0x0020, 0x007E, 0};
+    static const ImWchar big_ranges[] = {0x0030, 0x0039, 0x0050, 0x0050, 0x0070, 0x0070, 0};
+    ImFontConfig mid_config = cinzel_config;
+    rex::ui::souls::TitleFontMid() =
+        io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(kCinzelTtf), int(sizeof(kCinzelTtf)),
+                                       rex::ui::souls::kTitleFontMidSize, &mid_config, mid_ranges);
+    ImFontConfig big_config = cinzel_config;
+    big_config.OversampleH = 1;
+    rex::ui::souls::TitleFontBig() =
+        io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(kCinzelTtf), int(sizeof(kCinzelTtf)),
+                                       rex::ui::souls::kTitleFontBigSize, &big_config, big_ranges);
   }
 
 #if REX_PLATFORM_WIN32

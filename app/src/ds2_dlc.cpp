@@ -291,6 +291,7 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
     sharpen_ = saved.sharpen;
     remembered_ = saved.valid;
     scale_ = saved.valid ? saved.scale : 1.0;
+    focus_ = scale_ >= 1.0 ? kCard720 : kCard540;  // v131: one A starts with the remembered choice
   }
 
  protected:
@@ -314,48 +315,67 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       }
       if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) counting_ = false;
     }
-    // v130: the focus stays on the remembered card until the player moves it (D-pad, stick or touch), so one A
-    // starts with the previous settings. A focus request in the first frame alone was lost on the console (the
-    // focus ended on the 60 button).
-    if (steer_) {
-      for (int k : {int(ImGuiKey_GamepadDpadLeft), int(ImGuiKey_GamepadDpadRight), int(ImGuiKey_GamepadDpadUp),
-                    int(ImGuiKey_GamepadDpadDown)}) {
-        if (ImGui::IsKeyPressed(ImGuiKey(k), false)) steer_ = false;
+    // v131: the screen's own focus and input instead of ImGui navigation. On the console ImGui's focus ended on the
+    // 60 button whatever was requested (v128-v130), so A did not start the game. Here the focus starts on the
+    // remembered card, the D-pad / left stick move it along a fixed map, A activates the focused control, and a
+    // touch activates the control under the finger.
+    double choice = 0.0;
+    auto activate = [&](int item) {
+      switch (item) {
+        case kRus: language_ = 12; break;
+        case kEng: language_ = 1; break;
+        case kOther: language_ = toml_language_; break;
+        case kCard720: choice = 1.0; break;
+        case kCard540: choice = 0.75; break;
+        case kSharpen: sharpen_ = !sharpen_; break;
+        case kFps30: fps_ = 30; break;
+        case kFps60: fps_ = 60; break;
+        default: break;
       }
-      for (int k = ImGuiKey_GamepadLStickLeft; k <= ImGuiKey_GamepadLStickDown; ++k) {
-        if (ImGui::IsKeyPressed(ImGuiKey(k), false) && ImGui::GetKeyData(ImGuiKey(k))->AnalogValue > 0.5f) {
-          steer_ = false;
+    };
+    {
+      // A = accept as in ImGui's menus (switch_imgui_input.h: by letter A is the right face button).
+      const ImGuiKey accept = io.ConfigNavSwapGamepadButtons ? ImGuiKey_GamepadFaceRight : ImGuiKey_GamepadFaceDown;
+      if (!ImGui::IsKeyDown(accept)) armed_ = true;  // the A that launched the port must be released first
+      int dir = -1;
+      if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft, true) || ImGui::IsKeyPressed(ImGuiKey_GamepadLStickLeft, true)) dir = 0;
+      if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight, true) || ImGui::IsKeyPressed(ImGuiKey_GamepadLStickRight, true)) dir = 1;
+      if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadUp, true) || ImGui::IsKeyPressed(ImGuiKey_GamepadLStickUp, true)) dir = 2;
+      if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadDown, true) || ImGui::IsKeyPressed(ImGuiKey_GamepadLStickDown, true)) dir = 3;
+      if (dir >= 0) focus_ = Move(focus_, dir);
+      if (armed_ && ImGui::IsKeyPressed(accept, false)) activate(focus_);
+      if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        const ImVec2 m = io.MousePos;
+        for (int item = 0; item < kItems; ++item) {
+          if (item == kOther && !OtherLanguageName(toml_language_)) continue;
+          const ImVec4 r = Rect(item);
+          if (m.x >= r.x * k_ && m.x < r.z * k_ && m.y >= r.y * k_ && m.y < r.w * k_) {
+            focus_ = item;
+            activate(item);
+            break;  // the sharpening toggle comes before the 540p card it sits in
+          }
         }
       }
-      if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) steer_ = false;
     }
     DrawBackground(ImGui::GetBackgroundDrawList(), io.DisplaySize);
 
+    // One window over the whole screen, only to draw in (no ImGui navigation).
     ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
     ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_Always);
-    if (first_frame_ || steer_) ImGui::SetNextWindowFocus();
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
-    const ImU32 none = IM_COL32(0, 0, 0, 0);
-    ImGui::PushStyleColor(ImGuiCol_Button, none);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, none);
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, none);
-    ImGui::PushStyleColor(ImGuiCol_NavCursor, none);  // the focus is shown by the controls themselves
-    double choice = 0.0;
-    if (ImGui::Begin("##ds2_resolution", nullptr, rex::ui::souls::kWindowFlags)) {
+    if (ImGui::Begin("##ds2_resolution", nullptr,
+                     rex::ui::souls::kWindowFlags | ImGuiWindowFlags_NoNavInputs | ImGuiWindowFlags_NoNavFocus)) {
       ImDrawList* dl = ImGui::GetWindowDrawList();
       // Language (top left).
       Txt(dl, 28, 25, 13, 3, kLabel, "IN-GAME LANGUAGE");
-      if (Pill(dl, "##rus", "RUS", language_ == 12, 28, 42, 64, 44, 14, 2)) language_ = 12;
-      if (Pill(dl, "##eng", "ENG", language_ == 1, 100, 42, 64, 44, 14, 2)) language_ = 1;
+      Pill(dl, "RUS", language_ == 12, focus_ == kRus, Rect(kRus), 14, 2);
+      Pill(dl, "ENG", language_ == 1, focus_ == kEng, Rect(kEng), 14, 2);
       if (const char* other = OtherLanguageName(toml_language_)) {
-        if (Pill(dl, "##toml_lang", other, language_ == toml_language_, 172, 42, 64, 44, 14, 2)) {
-          language_ = toml_language_;
-        }
+        Pill(dl, other, language_ == toml_language_, focus_ == kOther, Rect(kOther), 14, 2);
       }
       // Title.
-      Txt(dl, 640, 53, 38, 12, IM_COL32(239, 226, 198, 255), "DARK SOULS II", 1, true, IM_COL32(255, 130, 40, 12));
+      Txt(dl, 640, 53, 38, 12, IM_COL32(239, 226, 198, 255), "DARK SOULS II", 1, false, IM_COL32(255, 130, 40, 12));
       Txt(dl, 640, 97, 13, 7, kGold, "SCHOLAR OF THE FIRST SIN", 1);
       dl->AddRectFilledMultiColor(P(450, 123.5f), P(640 - 12, 124.5f), IM_COL32(176, 138, 79, 0), kBronzeLine,
                                   kBronzeLine, IM_COL32(176, 138, 79, 0));
@@ -365,44 +385,30 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       rex::ui::souls::Diamond(dl, P(640, 124), 5.6f * k_, IM_COL32(255, 138, 42, 255));
       Txt(dl, 640, 161, 15, 6, kMuted, "CHOOSE RESOLUTION", 1);
 
-      // The two cards (invisible buttons first, so both focus states are known before drawing them).
-      if (steer_ && scale_ >= 1.0) ImGui::SetKeyboardFocusHere();
-      ImGui::SetCursorScreenPos(P(220, 190));
-      if (ImGui::Button("##720", S(300, 270))) choice = 1.0;
-      const bool hot720 = ImGui::IsItemFocused() || ImGui::IsItemHovered();
-      if (scale_ >= 1.0) ImGui::SetItemDefaultFocus();
-      if (steer_ && scale_ < 1.0) ImGui::SetKeyboardFocusHere();
-      ImGui::SetCursorScreenPos(P(760, 190));
-      ImGui::SetNextItemAllowOverlap();  // the sharpening toggle sits inside the 540p card
-      if (ImGui::Button("##540", S(300, 270))) choice = 0.75;
-      const bool hot540 = ImGui::IsItemFocused() || ImGui::IsItemHovered();
-      if (scale_ < 1.0) ImGui::SetItemDefaultFocus();
-      const bool any = hot720 || hot540;
-      const bool on720 = hot720 || (!any && scale_ >= 1.0);
-      const bool on540 = hot540 || (!any && scale_ < 1.0);
+      // The two cards: the focused one is lit; while the focus is elsewhere, the remembered one.
+      const bool card_focus = focus_ == kCard720 || focus_ == kCard540;
+      const bool on720 = focus_ == kCard720 || (!card_focus && scale_ >= 1.0);
+      const bool on540 = focus_ == kCard540 || (!card_focus && scale_ < 1.0);
       CardFace(dl, 220, on720);
       CardFace(dl, 760, on540);
       if (remembered_) Txt(dl, scale_ >= 1.0 ? 370 : 910, 218, 11, 4, IM_COL32(255, 198, 122, 255), "LAST USED", 1);
-      Txt(dl, 370, 292, 76, 0, on720 ? kBigOn : kBigOff, "720p", 1, true, on720 ? kBigGlow : 0);
+      Txt(dl, 370, 292, 76, 0, on720 ? kBigOn : kBigOff, "720p", 1, false, on720 ? kBigGlow : 0);
       Txt(dl, 370, 353, 15, 4, kSand, "NATIVE", 1);
       Txt(dl, 370, 382, 13, 2, kMuted, "Sharp picture", 1);
-      Txt(dl, 910, 270, 76, 0, on540 ? kBigOn : kBigOff, "540p", 1, true, on540 ? kBigGlow : 0);
+      Txt(dl, 910, 270, 76, 0, on540 ? kBigOn : kBigOff, "540p", 1, false, on540 ? kBigGlow : 0);
       Txt(dl, 910, 330, 15, 4, kSand, "MORE FPS", 1);
       Txt(dl, 910, 359, 13, 2, kMuted, "Softer picture", 1);
-      if (Pill(dl, "##sharpen", sharpen_ ? "SHARPENING: ON" : "SHARPENING: OFF", sharpen_, 800, 394, 220, 44, 13, 2)) {
-        sharpen_ = !sharpen_;
-        counting_ = false;
-      }
+      Pill(dl, sharpen_ ? "SHARPENING: ON" : "SHARPENING: OFF", sharpen_, focus_ == kSharpen, Rect(kSharpen), 13, 2);
       DrawBonfire(dl, P(520, 190), k_, time_);
 
       // Frame rate lock.
       Txt(dl, 644, 510, 16, 4, kLabel, "FRAME RATE LOCK", 2);
-      if (Pill(dl, "##fps30", "30", fps_ == 30, 666, 488, 72, 44, 18, 1)) fps_ = 30;
-      if (Pill(dl, "##fps60", "60", fps_ == 60, 752, 488, 72, 44, 18, 1)) fps_ = 60;
+      Pill(dl, "30", fps_ == 30, focus_ == kFps30, Rect(kFps30), 18, 1);
+      Pill(dl, "60", fps_ == 60, focus_ == kFps60, Rect(kFps60), 18, 1);
 
       // Countdown with the remembered choice: text and a draining ember bar.
       const float left = counting_ ? kCountdown - time_ : 0.0f;
-      if (counting_ && left <= 0.0f) choice = scale_;
+      if (counting_ && left <= 0.0f && choice == 0.0) choice = scale_;
       if (counting_) {
         char num[8];
         std::snprintf(num, sizeof(num), "%d", int(left) + 1);
@@ -427,8 +433,7 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       first_frame_ = false;
     }
     ImGui::End();
-    ImGui::PopStyleColor(4);
-    ImGui::PopStyleVar(3);
+    ImGui::PopStyleVar(2);
     if (choice > 0.0) {
       chosen_ = true;
       StartPrefs p;
@@ -526,12 +531,40 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
   }
 
   // A small button: lit (ember gradient, warm border, glow) when `on`, dark otherwise; a ring shows the focus.
-  bool Pill(ImDrawList* dl, const char* id, const char* text, bool on, float x, float y, float w, float h, float px,
-            float sp) const {
-    ImGui::SetCursorScreenPos(P(x, y));
-    const bool pressed = ImGui::Button(id, S(w, h));
-    const bool hot = ImGui::IsItemFocused() || ImGui::IsItemHovered();
-    const ImVec2 a = P(x, y), b = P(x + w, y + h);
+  // The controls: what is focusable, where it is (x0, y0, x1, y1 in mock-up px) and where the D-pad leads.
+  enum Item { kRus, kEng, kOther, kSharpen, kCard720, kCard540, kFps30, kFps60, kItems };
+  static ImVec4 Rect(int item) {
+    switch (item) {
+      case kRus: return ImVec4(28, 42, 92, 86);
+      case kEng: return ImVec4(100, 42, 164, 86);
+      case kOther: return ImVec4(172, 42, 236, 86);
+      case kSharpen: return ImVec4(800, 394, 1020, 438);
+      case kCard720: return ImVec4(220, 190, 520, 460);
+      case kCard540: return ImVec4(760, 190, 1060, 460);
+      case kFps30: return ImVec4(666, 488, 738, 532);
+      case kFps60: return ImVec4(752, 488, 824, 532);
+      default: return ImVec4(0, 0, 0, 0);
+    }
+  }
+  // dir: 0 left, 1 right, 2 up, 3 down.
+  int Move(int item, int dir) const {
+    const bool other = OtherLanguageName(toml_language_) != nullptr;
+    switch (item) {
+      case kRus: return dir == 1 ? kEng : dir == 3 ? kCard720 : item;
+      case kEng: return dir == 0 ? kRus : (dir == 1 && other) ? kOther : dir == 3 ? kCard720 : item;
+      case kOther: return dir == 0 ? kEng : dir == 3 ? kCard720 : item;
+      case kCard720: return dir == 1 ? kCard540 : dir == 2 ? kRus : dir == 3 ? kFps30 : item;
+      case kCard540: return dir == 0 ? kCard720 : dir == 2 ? kEng : dir == 3 ? kSharpen : item;
+      case kSharpen: return dir == 0 ? kCard720 : dir == 2 ? kCard540 : dir == 3 ? kFps60 : item;
+      case kFps30: return dir == 1 ? kFps60 : dir == 2 ? kCard720 : item;
+      case kFps60: return dir == 0 ? kFps30 : dir == 2 ? kSharpen : item;
+      default: return item;
+    }
+  }
+
+  // A small button: lit (ember gradient, warm border, glow) when `on`, dark otherwise; a ring shows the focus.
+  void Pill(ImDrawList* dl, const char* text, bool on, bool hot, ImVec4 r, float px, float sp) const {
+    const ImVec2 a = P(r.x, r.y), b = P(r.z, r.w);
     if (on) {
       Glow(dl, a, b, 255, 120, 24, 0.4f, 16.0f);
       dl->AddRectFilledMultiColor(a, b, IM_COL32(58, 26, 7, 255), IM_COL32(58, 26, 7, 255), IM_COL32(138, 60, 12, 255),
@@ -545,9 +578,8 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       const float d = 4.0f * k_;
       dl->AddRect(ImVec2(a.x - d, a.y - d), ImVec2(b.x + d, b.y + d), IM_COL32(255, 198, 122, 210), 0.0f, 0, 1.5f * k_);
     }
-    Txt(dl, x + w * 0.5f, y + h * 0.5f, px, sp,
+    Txt(dl, (r.x + r.z) * 0.5f, (r.y + r.w) * 0.5f, px, sp,
         on ? IM_COL32(255, 226, 176, 255) : hot ? IM_COL32(230, 216, 189, 255) : kMuted, text, 1);
-    return pressed;
   }
 
   // A resolution card (300 x 270 at x, 190): lit = ember gradient with a pulsing glow, else dark with bronze ticks.
@@ -803,7 +835,8 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
     Skull(173.0f, 239.0f, 0.85f, 14.0f);
   }
   float k_ = 1.0f;
-  bool steer_ = true;  // v130: keep the focus on the remembered card until the player moves it
+  int focus_ = kCard720;  // v131: the focused control (Item)
+  bool armed_ = false;    // v131: A was seen released since the screen appeared
 
   // Xbox 360 language ids of the European disc other than English and Russian.
   static const char* OtherLanguageName(int id) {

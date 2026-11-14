@@ -27,6 +27,18 @@ inline ImFont*& TitleFont() {
   static ImFont* font = nullptr;
   return font;
 }
+// v131 (DS2 port): Cinzel also baked larger, for big text (the start screen's title and resolutions), which
+// stair-stepped when the 32 px glyphs were magnified 1.6-3.2x. Each holds only the glyphs that big text uses.
+inline constexpr float kTitleFontMidSize = 52.0f;   // ASCII
+inline constexpr float kTitleFontBigSize = 104.0f;  // digits, 'P' and 'p'
+inline ImFont*& TitleFontMid() {
+  static ImFont* font = nullptr;
+  return font;
+}
+inline ImFont*& TitleFontBig() {
+  static ImFont* font = nullptr;
+  return font;
+}
 
 inline ImU32 Col(ImVec4 c, float alpha = 1.0f) { return ImGui::GetColorU32(ImVec4(c.x, c.y, c.z, c.w * alpha)); }
 
@@ -89,7 +101,14 @@ inline constexpr float kTitleFontSize = 32.0f;
 // Pushes the title font at kTitleFontSize * scale (or the default font scaled up when it is missing).
 inline void PushTitleFont(float scale) {
   if (ImFont* font = TitleFont()) {
-    ImGui::PushFont(font, kTitleFontSize * scale);
+    // v131: the closest baked size from below, so glyphs are shrunk a little rather than magnified.
+    const float size = kTitleFontSize * scale;
+    if (size > kTitleFontBigSize * 0.75f && TitleFontBig()) {
+      font = TitleFontBig();
+    } else if (size > kTitleFontMidSize * 0.8f && TitleFontMid()) {
+      font = TitleFontMid();
+    }
+    ImGui::PushFont(font, size);
   } else {
     ImGui::PushFont(nullptr, 0.0f);
     ImGui::SetWindowFontScale(2.4f * scale);
