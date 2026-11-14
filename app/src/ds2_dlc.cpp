@@ -314,11 +314,26 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       }
       if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) counting_ = false;
     }
+    // v130: the focus stays on the remembered card until the player moves it (D-pad, stick or touch), so one A
+    // starts with the previous settings. A focus request in the first frame alone was lost on the console (the
+    // focus ended on the 60 button).
+    if (steer_) {
+      for (int k : {int(ImGuiKey_GamepadDpadLeft), int(ImGuiKey_GamepadDpadRight), int(ImGuiKey_GamepadDpadUp),
+                    int(ImGuiKey_GamepadDpadDown)}) {
+        if (ImGui::IsKeyPressed(ImGuiKey(k), false)) steer_ = false;
+      }
+      for (int k = ImGuiKey_GamepadLStickLeft; k <= ImGuiKey_GamepadLStickDown; ++k) {
+        if (ImGui::IsKeyPressed(ImGuiKey(k), false) && ImGui::GetKeyData(ImGuiKey(k))->AnalogValue > 0.5f) {
+          steer_ = false;
+        }
+      }
+      if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) steer_ = false;
+    }
     DrawBackground(ImGui::GetBackgroundDrawList(), io.DisplaySize);
 
     ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
     ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_Always);
-    if (first_frame_) ImGui::SetNextWindowFocus();
+    if (first_frame_ || steer_) ImGui::SetNextWindowFocus();
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
@@ -331,7 +346,7 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
     if (ImGui::Begin("##ds2_resolution", nullptr, rex::ui::souls::kWindowFlags)) {
       ImDrawList* dl = ImGui::GetWindowDrawList();
       // Language (top left).
-      Txt(dl, 28, 26, 11, 3, kMuted, "IN-GAME LANGUAGE");
+      Txt(dl, 28, 25, 13, 3, kLabel, "IN-GAME LANGUAGE");
       if (Pill(dl, "##rus", "RUS", language_ == 12, 28, 42, 64, 44, 14, 2)) language_ = 12;
       if (Pill(dl, "##eng", "ENG", language_ == 1, 100, 42, 64, 44, 14, 2)) language_ = 1;
       if (const char* other = OtherLanguageName(toml_language_)) {
@@ -351,12 +366,12 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       Txt(dl, 640, 161, 15, 6, kMuted, "CHOOSE RESOLUTION", 1);
 
       // The two cards (invisible buttons first, so both focus states are known before drawing them).
-      if (first_frame_ && scale_ >= 1.0) ImGui::SetKeyboardFocusHere();
+      if (steer_ && scale_ >= 1.0) ImGui::SetKeyboardFocusHere();
       ImGui::SetCursorScreenPos(P(220, 190));
       if (ImGui::Button("##720", S(300, 270))) choice = 1.0;
       const bool hot720 = ImGui::IsItemFocused() || ImGui::IsItemHovered();
       if (scale_ >= 1.0) ImGui::SetItemDefaultFocus();
-      if (first_frame_ && scale_ < 1.0) ImGui::SetKeyboardFocusHere();
+      if (steer_ && scale_ < 1.0) ImGui::SetKeyboardFocusHere();
       ImGui::SetCursorScreenPos(P(760, 190));
       ImGui::SetNextItemAllowOverlap();  // the sharpening toggle sits inside the 540p card
       if (ImGui::Button("##540", S(300, 270))) choice = 0.75;
@@ -381,7 +396,7 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       DrawBonfire(dl, P(520, 190), k_, time_);
 
       // Frame rate lock.
-      Txt(dl, 644, 510, 14, 4, kMuted, "FRAME RATE LOCK", 2);
+      Txt(dl, 644, 510, 16, 4, kLabel, "FRAME RATE LOCK", 2);
       if (Pill(dl, "##fps30", "30", fps_ == 30, 666, 488, 72, 44, 18, 1)) fps_ = 30;
       if (Pill(dl, "##fps60", "60", fps_ == 60, 752, 488, 72, 44, 18, 1)) fps_ = 60;
 
@@ -430,6 +445,7 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
  private:
   static constexpr float kCountdown = 20.0f;  // v121: 20 s (was 10)
   static constexpr ImU32 kMuted = IM_COL32(168, 154, 133, 255);       // #a89a85
+  static constexpr ImU32 kLabel = IM_COL32(196, 181, 155, 255);       // small labels: a little lighter (v130)
   static constexpr ImU32 kSand = IM_COL32(216, 196, 156, 255);        // #d8c49c
   static constexpr ImU32 kGold = IM_COL32(201, 164, 104, 255);        // #c9a468
   static constexpr ImU32 kBronzeLine = IM_COL32(176, 138, 79, 255);   // #b08a4f
@@ -488,7 +504,8 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       }
     }
     run(0.0f, 0.0f, col);
-    if (bold) run(0.7f * k_, 0.0f, col);
+    // v130: Cinzel's hairlines vanish at small sizes on the console: text up to 16 px is drawn twice, offset.
+    if (bold || px <= 16.0f) run((px <= 16.0f ? 0.6f : 0.7f) * k_, 0.0f, col);
     rex::ui::souls::PopTitleFont();
   }
 
@@ -622,18 +639,18 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       dl->AddCircleFilled(c, r * k_, IM_COL32(255, 183, 92, int(255.0f * op)), 12);
     }
     // Author (bottom left).
-    Txt(dl, 28, 632, 11, 5, kMuted, "SWITCH PORT BY");
+    Txt(dl, 28, 630, 13, 5, kLabel, "SWITCH PORT BY");
     dl->AddCircleFilled(P(31.5f, 659), 8.0f * k_, IM_COL32(255, 122, 26, 60), 12);
     rex::ui::souls::Diamond(dl, P(31.5f, 659), 5.0f * k_, IM_COL32(255, 138, 42, 255));
     Txt(dl, 45, 659, 24, 5, IM_COL32(232, 201, 140, 255), "XDASCATX", 0, true, IM_COL32(255, 130, 40, 14));
-    Txt(dl, 28, 688, 12, 4, kGold, "XBOX 360 RECOMP");
+    Txt(dl, 28, 689, 14, 4, kGold, "XBOX 360 RECOMP");
     // Version (bottom right), in a box.
     if (DS2_VERSION_STRING[0]) {
-      const float wl = Width("VERSION", 11, 4) / k_, wv = Width(DS2_VERSION_STRING, 26, 2) / k_ + 0.7f;
+      const float wl = Width("VERSION", 13, 4) / k_, wv = Width(DS2_VERSION_STRING, 26, 2) / k_ + 0.7f;
       const float x1 = 1252.0f, x0 = x1 - 16.0f - wv - 12.0f - wl - 16.0f;
       dl->AddRectFilled(P(x0, 645), P(x1, 698), IM_COL32(14, 11, 8, 217));
       dl->AddRect(P(x0, 645), P(x1, 698), IM_COL32(107, 82, 48, 255), 0.0f, 0, 1.2f * k_);
-      Txt(dl, x0 + 16.0f, 671.5f, 11, 4, kMuted, "VERSION");
+      Txt(dl, x0 + 16.0f, 671.5f, 13, 4, kLabel, "VERSION");
       Txt(dl, x1 - 16.0f, 671.5f, 26, 2, IM_COL32(255, 183, 92, 255), DS2_VERSION_STRING, 2, true,
           IM_COL32(255, 122, 26, 20));
     }
@@ -786,6 +803,7 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
     Skull(173.0f, 239.0f, 0.85f, 14.0f);
   }
   float k_ = 1.0f;
+  bool steer_ = true;  // v130: keep the focus on the remembered card until the player moves it
 
   // Xbox 360 language ids of the European disc other than English and Russian.
   static const char* OtherLanguageName(int id) {
