@@ -21,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <thread>
 #include <cmath>
@@ -322,6 +323,12 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       // Language at the top left, on the title's row.
       const float title_y = ImGui::GetCursorPosY();
       {
+        // v128: what the toggles set, above them.
+        souls::PushTitleFont(0.4f);
+        ImGui::PushStyleColor(ImGuiCol_Text, souls::kAsh);
+        ImGui::TextUnformatted("In-game language");
+        ImGui::PopStyleColor();
+        souls::PopTitleFont();
         const ImVec2 lang(io.DisplaySize.x * 0.06f, io.DisplaySize.y * 0.052f);
         if (Toggle("##rus", "RUS", language_ == 12, lang, 0.6f)) language_ = 12;
         ImGui::SameLine(0.0f, 8.0f);
@@ -336,7 +343,7 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       souls::Divider();
       // The two resolutions; the remembered one has the focus.
       const ImVec2 size(io.DisplaySize.x * 0.24f, io.DisplaySize.y * 0.27f);
-      const float gap = 24.0f;
+      const float gap = io.DisplaySize.x * 0.19f;  // v128: room for the bonfire between the cards
       ImGui::PushStyleColor(ImGuiCol_Border, souls::kBronze);
       ImGui::PushStyleColor(ImGuiCol_Text, souls::kParchment);
       ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.5f);
@@ -352,6 +359,22 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       ImGui::PopStyleVar();
       ImGui::PopStyleColor(2);
       const ImVec2 after_cards = ImGui::GetCursorScreenPos();
+      {
+        // v128: the bonfire between the cards, standing on their bottom line.
+        const float s = std::min(gap / 240.0f, size.y * 1.05f / 270.0f);
+        const float cx = (card720.Max.x + card540.Min.x) * 0.5f;
+        DrawBonfire(ImGui::GetWindowDrawList(), ImVec2(cx - 120.0f * s, card720.Max.y - 262.0f * s), s, time_);
+      }
+      if (remembered_) {
+        // v128: the remembered card is marked (it has the focus: one A starts with the previous settings).
+        const ImRect& card = scale_ >= 1.0 ? card720 : card540;
+        souls::PushTitleFont(0.38f);
+        const char* last = "LAST USED";
+        const ImVec2 t = ImGui::CalcTextSize(last);
+        ImGui::GetWindowDrawList()->AddText(ImVec2((card.Min.x + card.Max.x - t.x) * 0.5f, card.Min.y + 12.0f),
+                                            souls::Col(souls::kEmber), last);
+        souls::PopTitleFont();
+      }
       // v117: sharpening of the 540p upscale, inside the 540p card (it belongs to that mode).
       const ImVec2 small(io.DisplaySize.x * 0.075f, io.DisplaySize.y * 0.065f);
       {
@@ -451,12 +474,145 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       dl->AddCircleFilled(ImVec2(x, y), r * 3.5f, souls::Col(souls::kEmber, 0.07f * fade));
       dl->AddCircleFilled(ImVec2(x, y), r, souls::Col(ImVec4(1.0f, 0.72f, 0.35f, 1.0f), 0.9f * fade));
     }
-    if (DS2_VERSION_STRING[0]) {
-      souls::PushTitleFont(0.57f);  // v118: larger
-      const ImVec2 t = ImGui::CalcTextSize(DS2_VERSION_STRING);
-      dl->AddText(ImVec2(d.x - t.x - 18.0f, d.y - t.y - 12.0f), souls::Col(souls::kAsh, 0.8f), DS2_VERSION_STRING);
+    // v128: the game's title at the top.
+    {
+      souls::PushTitleFont(1.15f);
+      const char* title = "DARK SOULS II";
+      const ImVec2 t = ImGui::CalcTextSize(title);
+      const float y = d.y * 0.04f;
+      dl->AddText(ImVec2((d.x - t.x) * 0.5f, y), souls::Col(souls::kParchment), title);
+      souls::PopTitleFont();
+      souls::PushTitleFont(0.42f);
+      const char* sub = "SCHOLAR OF THE FIRST SIN";
+      const ImVec2 u = ImGui::CalcTextSize(sub);
+      dl->AddText(ImVec2((d.x - u.x) * 0.5f, y + t.y + 4.0f), souls::Col(souls::kBronze), sub);
       souls::PopTitleFont();
     }
+    // v128: the author at the bottom left: "SWITCH PORT BY", the name, "XBOX 360 RECOMP".
+    {
+      const float x = 28.0f;
+      souls::PushTitleFont(0.38f);
+      const ImVec2 by = ImGui::CalcTextSize("SWITCH PORT BY");
+      const ImVec2 rc = ImGui::CalcTextSize("XBOX 360 RECOMP");
+      souls::PopTitleFont();
+      souls::PushTitleFont(0.78f);
+      const ImVec2 nm = ImGui::CalcTextSize("XDASCATX");
+      const float y_rc = d.y - 22.0f - rc.y;
+      const float y_nm = y_rc - 4.0f - nm.y;
+      souls::Diamond(dl, ImVec2(x + 5.0f, y_nm + nm.y * 0.5f), 5.0f, souls::Col(souls::kEmber));
+      dl->AddText(ImVec2(x + 18.0f, y_nm), souls::Col(ImVec4(0.91f, 0.79f, 0.55f, 1.0f)), "XDASCATX");
+      souls::PopTitleFont();
+      souls::PushTitleFont(0.38f);
+      dl->AddText(ImVec2(x, y_nm - 4.0f - by.y), souls::Col(souls::kAsh), "SWITCH PORT BY");
+      dl->AddText(ImVec2(x, y_rc), souls::Col(souls::kBronze), "XBOX 360 RECOMP");
+      souls::PopTitleFont();
+    }
+    // v128: the version at the bottom right, in a bronze box, large and in ember.
+    if (DS2_VERSION_STRING[0]) {
+      souls::PushTitleFont(0.36f);
+      const ImVec2 l = ImGui::CalcTextSize("VERSION");
+      souls::PopTitleFont();
+      souls::PushTitleFont(0.85f);
+      const ImVec2 v = ImGui::CalcTextSize(DS2_VERSION_STRING);
+      const float pad_x = 16.0f, pad_y = 8.0f, between = 12.0f;
+      const ImVec2 b(d.x - 28.0f, d.y - 20.0f);
+      const ImVec2 a(b.x - pad_x * 2.0f - l.x - between - v.x, b.y - pad_y * 2.0f - v.y);
+      dl->AddRectFilled(a, b, souls::Col(ImVec4(0.055f, 0.043f, 0.031f, 0.9f)));
+      dl->AddRect(a, b, souls::Col(souls::kBronzeDim), 0.0f, 0, 1.5f);
+      dl->AddText(ImVec2(b.x - pad_x - v.x, a.y + pad_y), souls::Col(souls::kEmber), DS2_VERSION_STRING);
+      souls::PopTitleFont();
+      souls::PushTitleFont(0.36f);
+      dl->AddText(ImVec2(a.x + pad_x, (a.y + b.y - l.y) * 0.5f), souls::Col(souls::kAsh), "VERSION");
+      souls::PopTitleFont();
+    }
+  }
+
+  // v128: a bonfire of bones with two skulls (the start screen's centre), in a 240 x 270 box at `o`, `s` pixels per
+  // unit; the flames flicker with `t`.
+  static void DrawBonfire(ImDrawList* dl, ImVec2 o, float s, float t) {
+    constexpr float kPi = 3.14159265f;
+    auto P = [&](float x, float y) { return ImVec2(o.x + x * s, o.y + y * s); };
+    const ImU32 bone = IM_COL32(203, 189, 159, 255), bone_edge = IM_COL32(107, 95, 74, 255);
+    const ImU32 hole = IM_COL32(20, 13, 8, 255);
+    // Glow.
+    const float breathe = 0.85f + 0.15f * std::sin(t * 2.6f);
+    for (int i = 6; i >= 1; --i) {
+      dl->AddCircleFilled(P(120.0f, 200.0f), float(i) * 20.0f * s, IM_COL32(255, 106, 18, int(14.0f * breathe)), 40);
+    }
+    dl->AddEllipseFilled(P(120.0f, 254.0f), ImVec2(104.0f * s, 12.0f * s), IM_COL32(13, 9, 7, 255));
+    auto Bone = [&](float cx, float cy, float len, float deg) {
+      const float a = deg * kPi / 180.0f, c = std::cos(a), sn = std::sin(a);
+      const float h = len * 0.5f - 4.5f;
+      dl->AddLine(P(cx - c * h, cy - sn * h), P(cx + c * h, cy + sn * h), bone, 4.5f * s);
+      for (int e = -1; e <= 1; e += 2) {
+        const float ex = cx + c * h * float(e), ey = cy + sn * h * float(e);
+        for (int side = -1; side <= 1; side += 2) {
+          dl->AddCircleFilled(P(ex - sn * 3.2f * float(side), ey + c * 3.2f * float(side)), 4.6f * s, bone, 12);
+        }
+      }
+    };
+    auto Skull = [&](float cx, float cy, float k, float deg) {
+      const float a = deg * kPi / 180.0f, c = std::cos(a), sn = std::sin(a);
+      auto Q = [&](float x, float y) {
+        x = (x - 20.0f) * k;
+        y = (y - 22.0f) * k;
+        return P(cx + x * c - y * sn, cy + x * sn + y * c);
+      };
+      dl->AddQuadFilled(Q(9, 27), Q(31, 27), Q(31, 42), Q(9, 42), bone);
+      dl->AddQuad(Q(9, 27), Q(31, 27), Q(31, 42), Q(9, 42), bone_edge, 1.0f);
+      dl->AddCircleFilled(Q(20, 19), 17.0f * k * s, bone, 28);
+      dl->AddCircle(Q(20, 19), 17.0f * k * s, bone_edge, 28, 1.0f);
+      dl->AddEllipseFilled(Q(13, 21), ImVec2(5.0f * k * s, 5.5f * k * s), hole, a);
+      dl->AddEllipseFilled(Q(27, 21), ImVec2(5.0f * k * s, 5.5f * k * s), hole, a);
+      dl->AddTriangleFilled(Q(20, 26), Q(17, 32), Q(23, 32), hole);
+      for (float x : {14.0f, 18.0f, 22.0f, 26.0f}) dl->AddLine(Q(x, 36), Q(x, 42), bone_edge, 1.0f);
+    };
+    // Bones behind the fire, and the ribs.
+    Bone(130.0f, 231.0f, 76.0f, -24.0f);
+    Bone(110.0f, 231.0f, 76.0f, 22.0f);
+    dl->PathLineTo(P(92, 236));
+    dl->PathBezierCubicCurveTo(P(96, 212), P(144, 212), P(148, 236), 16);
+    dl->PathStroke(bone, 0, 3.0f * s);
+    dl->PathLineTo(P(100, 240));
+    dl->PathBezierCubicCurveTo(P(104, 222), P(136, 222), P(140, 240), 16);
+    dl->PathStroke(bone, 0, 3.0f * s);
+    dl->AddEllipseFilled(P(120.0f, 234.0f), ImVec2(34.0f * s, 8.0f * s), IM_COL32(255, 106, 18, 100));
+    // The flames: four layers, each flickering around its base.
+    auto Flame = [&](std::initializer_list<float> v, ImU32 col, float sx, float sy) {
+      const float* p = v.begin();
+      const size_t n = v.size();
+      auto F = [&](float x, float y) {
+        x = 120.0f + (x - 120.0f) * sx;
+        y = 240.0f + (y - 240.0f) * sy;
+        return P(18.0f + 0.85f * x, 20.0f + 0.85f * y);
+      };
+      dl->PathLineTo(F(p[0], p[1]));
+      for (size_t i = 2; i + 5 < n; i += 6) {
+        dl->PathBezierCubicCurveTo(F(p[i], p[i + 1]), F(p[i + 2], p[i + 3]), F(p[i + 4], p[i + 5]), 14);
+      }
+      if (dl->_Path.Size > 3) dl->_Path.pop_back();  // the last point repeats the first
+      dl->PathFillConcave(col);
+    };
+    const float a1 = 1.0f + 0.03f * std::sin(t * 4.1f), b1 = 1.0f + 0.05f * std::sin(t * 3.3f + 1.0f);
+    const float a2 = 1.0f + 0.04f * std::sin(t * 5.7f + 2.0f), b2 = 1.0f + 0.06f * std::sin(t * 4.6f);
+    const float a3 = 1.0f + 0.05f * std::sin(t * 6.3f + 0.5f), b3 = 1.0f + 0.07f * std::sin(t * 5.2f + 1.7f);
+    Flame({70, 150, 78, 170, 74, 186, 82, 204, 70, 196, 60, 180, 70, 150}, IM_COL32(179, 50, 10, 255), a1, b1);
+    Flame({172, 138, 166, 160, 174, 178, 164, 200, 180, 188, 184, 164, 172, 138}, IM_COL32(179, 50, 10, 255), a1, b1);
+    Flame({120, 36,  150, 88,  186, 120, 176, 180, 170, 222, 146, 242, 120, 242, 94,  242, 68,  224, 64,  182,
+           60,  140, 88,  128, 96,  96,  102, 120, 112, 124, 114, 110, 116, 85,  112, 60,  120, 36},
+          IM_COL32(214, 72, 16, 255), a1, b1);
+    Flame({122, 92,  142, 126, 160, 150, 154, 190, 150, 220, 136, 238, 120, 238, 102, 238, 86,  224, 84,  194,
+           82,  166, 100, 156, 106, 134, 110, 150, 118, 150, 119, 138, 120, 122, 118, 108, 122, 92},
+          IM_COL32(255, 128, 32, 255), a2, b2);
+    Flame({121, 150, 132, 170, 140, 186, 136, 208, 133, 226, 127, 236, 120, 236, 112, 236, 104, 226, 103, 210,
+           102, 192, 112, 184, 116, 170, 118, 178, 121, 176, 121, 150},
+          IM_COL32(255, 210, 122, 255), a3, b3);
+    // Bones and skulls in front.
+    Bone(65.0f, 252.0f, 66.0f, 8.0f);
+    Bone(175.0f, 254.0f, 66.0f, -10.0f);
+    Bone(122.0f, 259.0f, 56.0f, 0.0f);
+    Skull(68.0f, 236.0f, 1.0f, -12.0f);
+    Skull(173.0f, 239.0f, 0.85f, 14.0f);
   }
   static float Hash(int n) {
     uint32_t x = uint32_t(n) * 0x9E3779B1u;
