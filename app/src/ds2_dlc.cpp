@@ -294,11 +294,12 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
   }
 
  protected:
+  // v128: the start screen drawn 1:1 from the mock-up (artifact "DS2 Start Screen", 1280 x 720 px, Cinzel). Every
+  // position and size below is in mock-up pixels and scaled by k_ = display width / 1280.
   void OnDraw(ImGuiIO& io) override {
-    namespace souls = rex::ui::souls;
     if (chosen_) return;
     time_ += io.DeltaTime;
-    DrawBackground(io);
+    k_ = io.DisplaySize.x / 1280.0f;
     // Countdown: any button or touch stops it.
     // v118: only a new press stops it, after a short grace: the A that launched the port can still be held
     // when the screen appears (v117 stopped the countdown in its first frame), and stick noise is ignored.
@@ -313,128 +314,106 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
       }
       if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) counting_ = false;
     }
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always,
-                            ImVec2(0.5f, 0.5f));
+    DrawBackground(ImGui::GetBackgroundDrawList(), io.DisplaySize);
+
+    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_Always);
     if (first_frame_) ImGui::SetNextWindowFocus();
-    souls::PushWindowStyle();
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+    const ImU32 none = IM_COL32(0, 0, 0, 0);
+    ImGui::PushStyleColor(ImGuiCol_Button, none);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, none);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, none);
+    ImGui::PushStyleColor(ImGuiCol_NavCursor, none);  // the focus is shown by the controls themselves
     double choice = 0.0;
-    if (ImGui::Begin("##ds2_resolution", nullptr, souls::kWindowFlags | ImGuiWindowFlags_AlwaysAutoResize)) {
-      souls::DrawFrame();
-      // Language at the top left, on the title's row.
-      const float title_y = ImGui::GetCursorPosY();
-      {
-        // v128: what the toggles set, above them.
-        souls::PushTitleFont(0.4f);
-        ImGui::PushStyleColor(ImGuiCol_Text, souls::kAsh);
-        ImGui::TextUnformatted("In-game language");
-        ImGui::PopStyleColor();
-        souls::PopTitleFont();
-        const ImVec2 lang(io.DisplaySize.x * 0.06f, io.DisplaySize.y * 0.052f);
-        if (Toggle("##rus", "RUS", language_ == 12, lang, 0.6f)) language_ = 12;
-        ImGui::SameLine(0.0f, 8.0f);
-        if (Toggle("##eng", "ENG", language_ == 1, lang, 0.6f)) language_ = 1;
-        if (const char* other = OtherLanguageName(toml_language_)) {
-          ImGui::SameLine(0.0f, 8.0f);
-          if (Toggle("##toml_lang", other, language_ == toml_language_, lang, 0.6f)) language_ = toml_language_;
+    if (ImGui::Begin("##ds2_resolution", nullptr, rex::ui::souls::kWindowFlags)) {
+      ImDrawList* dl = ImGui::GetWindowDrawList();
+      // Language (top left).
+      Txt(dl, 28, 26, 11, 3, kMuted, "IN-GAME LANGUAGE");
+      if (Pill(dl, "##rus", "RUS", language_ == 12, 28, 42, 64, 44, 14, 2)) language_ = 12;
+      if (Pill(dl, "##eng", "ENG", language_ == 1, 100, 42, 64, 44, 14, 2)) language_ = 1;
+      if (const char* other = OtherLanguageName(toml_language_)) {
+        if (Pill(dl, "##toml_lang", other, language_ == toml_language_, 172, 42, 64, 44, 14, 2)) {
+          language_ = toml_language_;
         }
       }
-      ImGui::SetCursorPosY(title_y);
-      souls::CenteredTitle("Choose Resolution", 1.0f, souls::kParchment);
-      souls::Divider();
-      // The two resolutions; the remembered one has the focus.
-      const ImVec2 size(io.DisplaySize.x * 0.24f, io.DisplaySize.y * 0.27f);
-      const float gap = io.DisplaySize.x * 0.19f;  // v128: room for the bonfire between the cards
-      ImGui::PushStyleColor(ImGuiCol_Border, souls::kBronze);
-      ImGui::PushStyleColor(ImGuiCol_Text, souls::kParchment);
-      ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.5f);
+      // Title.
+      Txt(dl, 640, 53, 38, 12, IM_COL32(239, 226, 198, 255), "DARK SOULS II", 1, true, IM_COL32(255, 130, 40, 12));
+      Txt(dl, 640, 97, 13, 7, kGold, "SCHOLAR OF THE FIRST SIN", 1);
+      dl->AddRectFilledMultiColor(P(450, 123.5f), P(640 - 12, 124.5f), IM_COL32(176, 138, 79, 0), kBronzeLine,
+                                  kBronzeLine, IM_COL32(176, 138, 79, 0));
+      dl->AddRectFilledMultiColor(P(640 + 12, 123.5f), P(830, 124.5f), kBronzeLine, IM_COL32(176, 138, 79, 0),
+                                  IM_COL32(176, 138, 79, 0), kBronzeLine);
+      dl->AddCircleFilled(P(640, 124), 9.0f * k_, IM_COL32(255, 122, 26, 50), 16);
+      rex::ui::souls::Diamond(dl, P(640, 124), 5.6f * k_, IM_COL32(255, 138, 42, 255));
+      Txt(dl, 640, 161, 15, 6, kMuted, "CHOOSE RESOLUTION", 1);
+
+      // The two cards (invisible buttons first, so both focus states are known before drawing them).
       if (first_frame_ && scale_ >= 1.0) ImGui::SetKeyboardFocusHere();
-      if (Choice("##720", "720p", "Native, sharp", size, false)) choice = 1.0;
-      ImRect card720(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+      ImGui::SetCursorScreenPos(P(220, 190));
+      if (ImGui::Button("##720", S(300, 270))) choice = 1.0;
+      const bool hot720 = ImGui::IsItemFocused() || ImGui::IsItemHovered();
       if (scale_ >= 1.0) ImGui::SetItemDefaultFocus();
-      ImGui::SameLine(0.0f, gap);
       if (first_frame_ && scale_ < 1.0) ImGui::SetKeyboardFocusHere();
-      if (Choice("##540", "540p", "More FPS, softer", size, true)) choice = 0.75;
-      ImRect card540(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+      ImGui::SetCursorScreenPos(P(760, 190));
+      ImGui::SetNextItemAllowOverlap();  // the sharpening toggle sits inside the 540p card
+      if (ImGui::Button("##540", S(300, 270))) choice = 0.75;
+      const bool hot540 = ImGui::IsItemFocused() || ImGui::IsItemHovered();
       if (scale_ < 1.0) ImGui::SetItemDefaultFocus();
-      ImGui::PopStyleVar();
-      ImGui::PopStyleColor(2);
-      const ImVec2 after_cards = ImGui::GetCursorScreenPos();
-      {
-        // v128: the bonfire between the cards, standing on their bottom line.
-        const float s = std::min(gap / 240.0f, size.y * 1.05f / 270.0f);
-        const float cx = (card720.Max.x + card540.Min.x) * 0.5f;
-        DrawBonfire(ImGui::GetWindowDrawList(), ImVec2(cx - 120.0f * s, card720.Max.y - 262.0f * s), s, time_);
+      const bool any = hot720 || hot540;
+      const bool on720 = hot720 || (!any && scale_ >= 1.0);
+      const bool on540 = hot540 || (!any && scale_ < 1.0);
+      CardFace(dl, 220, on720);
+      CardFace(dl, 760, on540);
+      if (remembered_) Txt(dl, scale_ >= 1.0 ? 370 : 910, 218, 11, 4, IM_COL32(255, 198, 122, 255), "LAST USED", 1);
+      Txt(dl, 370, 292, 76, 0, on720 ? kBigOn : kBigOff, "720p", 1, true, on720 ? kBigGlow : 0);
+      Txt(dl, 370, 353, 15, 4, kSand, "NATIVE", 1);
+      Txt(dl, 370, 382, 13, 2, kMuted, "Sharp picture", 1);
+      Txt(dl, 910, 270, 76, 0, on540 ? kBigOn : kBigOff, "540p", 1, true, on540 ? kBigGlow : 0);
+      Txt(dl, 910, 330, 15, 4, kSand, "MORE FPS", 1);
+      Txt(dl, 910, 359, 13, 2, kMuted, "Softer picture", 1);
+      if (Pill(dl, "##sharpen", sharpen_ ? "SHARPENING: ON" : "SHARPENING: OFF", sharpen_, 800, 394, 220, 44, 13, 2)) {
+        sharpen_ = !sharpen_;
+        counting_ = false;
       }
-      if (remembered_) {
-        // v128: the remembered card is marked (it has the focus: one A starts with the previous settings).
-        const ImRect& card = scale_ >= 1.0 ? card720 : card540;
-        souls::PushTitleFont(0.38f);
-        const char* last = "LAST USED";
-        const ImVec2 t = ImGui::CalcTextSize(last);
-        ImGui::GetWindowDrawList()->AddText(ImVec2((card.Min.x + card.Max.x - t.x) * 0.5f, card.Min.y + 12.0f),
-                                            souls::Col(souls::kEmber), last);
-        souls::PopTitleFont();
-      }
-      // v117: sharpening of the 540p upscale, inside the 540p card (it belongs to that mode).
-      const ImVec2 small(io.DisplaySize.x * 0.075f, io.DisplaySize.y * 0.065f);
-      {
-        const float pad = 18.0f;
-        const ImVec2 bar(card540.GetWidth() - 2.0f * pad, card540.GetHeight() * 0.2f);
-        ImGui::SetCursorScreenPos(ImVec2(card540.Min.x + pad, card540.Max.y - bar.y - pad));
-        if (Toggle("##sharpen", sharpen_ ? "Sharpening: On" : "Sharpening: Off", sharpen_, bar, 0.55f)) {
-          sharpen_ = !sharpen_;
-          counting_ = false;
-        }
-      }
-      // v117: the countdown shown on the remembered card: an ember bar draining along its top edge.
-      if (counting_) {
-        const ImRect& card = scale_ >= 1.0 ? card720 : card540;
-        const float frac = std::clamp((kCountdown - time_) / kCountdown, 0.0f, 1.0f);
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const float y = card.Min.y + 5.0f;
-        dl->AddRectFilled(ImVec2(card.Min.x + 6.0f, y), ImVec2(card.Max.x - 6.0f, y + 4.0f),
-                          souls::Col(souls::kBronzeDim));
-        dl->AddRectFilled(ImVec2(card.Min.x + 6.0f, y),
-                          ImVec2(card.Min.x + 6.0f + (card.GetWidth() - 12.0f) * frac, y + 4.0f),
-                          souls::Col(souls::kEmber));
-      }
-      ImGui::SetCursorScreenPos(after_cards);
-      // Frame rate lock at the right.
-      ImGui::Dummy(ImVec2(0.0f, 6.0f));
-      {
-        const float row_w = small.x * 2.0f + 12.0f;
-        const float row_y = ImGui::GetCursorPosY();
-        const float right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
-        const float x30 = right - row_w;
-        souls::PushTitleFont(0.55f);
-        const char* label = "Frame Rate Lock";
-        const ImVec2 label_size = ImGui::CalcTextSize(label);
-        ImGui::SetCursorPos(ImVec2(x30 - label_size.x - 16.0f, row_y + (small.y - label_size.y) * 0.5f));
-        ImGui::PushStyleColor(ImGuiCol_Text, souls::kAsh);
-        ImGui::TextUnformatted(label);
-        ImGui::PopStyleColor();
-        souls::PopTitleFont();
-        ImGui::SetCursorPos(ImVec2(x30, row_y));
-        if (Toggle("##fps30", "30", fps_ == 30, small)) fps_ = 30;
-        ImGui::SetCursorPos(ImVec2(x30 + small.x + 12.0f, row_y));
-        if (Toggle("##fps60", "60", fps_ == 60, small)) fps_ = 60;
-        ImGui::SetCursorPosY(row_y + small.y);
-      }
-      ImGui::Dummy(ImVec2(0.0f, 6.0f));
-      // Countdown with the remembered choice, or the button hints.
+      DrawBonfire(dl, P(520, 190), k_, time_);
+
+      // Frame rate lock.
+      Txt(dl, 644, 510, 14, 4, kMuted, "FRAME RATE LOCK", 2);
+      if (Pill(dl, "##fps30", "30", fps_ == 30, 666, 488, 72, 44, 18, 1)) fps_ = 30;
+      if (Pill(dl, "##fps60", "60", fps_ == 60, 752, 488, 72, 44, 18, 1)) fps_ = 60;
+
+      // Countdown with the remembered choice: text and a draining ember bar.
       const float left = counting_ ? kCountdown - time_ : 0.0f;
       if (counting_ && left <= 0.0f) choice = scale_;
       if (counting_) {
-        char text[64];
-        std::snprintf(text, sizeof(text), "Auto start in %d s  -  any button to stay", int(left) + 1);
-        souls::CenteredTitle(text, 0.75f, souls::kEmber);
-        ImGui::Dummy(ImVec2(0.0f, 4.0f));
+        char num[8];
+        std::snprintf(num, sizeof(num), "%d", int(left) + 1);
+        const char* a = "Auto start in ";
+        const char* b = " s  \xC2\xB7  any button to stay";
+        const float wa = Width(a, 14, 2), wn = Width(num, 18, 0) + 0.7f * k_, wb = Width(b, 14, 2);
+        const float x0 = (640.0f * k_ - (wa + wn + wb) * 0.5f) / k_;
+        Txt(dl, x0, 568, 14, 2, kSand, a);
+        Txt(dl, x0 + wa / k_, 568, 18, 0, IM_COL32(255, 183, 92, 255), num, 0, true);
+        Txt(dl, x0 + (wa + wn) / k_, 568, 14, 2, kSand, b);
+        const float frac = std::clamp(left / kCountdown, 0.0f, 1.0f);
+        dl->AddRectFilled(P(430, 590), P(850, 593), IM_COL32(42, 32, 22, 255));
+        const float xe = 430.0f + 420.0f * frac;
+        for (int i = 3; i >= 1; --i) {
+          const float g = float(i) * 2.5f;
+          dl->AddRectFilled(P(430 - g, 590 - g), P(xe + g, 593 + g), IM_COL32(255, 122, 26, 22));
+        }
+        dl->AddRectFilledMultiColor(P(430, 590), P(xe, 593), IM_COL32(138, 60, 12, 255), IM_COL32(255, 138, 42, 255),
+                                    IM_COL32(255, 138, 42, 255), IM_COL32(138, 60, 12, 255));
       }
-      DrawHints();  // v121: also under the countdown, so the touch hint is always visible
+      DrawHints(dl);
       first_frame_ = false;
     }
     ImGui::End();
-    souls::PopWindowStyle();
+    ImGui::PopStyleColor(4);
+    ImGui::PopStyleVar(3);
     if (choice > 0.0) {
       chosen_ = true;
       StartPrefs p;
@@ -450,81 +429,261 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
 
  private:
   static constexpr float kCountdown = 20.0f;  // v121: 20 s (was 10)
+  static constexpr ImU32 kMuted = IM_COL32(168, 154, 133, 255);       // #a89a85
+  static constexpr ImU32 kSand = IM_COL32(216, 196, 156, 255);        // #d8c49c
+  static constexpr ImU32 kGold = IM_COL32(201, 164, 104, 255);        // #c9a468
+  static constexpr ImU32 kBronzeLine = IM_COL32(176, 138, 79, 255);   // #b08a4f
+  static constexpr ImU32 kBigOn = IM_COL32(255, 226, 176, 255);       // #ffe2b0
+  static constexpr ImU32 kBigOff = IM_COL32(185, 169, 140, 255);      // #b9a98c
+  static constexpr ImU32 kBigGlow = IM_COL32(255, 140, 40, 16);
+  // ImGui sizes a font by ascent + descent; Cinzel's are 976 + 372 per 1000 em, so CSS font-size px x 1.348.
+  static constexpr float kCinzelEm = 1.348f;
 
-  // Dark screen with embers rising from a glow at the bottom, and the port version in the corner.
-  void DrawBackground(ImGuiIO& io) {
-    namespace souls = rex::ui::souls;
-    ImDrawList* dl = ImGui::GetBackgroundDrawList();
-    const ImVec2 d = io.DisplaySize;
-    dl->AddRectFilled(ImVec2(0, 0), d, IM_COL32(0, 0, 0, 255));  // v117: black
-    const ImU32 clear = souls::Col(souls::kEmber, 0.0f);
-    const ImU32 glow = souls::Col(souls::kEmber, 0.035f + 0.01f * std::sin(time_ * 1.3f));
-    dl->AddRectFilledMultiColor(ImVec2(0, d.y * 0.75f), d, clear, clear, glow, glow);
-    for (int i = 0; i < kEmbers; ++i) {
-      // Deterministic per ember: start, speed, sway and size from its index.
-      const float h1 = Hash(i * 3 + 1), h2 = Hash(i * 3 + 2), h3 = Hash(i * 3 + 3);
-      const float speed = 18.0f + 42.0f * h2;
-      const float travel = d.y * 0.85f;
-      const float period = travel / speed;
-      const float t = std::fmod(time_ + h1 * period, period) / period;  // 0 at the bottom, 1 at the top
-      const float x = d.x * (0.1f + 0.8f * h1) + std::sin(time_ * (0.6f + h3) + h2 * 6.28f) * (12.0f + 20.0f * h3);
-      const float y = d.y + 10.0f - t * travel;
-      const float fade = std::sin(t * 3.14159f) * (0.55f + 0.45f * std::sin(time_ * (3.0f + 4.0f * h3) + h1 * 9.0f));
-      const float r = 1.2f + 2.2f * h3;
-      dl->AddCircleFilled(ImVec2(x, y), r * 3.5f, souls::Col(souls::kEmber, 0.07f * fade));
-      dl->AddCircleFilled(ImVec2(x, y), r, souls::Col(ImVec4(1.0f, 0.72f, 0.35f, 1.0f), 0.9f * fade));
+  ImVec2 P(float x, float y) const { return ImVec2(x * k_, y * k_); }
+  ImVec2 S(float w, float h) const { return ImVec2(w * k_, h * k_); }
+
+  static int Utf8Len(unsigned char c) { return c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : 4; }
+
+  // Width in screen pixels of `t` in Cinzel at `px` mock-up pixels with `sp` px of letter spacing.
+  float Width(const char* t, float px, float sp) const {
+    rex::ui::souls::PushTitleFont(px * kCinzelEm * k_ / rex::ui::souls::kTitleFontSize);
+    float w = 0.0f;
+    int n = 0;
+    for (const char* c = t; *c;) {
+      const int len = Utf8Len(static_cast<unsigned char>(*c));
+      w += ImGui::CalcTextSize(c, c + len).x;
+      c += len;
+      ++n;
     }
-    // v128: the game's title at the top.
-    {
-      souls::PushTitleFont(1.15f);
-      const char* title = "DARK SOULS II";
-      const ImVec2 t = ImGui::CalcTextSize(title);
-      const float y = d.y * 0.04f;
-      dl->AddText(ImVec2((d.x - t.x) * 0.5f, y), souls::Col(souls::kParchment), title);
-      souls::PopTitleFont();
-      souls::PushTitleFont(0.42f);
-      const char* sub = "SCHOLAR OF THE FIRST SIN";
-      const ImVec2 u = ImGui::CalcTextSize(sub);
-      dl->AddText(ImVec2((d.x - u.x) * 0.5f, y + t.y + 4.0f), souls::Col(souls::kBronze), sub);
-      souls::PopTitleFont();
+    rex::ui::souls::PopTitleFont();
+    return w + sp * k_ * float(n > 0 ? n - 1 : 0);
+  }
+
+  // Text in Cinzel with letter spacing, its vertical centre at `yc`; align 0 = left at x, 1 = centred on x,
+  // 2 = right edge at x. `bold` draws it twice, a glow colour draws a soft halo under it.
+  void Txt(ImDrawList* dl, float x, float yc, float px, float sp, ImU32 col, const char* t, int align = 0,
+           bool bold = false, ImU32 glow = 0) const {
+    const float w = Width(t, px, sp);
+    rex::ui::souls::PushTitleFont(px * kCinzelEm * k_ / rex::ui::souls::kTitleFontSize);
+    const float h = ImGui::CalcTextSize("A").y;
+    float X = x * k_;
+    if (align == 1) X -= w * 0.5f;
+    if (align == 2) X -= w;
+    const float Y = yc * k_ - h * 0.5f;
+    auto run = [&](float ox, float oy, ImU32 c) {
+      float cx = X + ox;
+      for (const char* p = t; *p;) {
+        const int len = Utf8Len(static_cast<unsigned char>(*p));
+        dl->AddText(ImVec2(cx, Y + oy), c, p, p + len);
+        cx += ImGui::CalcTextSize(p, p + len).x + sp * k_;
+        p += len;
+      }
+    };
+    if (glow) {
+      for (float r : {7.0f, 4.5f, 2.5f}) {
+        for (int i = 0; i < 8; ++i) {
+          const float a = float(i) * 0.785398f;
+          run(std::cos(a) * r * k_, std::sin(a) * r * k_, glow);
+        }
+      }
     }
-    // v128: the author at the bottom left: "SWITCH PORT BY", the name, "XBOX 360 RECOMP".
-    {
-      const float x = 28.0f;
-      souls::PushTitleFont(0.38f);
-      const ImVec2 by = ImGui::CalcTextSize("SWITCH PORT BY");
-      const ImVec2 rc = ImGui::CalcTextSize("XBOX 360 RECOMP");
-      souls::PopTitleFont();
-      souls::PushTitleFont(0.78f);
-      const ImVec2 nm = ImGui::CalcTextSize("XDASCATX");
-      const float y_rc = d.y - 22.0f - rc.y;
-      const float y_nm = y_rc - 4.0f - nm.y;
-      souls::Diamond(dl, ImVec2(x + 5.0f, y_nm + nm.y * 0.5f), 5.0f, souls::Col(souls::kEmber));
-      dl->AddText(ImVec2(x + 18.0f, y_nm), souls::Col(ImVec4(0.91f, 0.79f, 0.55f, 1.0f)), "XDASCATX");
-      souls::PopTitleFont();
-      souls::PushTitleFont(0.38f);
-      dl->AddText(ImVec2(x, y_nm - 4.0f - by.y), souls::Col(souls::kAsh), "SWITCH PORT BY");
-      dl->AddText(ImVec2(x, y_rc), souls::Col(souls::kBronze), "XBOX 360 RECOMP");
-      souls::PopTitleFont();
+    run(0.0f, 0.0f, col);
+    if (bold) run(0.7f * k_, 0.0f, col);
+    rex::ui::souls::PopTitleFont();
+  }
+
+  // A soft glow around a rectangle: stacked outlines fading out over `spread` px.
+  void Glow(ImDrawList* dl, ImVec2 a, ImVec2 b, int r, int g, int bl, float alpha, float spread) const {
+    // Each step is a band (four rects) one step wide, so the bands meet without overlapping.
+    const int steps = std::max(4, int(spread * k_ / 1.5f));
+    const float w = spread * k_ / float(steps);
+    for (int i = 0; i < steps; ++i) {
+      const float d0 = w * float(i), d1 = w * float(i + 1);
+      const float f = 1.0f - (float(i) + 0.5f) / float(steps);
+      const ImU32 c = IM_COL32(r, g, bl, int(255.0f * alpha * f * f));
+      dl->AddRectFilled(ImVec2(a.x - d1, a.y - d1), ImVec2(b.x + d1, a.y - d0), c);
+      dl->AddRectFilled(ImVec2(a.x - d1, b.y + d0), ImVec2(b.x + d1, b.y + d1), c);
+      dl->AddRectFilled(ImVec2(a.x - d1, a.y - d0), ImVec2(a.x - d0, b.y + d0), c);
+      dl->AddRectFilled(ImVec2(b.x + d0, a.y - d0), ImVec2(b.x + d1, b.y + d0), c);
     }
-    // v128: the version at the bottom right, in a bronze box, large and in ember.
+  }
+
+  // A small button: lit (ember gradient, warm border, glow) when `on`, dark otherwise; a ring shows the focus.
+  bool Pill(ImDrawList* dl, const char* id, const char* text, bool on, float x, float y, float w, float h, float px,
+            float sp) const {
+    ImGui::SetCursorScreenPos(P(x, y));
+    const bool pressed = ImGui::Button(id, S(w, h));
+    const bool hot = ImGui::IsItemFocused() || ImGui::IsItemHovered();
+    const ImVec2 a = P(x, y), b = P(x + w, y + h);
+    if (on) {
+      Glow(dl, a, b, 255, 120, 24, 0.4f, 16.0f);
+      dl->AddRectFilledMultiColor(a, b, IM_COL32(58, 26, 7, 255), IM_COL32(58, 26, 7, 255), IM_COL32(138, 60, 12, 255),
+                                  IM_COL32(138, 60, 12, 255));
+      dl->AddRect(a, b, IM_COL32(231, 172, 95, 255), 0.0f, 0, 1.2f * k_);
+    } else {
+      dl->AddRectFilled(a, b, IM_COL32(14, 11, 8, 230));
+      dl->AddRect(a, b, hot ? IM_COL32(176, 138, 79, 255) : IM_COL32(74, 58, 38, 255), 0.0f, 0, 1.2f * k_);
+    }
+    if (hot) {
+      const float d = 4.0f * k_;
+      dl->AddRect(ImVec2(a.x - d, a.y - d), ImVec2(b.x + d, b.y + d), IM_COL32(255, 198, 122, 210), 0.0f, 0, 1.5f * k_);
+    }
+    Txt(dl, x + w * 0.5f, y + h * 0.5f, px, sp,
+        on ? IM_COL32(255, 226, 176, 255) : hot ? IM_COL32(230, 216, 189, 255) : kMuted, text, 1);
+    return pressed;
+  }
+
+  // A resolution card (300 x 270 at x, 190): lit = ember gradient with a pulsing glow, else dark with bronze ticks.
+  void CardFace(ImDrawList* dl, float x, bool on) const {
+    const ImVec2 a = P(x, 190), b = P(x + 300, 460);
+    const float ym = (190.0f + 270.0f * 0.58f) * k_;
+    if (on) {
+      const float pulse = 0.5f + 0.5f * std::sin(time_ * 6.2831853f / 2.4f);
+      Glow(dl, a, b, 255, 125, 27, 0.30f + 0.30f * pulse, 46.0f);
+      dl->AddRectFilledMultiColor(a, ImVec2(b.x, ym), IM_COL32(22, 14, 8, 245), IM_COL32(22, 14, 8, 245),
+                                  IM_COL32(64, 26, 6, 245), IM_COL32(64, 26, 6, 245));
+      dl->AddRectFilledMultiColor(ImVec2(a.x, ym), b, IM_COL32(64, 26, 6, 245), IM_COL32(64, 26, 6, 245),
+                                  IM_COL32(150, 62, 10, 245), IM_COL32(150, 62, 10, 245));
+      const int inner = int(255.0f * (0.16f + 0.18f * pulse));
+      dl->AddRectFilledMultiColor(ImVec2(a.x, b.y - 90.0f * k_), b, IM_COL32(255, 150, 50, 0), IM_COL32(255, 150, 50, 0),
+                                  IM_COL32(255, 150, 50, inner), IM_COL32(255, 150, 50, inner));
+      dl->AddRect(a, b, IM_COL32(231, 172, 95, 255), 0.0f, 0, 1.2f * k_);
+    } else {
+      dl->AddRectFilledMultiColor(a, b, IM_COL32(16, 12, 9, 240), IM_COL32(16, 12, 9, 240), IM_COL32(10, 8, 6, 240),
+                                  IM_COL32(10, 8, 6, 240));
+      dl->AddRect(a, b, IM_COL32(74, 58, 38, 255), 0.0f, 0, 1.2f * k_);
+    }
+    const ImU32 tick = on ? IM_COL32(255, 198, 122, 255) : IM_COL32(138, 108, 62, 255);
+    const float t = 2.0f * k_, l = 16.0f * k_, in = 8.0f * k_;
+    const ImVec2 c[4] = {ImVec2(a.x + in, a.y + in), ImVec2(b.x - in, a.y + in), ImVec2(a.x + in, b.y - in),
+                         ImVec2(b.x - in, b.y - in)};
+    const float sx[4] = {1, -1, 1, -1}, sy[4] = {1, 1, -1, -1};
+    for (int i = 0; i < 4; ++i) {
+      dl->AddRectFilled(ImVec2(std::min(c[i].x, c[i].x + sx[i] * l), std::min(c[i].y, c[i].y + sy[i] * t)),
+                        ImVec2(std::max(c[i].x, c[i].x + sx[i] * l), std::max(c[i].y, c[i].y + sy[i] * t)), tick);
+      dl->AddRectFilled(ImVec2(std::min(c[i].x, c[i].x + sx[i] * t), std::min(c[i].y, c[i].y + sy[i] * l)),
+                        ImVec2(std::max(c[i].x, c[i].x + sx[i] * t), std::max(c[i].y, c[i].y + sy[i] * l)), tick);
+    }
+  }
+
+  // Background: near black, the bonfire's warm halo, a darker vignette, embers rising from the fire, the author at
+  // the bottom left and the version at the bottom right.
+  void DrawBackground(ImDrawList* dl, ImVec2 d) const {
+    dl->AddRectFilled(ImVec2(0, 0), d, IM_COL32(5, 4, 3, 255));
+    // Halo and vignette as vertex-coloured grids (smooth radial gradients without banding).
+    auto grid = [&](auto color_at) {
+      constexpr int kNx = 40, kNy = 24;
+      for (int j = 0; j < kNy; ++j) {
+        for (int i = 0; i < kNx; ++i) {
+          const float x0 = 1280.0f * float(i) / kNx, x1 = 1280.0f * float(i + 1) / kNx;
+          const float y0 = 720.0f * float(j) / kNy, y1 = 720.0f * float(j + 1) / kNy;
+          dl->AddRectFilledMultiColor(P(x0, y0), P(x1, y1), color_at(x0, y0), color_at(x1, y0), color_at(x1, y1),
+                                      color_at(x0, y1));
+        }
+      }
+    };
+    // Halo: radial ellipse 560 x 400 at (640, 403): 26 % orange at the centre, 12 % at 46 %, nothing at 72 %.
+    const float breathe = 0.85f + 0.15f * (0.5f + 0.5f * std::sin(time_ * 6.2831853f / 2.4f));
+    grid([&](float x, float y) {
+      const float f = std::sqrt(((x - 640.0f) / 560.0f) * ((x - 640.0f) / 560.0f) +
+                                ((y - 403.0f) / 400.0f) * ((y - 403.0f) / 400.0f));
+      float alpha = 0.0f, mix = 1.0f;
+      if (f < 0.46f) {
+        mix = f / 0.46f;
+        alpha = 0.26f + (0.12f - 0.26f) * mix;
+      } else if (f < 0.72f) {
+        alpha = 0.12f * (0.72f - f) / 0.26f;
+      }
+      return IM_COL32(int(255 + (130 - 255) * mix), int(112 + (44 - 112) * mix), int(20 + (6 - 20) * mix),
+                      int(255.0f * alpha * breathe));
+    });
+    dl->AddRectFilledMultiColor(P(0, 520), d, IM_COL32(90, 30, 4, 0), IM_COL32(90, 30, 4, 0), IM_COL32(90, 30, 4, 41),
+                                IM_COL32(90, 30, 4, 41));
+    // Vignette: radial ellipse 900 x 560, clear to 55 %, 78 % black at the edge.
+    grid([&](float x, float y) {
+      const float f = std::sqrt(((x - 640.0f) / 900.0f) * ((x - 640.0f) / 900.0f) +
+                                ((y - 360.0f) / 560.0f) * ((y - 360.0f) / 560.0f));
+      const float alpha = f < 0.55f ? 0.0f : 0.78f * std::min(1.0f, (f - 0.55f) / 0.45f);
+      return IM_COL32(0, 0, 0, int(255.0f * alpha));
+    });
+    // Embers rising from the fire (the mock-up's ten): x, drift, period, delay, size.
+    static constexpr float kEm[10][5] = {{598, -40, 5.2f, 0.0f, 4}, {622, 26, 4.1f, 0.7f, 3}, {640, -14, 6.0f, 1.5f, 4},
+                                         {655, 48, 4.6f, 2.2f, 3},  {676, 18, 5.6f, 0.3f, 4}, {612, -62, 6.4f, 3.1f, 2},
+                                         {664, 70, 6.8f, 3.8f, 2},  {634, 8, 3.8f, 2.7f, 3},  {588, -90, 7.2f, 1.1f, 2},
+                                         {690, 96, 7.4f, 4.4f, 2}};
+    for (const auto& e : kEm) {
+      if (time_ < e[3]) continue;
+      const float t = std::fmod(time_ - e[3], e[2]) / e[2];
+      const float op = t < 0.12f ? t / 0.12f : (1.0f - t) / 0.88f;
+      const float r = e[4] * 0.5f;
+      const ImVec2 c = P(e[0] + r + e[1] * t, 470.0f - r - 430.0f * t);
+      dl->AddCircleFilled(c, (r + 5.0f) * k_, IM_COL32(255, 122, 26, int(60.0f * op)), 12);
+      dl->AddCircleFilled(c, (r + 2.0f) * k_, IM_COL32(255, 122, 26, int(110.0f * op)), 12);
+      dl->AddCircleFilled(c, r * k_, IM_COL32(255, 183, 92, int(255.0f * op)), 12);
+    }
+    // Author (bottom left).
+    Txt(dl, 28, 632, 11, 5, kMuted, "SWITCH PORT BY");
+    dl->AddCircleFilled(P(31.5f, 659), 8.0f * k_, IM_COL32(255, 122, 26, 60), 12);
+    rex::ui::souls::Diamond(dl, P(31.5f, 659), 5.0f * k_, IM_COL32(255, 138, 42, 255));
+    Txt(dl, 45, 659, 24, 5, IM_COL32(232, 201, 140, 255), "XDASCATX", 0, true, IM_COL32(255, 130, 40, 14));
+    Txt(dl, 28, 688, 12, 4, kGold, "XBOX 360 RECOMP");
+    // Version (bottom right), in a box.
     if (DS2_VERSION_STRING[0]) {
-      souls::PushTitleFont(0.36f);
-      const ImVec2 l = ImGui::CalcTextSize("VERSION");
-      souls::PopTitleFont();
-      souls::PushTitleFont(0.85f);
-      const ImVec2 v = ImGui::CalcTextSize(DS2_VERSION_STRING);
-      const float pad_x = 16.0f, pad_y = 8.0f, between = 12.0f;
-      const ImVec2 b(d.x - 28.0f, d.y - 20.0f);
-      const ImVec2 a(b.x - pad_x * 2.0f - l.x - between - v.x, b.y - pad_y * 2.0f - v.y);
-      dl->AddRectFilled(a, b, souls::Col(ImVec4(0.055f, 0.043f, 0.031f, 0.9f)));
-      dl->AddRect(a, b, souls::Col(souls::kBronzeDim), 0.0f, 0, 1.5f);
-      dl->AddText(ImVec2(b.x - pad_x - v.x, a.y + pad_y), souls::Col(souls::kEmber), DS2_VERSION_STRING);
-      souls::PopTitleFont();
-      souls::PushTitleFont(0.36f);
-      dl->AddText(ImVec2(a.x + pad_x, (a.y + b.y - l.y) * 0.5f), souls::Col(souls::kAsh), "VERSION");
-      souls::PopTitleFont();
+      const float wl = Width("VERSION", 11, 4) / k_, wv = Width(DS2_VERSION_STRING, 26, 2) / k_ + 0.7f;
+      const float x1 = 1252.0f, x0 = x1 - 16.0f - wv - 12.0f - wl - 16.0f;
+      dl->AddRectFilled(P(x0, 645), P(x1, 698), IM_COL32(14, 11, 8, 217));
+      dl->AddRect(P(x0, 645), P(x1, 698), IM_COL32(107, 82, 48, 255), 0.0f, 0, 1.2f * k_);
+      Txt(dl, x0 + 16.0f, 671.5f, 11, 4, kMuted, "VERSION");
+      Txt(dl, x1 - 16.0f, 671.5f, 26, 2, IM_COL32(255, 183, 92, 255), DS2_VERSION_STRING, 2, true,
+          IM_COL32(255, 122, 26, 20));
     }
+  }
+
+  // "[D-pad] Select   (A) Start   or   [tap] Tap", the mock-up's outlined glyphs, centred at y 677.
+  void DrawHints(ImDrawList* dl) const {
+    const ImU32 ink = kGold;
+    const float ws = Width("Select", 14, 2) / k_, wt = Width("Start", 14, 2) / k_;
+    const float wo = Width("or", 14, 2) / k_, wp = Width("Tap", 14, 2) / k_;
+    const float total = 26 + 10 + ws + 32 + 26 + 10 + wt + 24 + wo + 24 + 26 + 10 + wp;
+    float x = 640.0f - total * 0.5f;
+    const float y0 = 677.0f - 13.0f;
+    auto G = [&](float gx, float gy, float ox) { return P(ox + gx, y0 + gy); };
+    const float th = 1.6f * k_;
+    // D-pad.
+    {
+      const float pts[12][2] = {{10, 2}, {16, 2}, {16, 10}, {24, 10}, {24, 16}, {16, 16},
+                                {16, 24}, {10, 24}, {10, 16}, {2, 16},  {2, 10},  {10, 10}};
+      for (const auto& p : pts) dl->PathLineTo(G(p[0], p[1], x));
+      dl->PathStroke(ink, ImDrawFlags_Closed, th);
+    }
+    x += 26 + 10;
+    Txt(dl, x, 677, 14, 2, kMuted, "Select");
+    x += ws + 32;
+    // A button.
+    dl->AddCircle(G(13, 13, x), 11.0f * k_, ink, 32, th);
+    dl->PathLineTo(G(8.5f, 18.5f, x));
+    dl->PathLineTo(G(13, 7.5f, x));
+    dl->PathLineTo(G(17.5f, 18.5f, x));
+    dl->PathStroke(ink, 0, th);
+    dl->AddLine(G(10.3f, 14.5f, x), G(15.7f, 14.5f, x), ink, th);
+    x += 26 + 10;
+    Txt(dl, x, 677, 14, 2, kMuted, "Start");
+    x += wt + 24;
+    Txt(dl, x, 677, 14, 2, IM_COL32(133, 119, 100, 255), "or");
+    x += wo + 24;
+    // Tap: a finger with two arcs.
+    {
+      const float pts[][2] = {{11, 23},   {11, 13.5f}, {11.6f, 12.1f}, {13, 11.5f},   {14.4f, 12.1f}, {15, 13.5f},
+                              {15, 19},   {19.2f, 20.2f}, {20.3f, 21.0f}, {20.6f, 22.4f}, {20.3f, 24}};
+      for (const auto& p : pts) dl->PathLineTo(G(p[0], p[1], x));
+      dl->PathStroke(ink, 0, th);
+      dl->PathArcTo(G(13, 12.27f, x), 5.4f * k_, -2.667f, -0.475f, 16);
+      dl->PathStroke(ink, 0, 1.4f * k_);
+      dl->PathArcTo(G(13, 12.2f, x), 8.4f * k_, -2.641f, -0.500f, 20);
+      dl->PathStroke(ink, 0, 1.4f * k_);
+    }
+    x += 26 + 10;
+    Txt(dl, x, 677, 14, 2, kMuted, "Tap");
   }
 
   // v128: a bonfire of bones with two skulls (the start screen's centre), in a 240 x 270 box at `o`, `s` pixels per
@@ -534,11 +693,23 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
     auto P = [&](float x, float y) { return ImVec2(o.x + x * s, o.y + y * s); };
     const ImU32 bone = IM_COL32(203, 189, 159, 255), bone_edge = IM_COL32(107, 95, 74, 255);
     const ImU32 hole = IM_COL32(20, 13, 8, 255);
-    // Glow.
-    const float breathe = 0.85f + 0.15f * std::sin(t * 2.6f);
-    for (int i = 6; i >= 1; --i) {
-      dl->AddCircleFilled(P(120.0f, 200.0f), float(i) * 20.0f * s, IM_COL32(255, 106, 18, int(14.0f * breathe)), 40);
+    // Glow: the mock-up's radial gradient (centre 50 % / 78 % of the box, radius 55 %), kept inside the box.
+    dl->PushClipRect(o, P(240.0f, 270.0f), true);
+    {
+      constexpr int kRings = 16;
+      float prev = 0.0f;
+      for (int i = kRings; i >= 1; --i) {
+        const float f = float(i) / float(kRings);
+        const float target = f < 0.5f ? 0.55f + (0.18f - 0.55f) * (f / 0.5f) : 0.18f * (1.0f - f) / 0.5f;
+        const float mix = std::min(1.0f, f / 0.5f);
+        const float add = std::max(0.0f, target - prev);
+        prev = target;
+        dl->AddEllipseFilled(P(120.0f, 210.6f), ImVec2(132.0f * f * s, 148.5f * f * s),
+                             IM_COL32(255, int(181 + (106 - 181) * mix), int(74 + (18 - 74) * mix), int(255.0f * add)),
+                             0.0f, 48);
+      }
     }
+    dl->PopClipRect();
     dl->AddEllipseFilled(P(120.0f, 254.0f), ImVec2(104.0f * s, 12.0f * s), IM_COL32(13, 9, 7, 255));
     auto Bone = [&](float cx, float cy, float len, float deg) {
       const float a = deg * kPi / 180.0f, c = std::cos(a), sn = std::sin(a);
@@ -614,158 +785,7 @@ class ResolutionDialog final : public rex::ui::ImGuiDialog {
     Skull(68.0f, 236.0f, 1.0f, -12.0f);
     Skull(173.0f, 239.0f, 0.85f, 14.0f);
   }
-  static float Hash(int n) {
-    uint32_t x = uint32_t(n) * 0x9E3779B1u;
-    x ^= x >> 15;
-    x *= 0x85EBCA77u;
-    x ^= x >> 13;
-    return float(x & 0xFFFF) / 65535.0f;
-  }
-  static constexpr int kEmbers = 70;
-
-  // "[D-pad] Select    (A) Start   or   [finger] Tap" with drawn glyphs (v121: the touch hint).
-  void DrawHints() {
-    namespace souls = rex::ui::souls;
-    souls::PushTitleFont(0.62f);
-    const char* select = "Select";
-    const char* start = "Start";
-    const char* or_text = "or";
-    const char* tap = "Tap";
-    const ImVec2 ts = ImGui::CalcTextSize(select), tt = ImGui::CalcTextSize(start);
-    const ImVec2 to = ImGui::CalcTextSize(or_text), tp = ImGui::CalcTextSize(tap);
-    const float icon = ts.y * 1.1f, space = 10.0f, group_gap = 40.0f, or_gap = 28.0f;
-    const float total = icon + space + ts.x + group_gap + icon + space + tt.x + or_gap + to.x + or_gap +
-                        icon * 1.2f + space + tp.x;
-    const float x0 = ImGui::GetCursorScreenPos().x + (ImGui::GetContentRegionAvail().x - total) * 0.5f;
-    const float y0 = ImGui::GetCursorScreenPos().y;
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImU32 ink = souls::Col(souls::kAsh);
-    // D-pad: a cross.
-    {
-      const float c = icon * 0.5f, arm = icon * 0.18f;
-      const ImVec2 m(x0 + c, y0 + ts.y * 0.5f);
-      dl->AddRectFilled(ImVec2(m.x - c, m.y - arm), ImVec2(m.x + c, m.y + arm), ink, 2.0f);
-      dl->AddRectFilled(ImVec2(m.x - arm, m.y - c), ImVec2(m.x + arm, m.y + c), ink, 2.0f);
-    }
-    dl->AddText(ImVec2(x0 + icon + space, y0), ink, select);
-    // A button: a circle with the letter.
-    const float ax = x0 + icon + space + ts.x + group_gap;
-    {
-      const ImVec2 m(ax + icon * 0.5f, y0 + ts.y * 0.5f);
-      dl->AddCircle(m, icon * 0.5f, souls::Col(souls::kEmber), 24, 1.6f);
-      const ImVec2 la = ImGui::CalcTextSize("A");
-      dl->AddText(ImVec2(m.x - la.x * 0.5f, m.y - la.y * 0.5f), souls::Col(souls::kParchment), "A");
-    }
-    dl->AddText(ImVec2(ax + icon + space, y0), ink, start);
-    // "or", dimmer.
-    const float ox = ax + icon + space + tt.x + or_gap;
-    dl->AddText(ImVec2(ox, y0), souls::Col(souls::kAsh, 0.6f), or_text);
-    // Hand pointing with the index finger (a silhouette), turned 90 degrees left so the finger points left:
-    // index finger out, the other three fingers curled as knuckles, thumb folded; two tap arcs at the fingertip.
-    // Drawn upright in local coordinates and rotated: (dx, dy) -> (dy, -dx) around the icon centre.
-    const float fx = ox + to.x + or_gap;
-    const float hand_w = icon * 1.2f;  // the upright hand's height becomes the width
-    {
-      const float h = icon * 1.2f;
-      const ImVec2 c(fx + hand_w * 0.5f, y0 + ts.y * 0.5f);
-      // Upright layout, relative to the centre (y grows down).
-      const float top = -h * 0.5f;
-      const float fw = icon * 0.20f;
-      const float fl = -icon * 0.26f + icon * 0.0f;
-      auto rot = [&](float dx, float dy) { return ImVec2(c.x + dy, c.y - dx); };
-      auto rect = [&](float x0, float y0r, float x1, float y1, float rounding, ImDrawFlags flags) {
-        const ImVec2 p0 = rot(x0, y0r), p1 = rot(x1, y1);
-        dl->AddRectFilled(ImVec2(std::min(p0.x, p1.x), std::min(p0.y, p1.y)),
-                          ImVec2(std::max(p0.x, p1.x), std::max(p0.y, p1.y)), ink, rounding, flags);
-      };
-      const float tip_y = top + h * 0.06f;
-      // index finger (its rounded top end becomes the left end)
-      rect(fl, tip_y, fl + fw, top + h * 0.60f, fw * 0.5f, ImDrawFlags_RoundCornersLeft);
-      // palm
-      rect(fl, top + h * 0.50f, icon * 0.36f, top + h, icon * 0.12f, 0);
-      // curled fingers
-      const float kr = icon * 0.085f;
-      for (int k = 0; k < 3; ++k) {
-        dl->AddCircleFilled(rot(fl + fw + kr * (1.1f + 2.0f * float(k)), top + h * 0.50f), kr, ink, 12);
-      }
-      // thumb
-      rect(fl - icon * 0.14f, top + h * 0.62f, fl + fw * 0.6f, top + h * 0.80f, icon * 0.08f, 0);
-      // tap arcs around the fingertip (angles turned by -90 degrees with the hand)
-      const ImVec2 tip = rot(fl + fw * 0.5f, tip_y);
-      const ImU32 ember = souls::Col(souls::kEmber);
-      const float a0 = 3.14159f * 0.65f, a1 = 3.14159f * 1.35f;
-      dl->PathArcTo(tip, fw * 1.4f, a0, a1, 10);
-      dl->PathStroke(ember, 0, 1.4f);
-      dl->PathArcTo(tip, fw * 2.3f, a0, a1, 12);
-      dl->PathStroke(ember, 0, 1.4f);
-    }
-    dl->AddText(ImVec2(fx + hand_w + space, y0), ink, tap);
-    souls::PopTitleFont();
-    ImGui::Dummy(ImVec2(total, ts.y));
-  }
-
-  // A small toggle; the selected one is lit in ember, the other dimmed.
-  static bool Toggle(const char* id, const char* text, bool selected, ImVec2 size, float text_scale = 0.8f) {
-    namespace souls = rex::ui::souls;
-    ImGui::PushStyleColor(ImGuiCol_Button, selected ? ImVec4(0.42f, 0.23f, 0.07f, 0.95f)
-                                                    : ImVec4(0.10f, 0.08f, 0.06f, 0.85f));
-    ImGui::PushStyleColor(ImGuiCol_Border, selected ? souls::kEmber : souls::kBronzeDim);
-    const bool pressed = ImGui::Button(id, size);
-    ImGui::PopStyleColor(2);
-    const bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused();
-    const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    souls::PushTitleFont(text_scale);
-    const ImVec2 t = ImGui::CalcTextSize(text);
-    const ImVec4 color = selected ? souls::kParchment : souls::kAsh;
-    dl->AddText(ImVec2((a.x + b.x - t.x) * 0.5f, (a.y + b.y - t.y) * 0.5f),
-                souls::Col(color, selected || hot ? 1.0f : 0.6f), text);
-    souls::PopTitleFont();
-    if (selected) souls::Diamond(dl, ImVec2((a.x + b.x) * 0.5f, b.y), 4.0f, souls::Col(souls::kEmber));
-    return pressed;
-  }
-
-  // A button with the resolution in the title font and a short line under it.
-  static bool Choice(const char* id, const char* title, const char* note, ImVec2 size, bool overlap) {
-    namespace souls = rex::ui::souls;
-    if (overlap) ImGui::SetNextItemAllowOverlap();  // v117: the sharpening toggle sits inside the 540p card
-    const bool pressed = ImGui::Button(id, size);
-    const bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused();
-    const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    // v118: both cards breathe in ember while the screen waits for a choice; the focused one more strongly.
-    // v121: much stronger (the v118 thin border was not visible on the console): the whole card is a full
-    // ember gradient that swells and fades (~1.6 s cycle), with a thick border and a wide halo.
-    {
-      const float pulse = 0.5f + 0.5f * std::sin(float(ImGui::GetTime()) * 3.9f);
-      const float strength = hot ? 0.45f + 0.55f * pulse : 0.15f + 0.85f * pulse;
-      const float peak = hot ? 0.85f : 0.65f;
-      const ImU32 fill_top = souls::Col(souls::kEmber, strength * peak * 0.15f);
-      const ImU32 fill_bottom = souls::Col(souls::kEmber, strength * peak);
-      dl->AddRectFilledMultiColor(a, b, fill_top, fill_top, fill_bottom, fill_bottom);
-      for (int i = 8; i >= 1; --i) {
-        const float g = float(i) * 3.0f;
-        dl->AddRect(ImVec2(a.x - g, a.y - g), ImVec2(b.x + g, b.y + g),
-                    souls::Col(souls::kEmber, strength * 0.55f / float(i)), 0.0f, 0, 3.0f);
-      }
-      dl->AddRect(a, b, souls::Col(souls::kEmber, 0.4f + 0.6f * strength), 0.0f, 0, hot ? 3.5f : 2.5f);
-    }
-    souls::PushTitleFont(1.3f);
-    ImVec2 t = ImGui::CalcTextSize(title);
-    const float cx = (a.x + b.x) * 0.5f;
-    const float ty = a.y + (b.y - a.y) * 0.24f - t.y * 0.5f;
-    dl->AddText(ImVec2(cx - t.x * 0.5f, ty), souls::Col(hot ? souls::kEmber : souls::kParchment), title);
-    souls::PopTitleFont();
-    souls::PushTitleFont(0.55f);
-    const ImVec2 n = ImGui::CalcTextSize(note);
-    dl->AddText(ImVec2(cx - n.x * 0.5f, a.y + (b.y - a.y) * 0.48f - n.y * 0.5f), souls::Col(souls::kAsh), note);
-    souls::PopTitleFont();
-    if (hot) {
-      souls::Diamond(dl, ImVec2(a.x, (a.y + b.y) * 0.5f), 6.0f, souls::Col(souls::kEmber));
-      souls::Diamond(dl, ImVec2(b.x, (a.y + b.y) * 0.5f), 6.0f, souls::Col(souls::kEmber));
-    }
-    return pressed;
-  }
+  float k_ = 1.0f;
 
   // Xbox 360 language ids of the European disc other than English and Russian.
   static const char* OtherLanguageName(int id) {
